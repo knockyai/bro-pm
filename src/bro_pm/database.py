@@ -57,7 +57,3 @@ class Database:
 
     def session(self) -> Session:
         return self.session_factory()
-
-
-# create schema on import so local smoke tests and CLI usage work immediately
-init_db()

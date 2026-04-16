@@ -17,9 +17,11 @@ def _project_to_response(project: models.Project) -> ProjectResponse:
         id=str(project.id),
         name=project.name,
         slug=project.slug,
-        visibility=project.visibility,
+        description=project.description,
         safe_paused=project.safe_paused,
-        metadata=project.metadata or {},
+        created_by=project.created_by,
+        visibility=project.visibility,
+        metadata=project.metadata_json or {},
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
@@ -59,9 +61,11 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db_session)
     project = models.Project(
         name=payload.name,
         slug=payload.slug,
+        description=payload.description,
         visibility=payload.visibility,
         safe_paused=payload.safe_paused,
-        metadata=payload.metadata or {},
+        created_by=payload.created_by,
+        metadata_json=payload.metadata or {},
     )
     db.add(project)
     db.flush()

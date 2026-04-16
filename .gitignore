@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Local DB artifacts
+*.db
+
 # Local scratch and tooling outputs
 .tmp/
 .pytest_cache/

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import importlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+from uuid import uuid4
 
 import pytest
 
@@ -36,6 +40,14 @@ def db_session():
         yield session
     finally:
         session.close()
+
+
+def _make_file_backed_db_module(tmp_path) -> tuple[object, str]:
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    db_path = Path(tmp_path) / f"bro_pm_service_{uuid4().hex}.db"
+    database.init_db(f"sqlite:///{db_path}")
+    return database, str(db_path)
 
 
 def test_policy_engine_trusted_and_untrusted_actor_behavior():
@@ -244,3 +256,73 @@ def test_command_service_approval_required_path_does_not_apply_action(db_session
     assert project.safe_paused is False
     audit = session.query(models.AuditEvent).filter_by(id=result.audit_id).one()
     assert audit.result == "awaiting_approval"
+
+
+def test_command_service_rejects_idempotent_replay_when_stored_payload_is_invalid(db_session):
+    session = db_session
+    session.add(
+        models.AuditEvent(
+            actor="alice",
+            action="close_task",
+            target_type="proposal",
+            target_id="T-1",
+            payload="{not-json",
+            result="awaiting_approval",
+            idempotency_key="broken-idempotency-key",
+        )
+    )
+    session.commit()
+
+    service = CommandService(db_session=session)
+    proposal = service.parse(actor="alice", command="close task T-1", project_id=None)
+
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="broken-idempotency-key",
+    )
+
+    assert result.success is False
+    assert result.result == "rejected"
+    assert result.detail == "idempotency key already used for unreadable stored request context"
+
+
+def test_command_service_idempotency_replays_under_concurrent_duplicate_requests(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+
+    start_barrier = Barrier(2)
+    idempotency_key = f"idem-{uuid4().hex[:8]}"
+
+    def _run_once():
+        session = database.SessionLocal()
+        try:
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="close task T-1",
+                project_id=None,
+            )
+            start_barrier.wait(timeout=5)
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key=idempotency_key,
+            )
+            session.commit()
+            return {"status": "ok", "result": execution.result, "audit_id": execution.audit_id}
+        except Exception as exc:
+            session.rollback()
+            return {"status": "error", "error_type": type(exc).__name__, "detail": str(exc)}
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [future.result() for future in [executor.submit(_run_once), executor.submit(_run_once)]]
+
+    assert all(outcome["status"] == "ok" for outcome in outcomes)
+    assert {outcome["result"] for outcome in outcomes} == {"requires_approval"}
+    assert len({outcome["audit_id"] for outcome in outcomes}) == 1
