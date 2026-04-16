@@ -1,0 +1,7 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+
+# Local scratch and tooling outputs
+.tmp/
+.pytest_cache/

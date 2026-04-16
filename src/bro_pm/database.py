@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine
@@ -10,13 +9,30 @@ from .config import settings
 from .models import Base
 
 
-# Lazily initialized singleton to keep connection configuration stable.
-_engine = create_engine(settings.database_url, echo=False, future=True)
+_ENGINE_OPTIONS = {"echo": False, "future": True}
+
+_engine = create_engine(settings.database_url, **_ENGINE_OPTIONS)
 SessionLocal = sessionmaker(bind=_engine, class_=Session, autocommit=False, autoflush=False, future=True)
 
 
-# create schema on import so local smoke tests can run immediately
-Base.metadata.create_all(bind=_engine)
+
+def _initialize_engine(database_url: str) -> None:
+    """(Re)initialize the SQLAlchemy engine and session factory for tests/runtime."""
+
+    global _engine
+    global SessionLocal
+
+    _engine.dispose()
+    _engine = create_engine(database_url, **_ENGINE_OPTIONS)
+    SessionLocal.configure(bind=_engine)
+
+
+def init_db(database_url: str | None = None) -> None:
+    """Initialize or reinitialize DB schema for a concrete database URL."""
+
+    if database_url is not None and database_url != settings.database_url:
+        _initialize_engine(database_url)
+    Base.metadata.create_all(bind=_engine)
 
 
 def get_db_session() -> Iterator[Session]:
@@ -36,8 +52,12 @@ def get_db_session() -> Iterator[Session]:
 class Database:
     """Compatibility wrapper for non-HTTP usage paths."""
 
-    def __init__(self) -> None:
-        self.session_factory = SessionLocal
+    def __init__(self, session_factory: sessionmaker | None = None) -> None:
+        self.session_factory = session_factory or SessionLocal
 
     def session(self) -> Session:
         return self.session_factory()
+
+
+# create schema on import so local smoke tests and CLI usage work immediately
+init_db()
