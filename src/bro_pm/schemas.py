@@ -107,7 +107,7 @@ class AuditResponse(BaseModel):
     target_type: str
     target_id: str | None
     result: str
-    payload: str
+    created_at: datetime
 
 
 class RollbackRequest(BaseModel):

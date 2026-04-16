@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib
 import sys
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+
+from bro_pm import models
 
 
 @pytest.fixture
@@ -195,3 +198,120 @@ def test_api_command_rejects_same_idempotency_key_for_different_context(api_clie
     assert second.json()["accepted"] is False
     assert second.json()["result"] == "rejected"
     assert second.json()["detail"] == "idempotency key already used for different request context"
+
+
+def test_api_project_audit_list_is_newest_first_when_available(api_client: TestClient):
+    project = _create_project(api_client)
+
+    pause_payload = {
+        "command_text": f"pause project {project['id']}",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+    }
+    pause_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=pause_payload,
+    )
+    assert pause_resp.status_code == 200
+
+    resume_payload = {
+        "command_text": f"resume project {project['id']}",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+    }
+    resume_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=resume_payload,
+    )
+    assert resume_resp.status_code == 200
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events",
+    )
+    assert response.status_code == 200
+
+    events = response.json()
+    assert isinstance(events, list)
+    assert len(events) == 2
+    assert {
+        pause_resp.json()["audit_id"],
+        resume_resp.json()["audit_id"],
+    } == {events[0]["id"], events[1]["id"]}
+    assert events[0]["project_id"] == project["id"]
+    assert events[1]["project_id"] == project["id"]
+    assert events[0]["action"] in {"pause_project", "unpause_project"}
+    assert events[1]["action"] in {"pause_project", "unpause_project"}
+    assert events[0]["result"] in {"accepted", "executed", "denied", "awaiting_approval"}
+    assert "created_at" in events[0]
+
+    first_created = datetime.fromisoformat(events[0]["created_at"].replace("Z", "+00:00"))
+    second_created = datetime.fromisoformat(events[1]["created_at"].replace("Z", "+00:00"))
+    assert first_created >= second_created
+
+    assert {event["action"] for event in events} == {"pause_project", "unpause_project"}
+    assert all(event["actor"] == "alice" for event in events)
+
+
+def test_api_project_audit_list_missing_project_returns_404(api_client: TestClient):
+    response = api_client.get(
+        "/api/v1/projects/does-not-exist/audit-events",
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
+
+
+def test_api_project_audit_list_for_existing_project_without_events_is_empty(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        shared_timestamp = datetime(2026, 1, 1, 0, 0, 0)
+        first_event = models.AuditEvent(
+            id="event-alpha",
+            project_id=project["id"],
+            actor="alice",
+            action="pause_project",
+            target_type="proposal",
+            target_id=project["id"],
+            payload='{"actor": "alice"}',
+            result="accepted",
+            created_at=shared_timestamp,
+        )
+        second_event = models.AuditEvent(
+            id="event-omega",
+            project_id=project["id"],
+            actor="alice",
+            action="unpause_project",
+            target_type="proposal",
+            target_id=project["id"],
+            payload='{"actor": "alice"}',
+            result="accepted",
+            created_at=shared_timestamp,
+        )
+        database_session.add_all([first_event, second_event])
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events",
+    )
+    assert response.status_code == 200
+
+    events = response.json()
+    assert len(events) == 2
+    assert events[0]["id"] == "event-omega"
+    assert events[1]["id"] == "event-alpha"

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ...database import get_db_session
 from ... import models
-from ...schemas import ProjectCreate, ProjectResponse, TaskCreate, TaskResponse
+from ...schemas import ProjectCreate, ProjectResponse, TaskCreate, TaskResponse, AuditResponse
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -24,6 +24,19 @@ def _project_to_response(project: models.Project) -> ProjectResponse:
         metadata=project.metadata_json or {},
         created_at=project.created_at,
         updated_at=project.updated_at,
+    )
+
+
+def _audit_event_to_response(event: models.AuditEvent) -> AuditResponse:
+    return AuditResponse(
+        id=str(event.id),
+        project_id=str(event.project_id) if event.project_id else None,
+        actor=event.actor,
+        action=event.action,
+        target_type=event.target_type,
+        target_id=event.target_id,
+        result=event.result,
+        created_at=event.created_at,
     )
 
 
@@ -102,3 +115,24 @@ def list_tasks(project_id: str, db: Session = Depends(get_db_session)) -> List[T
         raise HTTPException(status_code=404, detail="project not found")
     tasks = db.query(models.Task).filter_by(project_id=project_id).order_by(models.Task.created_at.desc()).all()
     return [_task_to_response(task) for task in tasks]
+
+
+@router.get("/{project_id}/audit-events", response_model=List[AuditResponse])
+def list_audit_events(
+    project_id: str,
+    db: Session = Depends(get_db_session),
+) -> List[AuditResponse]:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    events = (
+        db.query(models.AuditEvent)
+        .filter_by(project_id=project_id)
+        .order_by(
+            models.AuditEvent.created_at.desc(),
+            models.AuditEvent.id.desc(),
+        )
+        .all()
+    )
+    return [_audit_event_to_response(event) for event in events]
