@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -12,6 +14,7 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=3, max_length=120)
     slug: str = Field(min_length=3, max_length=120)
     description: str | None = None
+    timezone: str | None = None
     created_by: str | None = None
     visibility: str = "internal"
     safe_paused: bool = False
@@ -34,6 +37,20 @@ class ProjectCreate(BaseModel):
             raise ValueError("visibility must not contain '/'")
         return normalized
 
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("timezone must not be empty")
+        try:
+            ZoneInfo(normalized)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return normalized
+
 
 class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -42,12 +59,76 @@ class ProjectResponse(BaseModel):
     name: str
     slug: str
     description: str | None
+    timezone: str | None = None
     safe_paused: bool
     created_by: str | None
     visibility: str
     metadata: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ProjectMembershipResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    actor: str
+    role: str
+
+
+class OnboardingTeamInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=2, max_length=120)
+    owner: str = Field(min_length=2, max_length=120)
+    capacity: int = Field(ge=1, le=1000)
+
+
+class ProjectOnboardingCreate(ProjectCreate):
+    boss: str = Field(min_length=2, max_length=120)
+    admin: str = Field(min_length=2, max_length=120)
+    reporting_cadence: str = Field(min_length=3, max_length=80, default="weekly")
+    communication_integrations: list[str] = Field(default_factory=list)
+    board_integration: str = Field(min_length=2, max_length=80)
+    team: list[OnboardingTeamInput] = Field(default_factory=list)
+
+    @field_validator("communication_integrations")
+    @classmethod
+    def validate_communication_integrations(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value if item and item.strip()]
+        if not normalized:
+            raise ValueError("at least one communication integration is required")
+        return normalized
+
+    @field_validator("board_integration", "reporting_cadence")
+    @classmethod
+    def normalize_non_empty_string(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be empty")
+        return normalized
+
+
+class OnboardingGateChecks(BaseModel):
+    policy_attached: bool
+    communication_ready: bool
+    board_sync_healthy: bool
+    safe_pause_default_off: bool
+
+
+class OnboardingSmokeCheck(BaseModel):
+    status: str
+    detail: str
+
+
+class ProjectOnboardingResponse(BaseModel):
+    project: ProjectResponse
+    timezone: str
+    policy: str
+    reporting_cadence: str
+    memberships: list[ProjectMembershipResponse] = Field(default_factory=list)
+    gate_checks: OnboardingGateChecks
+    smoke_check: OnboardingSmokeCheck
+    status: str
 
 
 class TaskCreate(BaseModel):

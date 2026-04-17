@@ -146,6 +146,12 @@ def _assert_no_legacy_active_goal_duplicates() -> None:
 def _upgrade_legacy_schema() -> None:
     inspector = inspect(_engine)
 
+    if "projects" in inspector.get_table_names():
+        project_columns = {column["name"] for column in inspector.get_columns("projects")}
+        if "timezone" not in project_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE projects ADD COLUMN timezone VARCHAR(120)"))
+
     if "tasks" in inspector.get_table_names():
         task_columns = {column["name"] for column in inspector.get_columns("tasks")}
         if "goal_id" not in task_columns:

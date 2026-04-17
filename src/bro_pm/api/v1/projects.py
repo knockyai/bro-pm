@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
@@ -9,10 +10,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...database import get_db_session
-from ...integrations import IntegrationError
+from ...integrations import INTEGRATIONS, IntegrationError
 from ... import models
 from ...schemas import (
     ProjectCreate,
+    ProjectOnboardingCreate,
+    ProjectOnboardingResponse,
+    ProjectMembershipResponse,
+    OnboardingGateChecks,
+    OnboardingSmokeCheck,
     ProjectResponse,
     TaskCreate,
     TaskResponse,
@@ -24,6 +30,7 @@ from ...schemas import (
     RollbackRequest,
     RollbackResponse,
 )
+
 from ...policy import PolicyEngine
 from ...services.command_service import CommandService
 from ...services.reporting_service import ReportingService
@@ -53,12 +60,51 @@ def _project_to_response(project: models.Project) -> ProjectResponse:
         name=project.name,
         slug=project.slug,
         description=project.description,
+        timezone=project.timezone,
         safe_paused=project.safe_paused,
         created_by=project.created_by,
         visibility=project.visibility,
         metadata=project.metadata_json or {},
         created_at=project.created_at,
         updated_at=project.updated_at,
+    )
+
+
+def _membership_to_response(membership: models.ProjectMembership) -> ProjectMembershipResponse:
+    return ProjectMembershipResponse(actor=membership.actor, role=membership.role)
+
+
+def _onboarding_allowed_integration(name: str, allowed: set[str], integration_type: str) -> str:
+    normalized = name.strip().lower()
+    if normalized not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise HTTPException(status_code=422, detail=f"unsupported {integration_type} integration: {normalized}; allowed: {allowed_values}")
+    return normalized
+
+
+def _build_onboarding_response(project: models.Project) -> ProjectOnboardingResponse:
+    metadata = project.metadata_json or {}
+    onboarding = metadata.get("onboarding") or {}
+    gate_checks = onboarding.get("gate_checks") or {}
+    smoke_check = onboarding.get("smoke_check") or {}
+    memberships = sorted(project.memberships, key=lambda membership: (membership.role, membership.actor))
+    return ProjectOnboardingResponse(
+        project=_project_to_response(project),
+        timezone=project.timezone or "",
+        policy=onboarding.get("policy", "default_mvp"),
+        reporting_cadence=onboarding.get("reporting_cadence", "weekly"),
+        memberships=[_membership_to_response(membership) for membership in memberships],
+        gate_checks=OnboardingGateChecks(
+            policy_attached=bool(gate_checks.get("policy_attached")),
+            communication_ready=bool(gate_checks.get("communication_ready")),
+            board_sync_healthy=bool(gate_checks.get("board_sync_healthy")),
+            safe_pause_default_off=bool(gate_checks.get("safe_pause_default_off")),
+        ),
+        smoke_check=OnboardingSmokeCheck(
+            status=str(smoke_check.get("status", "pending")),
+            detail=str(smoke_check.get("detail", "")),
+        ),
+        status=str(onboarding.get("status", "draft")),
     )
 
 
@@ -76,12 +122,19 @@ def _audit_event_to_response(event: models.AuditEvent) -> AuditResponse:
     )
 
 
-def _audit_event_detail(raw_payload: str | None) -> str:
+def _audit_event_payload(raw_payload: str | None) -> dict:
     try:
         payload = json.loads(raw_payload or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _audit_event_detail(raw_payload: str | None) -> str:
+    payload = _audit_event_payload(raw_payload)
+    if not payload:
         return ""
     detail = payload.get("integration", {}).get("detail")
     if isinstance(detail, str) and detail:
@@ -146,6 +199,7 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db_session)
         name=payload.name,
         slug=payload.slug,
         description=payload.description,
+        timezone=payload.timezone,
         visibility=payload.visibility,
         safe_paused=payload.safe_paused,
         created_by=payload.created_by,
@@ -155,6 +209,166 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db_session)
     db.flush()
     db.refresh(project)
     return _project_to_response(project)
+
+
+@router.post("/onboard", response_model=ProjectOnboardingResponse, status_code=status.HTTP_201_CREATED)
+def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_db_session)) -> ProjectOnboardingResponse:
+    if not payload.slug:
+        raise HTTPException(status_code=400, detail="slug required")
+
+    existing = db.query(models.Project).filter_by(slug=payload.slug).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="slug already exists")
+
+    communication_integrations = [
+        _onboarding_allowed_integration(name, {"slack", "telegram"}, "communication")
+        for name in payload.communication_integrations
+    ]
+    board_integration = _onboarding_allowed_integration(payload.board_integration, {"jira", "notion", "trello"}, "board")
+
+    project = models.Project(
+        name=payload.name,
+        slug=payload.slug,
+        description=payload.description,
+        timezone=payload.timezone,
+        visibility=payload.visibility,
+        safe_paused=False,
+        created_by=payload.created_by or payload.admin,
+        metadata_json=payload.metadata or {},
+    )
+    db.add(project)
+    db.flush()
+
+    memberships = [models.ProjectMembership(project_id=project.id, actor=payload.boss, role="owner")]
+    if payload.admin != payload.boss:
+        memberships.append(models.ProjectMembership(project_id=project.id, actor=payload.admin, role="admin"))
+    db.add_all(memberships)
+
+    smoke_detail = ""
+    try:
+        smoke_result = INTEGRATIONS[board_integration].execute(
+            action="create_task",
+            payload={
+                "project_id": project.id,
+                "title": "Synthetic onboarding smoke check",
+                "actor": payload.admin,
+            },
+        )
+        gate_checks = {
+            "policy_attached": True,
+            "communication_ready": bool(communication_integrations),
+            "board_sync_healthy": bool(smoke_result.ok),
+            "safe_pause_default_off": not project.safe_paused,
+        }
+        smoke_detail = smoke_result.detail or f"{board_integration} executed: create_task"
+        onboarding_metadata = {
+            "status": "active",
+            "policy": "default_mvp",
+            "reporting_cadence": payload.reporting_cadence,
+            "communication_integrations": communication_integrations,
+            "board_integration": board_integration,
+            "team": [team.model_dump() for team in payload.team],
+            "gate_checks": gate_checks,
+            "smoke_check": {
+                "status": "passed" if smoke_result.ok else "failed",
+                "detail": smoke_detail,
+            },
+        }
+        project.metadata_json = {
+            **(project.metadata_json or {}),
+            "onboarding": onboarding_metadata,
+        }
+        db.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor=payload.admin,
+                action="onboard_project",
+                target_type="project",
+                target_id=project.id,
+                payload=json.dumps(
+                    {
+                        "detail": smoke_detail,
+                        "gate_checks": gate_checks,
+                        "onboarding": onboarding_metadata,
+                    },
+                    ensure_ascii=False,
+                ),
+                result="executed" if smoke_result.ok else "failed",
+            )
+        )
+        db.flush()
+        db.refresh(project)
+        return _build_onboarding_response(project)
+    except IntegrationError as exc:
+        detail = str(exc)
+        project.safe_paused = True
+        failure_gate_checks = {
+            "policy_attached": True,
+            "communication_ready": bool(communication_integrations),
+            "board_sync_healthy": False,
+            "safe_pause_default_off": False,
+        }
+        failure_event_created_at = datetime.utcnow()
+        escalation_created_at = failure_event_created_at + timedelta(microseconds=1)
+        project.metadata_json = {
+            **(project.metadata_json or {}),
+            "onboarding": {
+                "status": "failed",
+                "policy": "default_mvp",
+                "reporting_cadence": payload.reporting_cadence,
+                "communication_integrations": communication_integrations,
+                "board_integration": board_integration,
+                "team": [team.model_dump() for team in payload.team],
+                "gate_checks": failure_gate_checks,
+                "smoke_check": {
+                    "status": "failed",
+                    "detail": detail,
+                },
+            },
+        }
+        db.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor=payload.admin,
+                action="onboard_project",
+                target_type="project",
+                target_id=project.id,
+                payload=json.dumps(
+                    {
+                        "detail": detail,
+                        "gate_checks": failure_gate_checks,
+                        "onboarding": (project.metadata_json or {}).get("onboarding", {}),
+                    },
+                    ensure_ascii=False,
+                ),
+                result="failed",
+                created_at=failure_event_created_at,
+            )
+        )
+        db.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor=payload.admin,
+                action="draft_boss_escalation",
+                target_type="project",
+                target_id=project.id,
+                payload=json.dumps(
+                    {
+                        "detail": detail,
+                        "proposal": {
+                            "payload": {
+                                "escalation_message": f"Onboarding failed for {project.slug}: {detail}",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                result="requires_approval",
+                created_at=escalation_created_at,
+            )
+        )
+        db.commit()
+        raise HTTPException(status_code=422, detail=detail) from exc
 
 
 @router.post("/{project_id}/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
