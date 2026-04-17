@@ -631,12 +631,18 @@ class CommandService:
             )
         return stored == current
 
+    def _mapping_payload_member(self, payload: object, key: str) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        value = payload.get(key)
+        return value if isinstance(value, dict) else {}
+
     def _stored_payload_has_complete_replay_context(self, payload: dict) -> bool:
         if not isinstance(payload, dict):
             return False
 
-        auth = payload.get("auth")
-        proposal_payload = payload.get("proposal")
+        auth = self._mapping_payload_member(payload, "auth")
+        proposal_payload = self._mapping_payload_member(payload, "proposal")
         required_auth_keys = {
             "role",
             "actor_trusted",
@@ -644,10 +650,24 @@ class CommandService:
             "validate_integration",
             "execute_integration",
         }
+        required_proposal_keys = {
+            "action",
+            "project_id",
+            "reason",
+            "payload",
+            "requires_approval",
+        }
         return (
-            isinstance(auth, dict)
+            bool(auth)
             and required_auth_keys.issubset(auth)
-            and isinstance(proposal_payload, dict)
+            and bool(proposal_payload)
+            and required_proposal_keys.issubset(proposal_payload)
+        )
+
+    def _can_repair_incomplete_stale_pending_replay(self, replay_context: dict) -> bool:
+        return (
+            replay_context.get("actor_trusted") is True
+            and replay_context.get("role") in {"admin", "owner"}
         )
 
     def _can_repair_stale_pending_integration_replay(
@@ -671,10 +691,17 @@ class CommandService:
         if existing.actor != replay_context.get("actor"):
             return False
 
+        if (
+            existing.project_id != proposal.project_id
+            or existing.target_type != "proposal"
+            or existing.target_id != proposal.project_id
+        ):
+            return False
+
         try:
             payload = json.loads(existing.payload) if existing.payload else {}
         except (TypeError, ValueError, json.JSONDecodeError):
-            return True
+            return self._can_repair_incomplete_stale_pending_replay(replay_context)
 
         if isinstance(payload, dict):
             payload_actor = payload.get("actor")
@@ -702,7 +729,7 @@ class CommandService:
             ):
                 return False
         if not self._stored_payload_has_complete_replay_context(payload):
-            return True
+            return self._can_repair_incomplete_stale_pending_replay(replay_context)
 
         auth = payload.get("auth")
         proposal_payload = payload.get("proposal")
@@ -732,7 +759,7 @@ class CommandService:
             repair_payload = True
 
         if repair_payload:
-            integration_payload = (payload.get("integration") or {}) if isinstance(payload, dict) else {}
+            integration_payload = self._mapping_payload_member(payload, "integration")
             payload = {
                 **(payload if isinstance(payload, dict) else {}),
                 "actor": (payload.get("actor") if isinstance(payload, dict) else None) or existing.actor,
@@ -745,9 +772,10 @@ class CommandService:
                 },
             }
 
-        integration_payload = payload.get("integration") or {}
+        integration_payload = self._mapping_payload_member(payload, "integration")
         payload["integration"] = {
             **integration_payload,
+            "action": integration_payload.get("action") or existing.action,
             "status": "failed",
             "detail": detail,
         }
@@ -784,14 +812,24 @@ class CommandService:
                 result="rejected",
                 detail="idempotency key already used for unreadable stored request context",
             )
+        if not isinstance(existing_payload, dict):
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="rejected",
+                detail="idempotency key already used for unreadable stored request context",
+            )
 
-        detail = existing_payload.get("policy", {}).get("reason", "replayed idempotent result")
-        integration_detail = (
-            existing_payload.get("integration", {}) or {}
-        ).get("detail")
+        existing_policy = self._mapping_payload_member(existing_payload, "policy")
+        existing_auth = self._mapping_payload_member(existing_payload, "auth")
+        existing_integration = self._mapping_payload_member(existing_payload, "integration")
+        existing_replay_repair = self._mapping_payload_member(existing_payload, "replay_repair")
+        detail = existing_policy.get("reason", "replayed idempotent result")
+        integration_detail = existing_integration.get("detail")
         if (
-            existing_payload.get("auth", {}).get("validate_integration", False)
-            or existing_payload.get("auth", {}).get("execute_integration", False)
+            existing_auth.get("validate_integration", False)
+            or existing_auth.get("execute_integration", False)
         ) and integration_detail:
             detail = integration_detail
         if repaired_stale_payload or (
@@ -799,8 +837,7 @@ class CommandService:
             and integration_detail == "stale pending integration request requires manual reconciliation before retry"
             and not self._stored_payload_has_complete_replay_context(existing_payload)
         ) or (
-            (existing_payload.get("replay_repair", {}) or {}).get("source")
-            == "unreadable_pending_integration_payload"
+            existing_replay_repair.get("source") == "unreadable_pending_integration_payload"
         ):
             return ProposalExecution(
                 success=False,
@@ -812,12 +849,12 @@ class CommandService:
 
         existing_context = {
             "actor": existing.actor,
-            "role": existing_payload.get("auth", {}).get("role"),
-            "actor_trusted": existing_payload.get("auth", {}).get("actor_trusted"),
+            "role": existing_auth.get("role"),
+            "actor_trusted": existing_auth.get("actor_trusted"),
             "proposal": existing_payload.get("proposal", {}),
-            "dry_run": existing_payload.get("auth", {}).get("dry_run", False),
-            "validate_integration": existing_payload.get("auth", {}).get("validate_integration", False),
-            "execute_integration": existing_payload.get("auth", {}).get("execute_integration", False),
+            "dry_run": existing_auth.get("dry_run", False),
+            "validate_integration": existing_auth.get("validate_integration", False),
+            "execute_integration": existing_auth.get("execute_integration", False),
         }
         if existing_context != replay_context:
             return ProposalExecution(
