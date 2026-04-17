@@ -136,16 +136,21 @@ def _audit_event_detail(raw_payload: str | None) -> str:
     payload = _audit_event_payload(raw_payload)
     if not payload:
         return ""
-    detail = payload.get("integration", {}).get("detail")
-    if isinstance(detail, str) and detail:
-        return detail
-    policy = payload.get("policy", {})
+
+    integration = payload.get("integration")
+    if isinstance(integration, dict):
+        detail = integration.get("detail")
+        if isinstance(detail, str) and detail:
+            return detail
+
+    policy = payload.get("policy")
     if isinstance(policy, dict):
         reason = policy.get("reason")
         if isinstance(reason, str) and reason:
             return reason
+
     fallback = payload.get("detail")
-    if isinstance(fallback, str):
+    if isinstance(fallback, str) and fallback:
         return fallback
     return ""
 

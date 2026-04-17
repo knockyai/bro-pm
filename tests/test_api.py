@@ -913,6 +913,7 @@ def test_api_project_audit_list_is_newest_first_when_available(api_client: TestC
     assert events[1]["action"] in {"pause_project", "unpause_project"}
     assert events[0]["result"] in {"accepted", "executed", "denied", "awaiting_approval"}
     assert "created_at" in events[0]
+    assert all("payload" not in event for event in events)
 
     first_created = datetime.fromisoformat(events[0]["created_at"].replace("Z", "+00:00"))
     second_created = datetime.fromisoformat(events[1]["created_at"].replace("Z", "+00:00"))
@@ -936,6 +937,109 @@ def test_api_project_audit_list_for_existing_project_without_events_is_empty(api
     response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_api_project_audit_list_handles_non_mapping_integration_payload(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        event = models.AuditEvent(
+            id="event-list-fallback",
+            project_id=project["id"],
+            actor="alice",
+            action="pause_project",
+            target_type="proposal",
+            target_id=project["id"],
+            payload=json.dumps(
+                {
+                    "integration": None,
+                    "policy": {"reason": "policy fallback detail"},
+                }
+            ),
+            result="accepted",
+        )
+        database_session.add(event)
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+
+    assert response.status_code == 200
+    assert response.json()[0]["detail"] == "policy fallback detail"
+    assert "payload" not in response.json()[0]
+
+
+def test_api_project_audit_list_preserves_long_integration_detail(api_client: TestClient):
+    project = _create_project(api_client)
+    long_detail = "publish integration unavailable: " + ("x" * 320)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        event = models.AuditEvent(
+            id="event-long-detail",
+            project_id=project["id"],
+            actor="alice",
+            action="publish_report",
+            target_type="report",
+            target_id=f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+            payload=json.dumps(
+                {
+                    "integration": {
+                        "detail": long_detail,
+                    },
+                }
+            ),
+            result="failed",
+        )
+        database_session.add(event)
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+
+    assert response.status_code == 200
+    assert response.json()[0]["detail"] == long_detail
+    assert "payload" not in response.json()[0]
+
+
+def test_api_project_audit_list_preserves_exact_detail_text(api_client: TestClient):
+    project = _create_project(api_client)
+    exact_detail = "publish integration unavailable\n"
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        event = models.AuditEvent(
+            id="event-exact-detail",
+            project_id=project["id"],
+            actor="alice",
+            action="publish_report",
+            target_type="report",
+            target_id=f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+            payload=json.dumps(
+                {
+                    "integration": {
+                        "detail": exact_detail,
+                    },
+                }
+            ),
+            result="failed",
+        )
+        database_session.add(event)
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+
+    assert response.status_code == 200
+    assert response.json()[0]["detail"] == exact_detail
+    assert "payload" not in response.json()[0]
 
 
 def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient):
@@ -981,7 +1085,6 @@ def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient
     assert len(events) == 2
     assert events[0]["id"] == "event-omega"
     assert events[1]["id"] == "event-alpha"
-
 
 def test_api_project_rollback_reverses_pause_and_persists_rollback_record(api_client: TestClient):
     project = _create_project(api_client)
