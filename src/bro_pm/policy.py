@@ -32,9 +32,20 @@ class PolicyEngine:
 
         privileged = self._can_escalate(actor_role, "admin")
 
-        # safe pause is a hard stop for unsafe operations in MVP
-        if safe_paused and action not in {"unpause_project", "get_status", "audit_view", "rollback_action"}:
+        # safe pause is a hard stop for unsafe operations in MVP.
+        # Audit-only draft boss escalations stay permitted for reporting, but still
+        # follow role and project-context enforcement elsewhere.
+        if safe_paused and action not in {
+            "unpause_project",
+            "get_status",
+            "audit_view",
+            "rollback_action",
+            "draft_boss_escalation",
+        }:
             return PolicyDecision(False, "project is safe-paused", safe_pause_blocked=True)
+
+        if action == "draft_boss_escalation" and not self._can_escalate(actor_role, "operator"):
+            return PolicyDecision(False, "requires operator role")
 
         if action in {"delete_project", "set_trust_policy"} and not privileged:
             return PolicyDecision(False, "requires admin or owner role")
@@ -51,5 +62,8 @@ class PolicyEngine:
         # high-risk command requires approval path in audit logs
         if action in {"close_task", "delete_task", "apply_bulk"}:
             return PolicyDecision(True, "approved with human confirmation", requires_approval=True)
+
+        if action == "draft_boss_escalation":
+            return PolicyDecision(True, "escalation draft requires operator confirmation", requires_approval=True)
 
         return PolicyDecision(True, "policy accepted")

@@ -72,18 +72,35 @@ class CommandService:
                     proposal=proposal,
                 )
 
-        safe_paused = False
-        if project_id:
-            project = self.db.get(models.Project, project_id)
-            if project:
-                safe_paused = bool(project.safe_paused)
+        if proposal.action == "draft_boss_escalation":
+            if not project_id:
+                decision = PolicyDecision(False, "project context required for draft_boss_escalation")
+            else:
+                project = self.db.get(models.Project, project_id)
+                if not project:
+                    decision = PolicyDecision(False, "project not found for draft_boss_escalation")
+                elif not proposal.payload.get("escalation_message"):
+                    decision = PolicyDecision(False, "escalation message required for draft_boss_escalation")
+                else:
+                    decision = self.policy.evaluate(
+                        actor_role=role,
+                        actor_trusted=actor_trusted,
+                        action=proposal.action,
+                        safe_paused=bool(project.safe_paused),
+                    )
+        else:
+            safe_paused = False
+            if project_id:
+                project = self.db.get(models.Project, project_id)
+                if project:
+                    safe_paused = bool(project.safe_paused)
 
-        decision: PolicyDecision = self.policy.evaluate(
-            actor_role=role,
-            actor_trusted=actor_trusted,
-            action=proposal.action,
-            safe_paused=safe_paused,
-        )
+            decision: PolicyDecision = self.policy.evaluate(
+                actor_role=role,
+                actor_trusted=actor_trusted,
+                action=proposal.action,
+                safe_paused=safe_paused,
+            )
 
         success = decision.allowed
         response_result = "rejected"

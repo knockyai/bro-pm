@@ -34,7 +34,8 @@ class HermesAdapter:
         raise RuntimeError("remote Hermes runtime not enabled")
 
     def _deterministic_parser(self, actor: str, command_text: str) -> CommandProposal:
-        text = command_text.strip().lower()
+        stripped_command = command_text.strip()
+        text = stripped_command.lower()
         if text.startswith("pause project "):
             target = text.removeprefix("pause project ").strip()
             return CommandProposal(
@@ -64,6 +65,20 @@ class HermesAdapter:
                 action="close_task",
                 reason="parsed command",
                 payload={"target_type": "task", "target_id": tid, "raw_command": command_text},
+            )
+        if text == "draft_boss_escalation" or text.startswith("draft_boss_escalation "):
+            message = stripped_command[len("draft_boss_escalation"):].strip()
+            return CommandProposal(
+                action="draft_boss_escalation",
+                reason="parsed command",
+                requires_approval=True,
+                payload={
+                    "raw_command": command_text,
+                    "escalation_message": message,
+                    "risk_level": "high",
+                    "trace_label": "draft_boss_escalation",
+                    "operator_confirmation": True,
+                },
             )
 
         # fallback with zero side effects

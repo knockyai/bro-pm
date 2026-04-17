@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib
 import sys
 from datetime import datetime
@@ -300,6 +301,127 @@ def test_api_command_denial_and_approval_paths(api_client: TestClient):
     assert approval_result["result"] == "requires_approval"
     assert approval_result["action"] == "close_task"
     assert approval_result["detail"] == "approved with human confirmation"
+
+
+def test_api_draft_boss_escalation_is_audit_only_and_requires_confirmation(api_client: TestClient):
+    project = _create_project(api_client)
+    command_payload = {
+        "command_text": "draft_boss_escalation customers are blocked by API outage",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+    }
+
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+    assert response.status_code == 200
+    command_result = response.json()
+    assert command_result["accepted"] is True
+    assert command_result["result"] == "requires_approval"
+    assert command_result["action"] == "draft_boss_escalation"
+    assert "operator confirmation" in command_result["detail"]
+
+    response = api_client.get("/api/v1/projects")
+    assert response.status_code == 200
+    listed = response.json()
+    assert listed[0]["safe_paused"] is False
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(id=command_result["audit_id"]).one()
+        payload = json.loads(audit.payload)
+        assert audit.action == "draft_boss_escalation"
+        assert payload["proposal"]["payload"]["raw_command"] == "draft_boss_escalation customers are blocked by API outage"
+        assert payload["proposal"]["payload"]["trace_label"] == "draft_boss_escalation"
+    finally:
+        session.close()
+
+
+def test_api_command_draft_boss_escalation_idempotent_replay(api_client: TestClient):
+    project = _create_project(api_client)
+    command_payload = {
+        "command_text": "draft_boss_escalation database partition full",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "idempotency_key": "draft-escalation-once",
+    }
+
+    first = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+    second = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["result"] == "requires_approval"
+    assert second.json()["result"] == "requires_approval"
+    assert first.json()["audit_id"] == second.json()["audit_id"]
+
+
+def test_api_draft_boss_escalation_rejects_viewer(api_client: TestClient):
+    project = _create_project(api_client)
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "draft_boss_escalation viewer cannot escalate",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "viewer",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert response.json()["result"] == "rejected"
+    assert response.json()["detail"] == "requires operator role"
+
+
+def test_api_draft_boss_escalation_requires_project_context(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "draft_boss_escalation missing project context",
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert response.json()["result"] == "rejected"
+    assert response.json()["detail"] == "project context required for draft_boss_escalation"
+
+
+def test_api_draft_boss_escalation_requires_message(api_client: TestClient):
+    project = _create_project(api_client)
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "draft_boss_escalation   ",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert response.json()["result"] == "rejected"
+    assert response.json()["detail"] == "escalation message required for draft_boss_escalation"
 
 
 def test_api_command_reuses_idempotency_key_without_crashing(api_client: TestClient):

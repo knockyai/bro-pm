@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -85,6 +86,12 @@ def test_policy_engine_safe_pause_blocks_unsafe_actions():
         action="unpause_project",
         safe_paused=True,
     )
+    draft_boss_allowed = engine.evaluate(
+        actor_role="admin",
+        actor_trusted=True,
+        action="draft_boss_escalation",
+        safe_paused=True,
+    )
 
     assert blocked.allowed is False
     assert blocked.safe_pause_blocked is True
@@ -92,6 +99,21 @@ def test_policy_engine_safe_pause_blocks_unsafe_actions():
 
     assert allowed.allowed is True
     assert allowed.safe_pause_blocked is False
+    assert draft_boss_allowed.allowed is True
+    assert draft_boss_allowed.safe_pause_blocked is False
+
+
+def test_policy_engine_draft_boss_escalation_rejects_viewer():
+    engine = PolicyEngine()
+    decision = engine.evaluate(
+        actor_role="viewer",
+        actor_trusted=True,
+        action="draft_boss_escalation",
+        safe_paused=False,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "requires operator role"
 
 
 def test_policy_engine_allows_rollback_action_in_safe_pause_for_privileged_role():
@@ -122,6 +144,20 @@ def test_policy_engine_high_risk_action_requires_approval():
     assert "approved with human confirmation" in decision.reason
 
 
+def test_policy_engine_draft_boss_escalation_requires_approval():
+    engine = PolicyEngine()
+    decision = engine.evaluate(
+        actor_role="admin",
+        actor_trusted=True,
+        action="draft_boss_escalation",
+        safe_paused=False,
+    )
+
+    assert decision.allowed is True
+    assert decision.requires_approval is True
+    assert "operator confirmation" in decision.reason
+
+
 @pytest.mark.parametrize(
     (
         "command_text",
@@ -144,6 +180,28 @@ def test_hermes_adapter_deterministic_parser_parses_known_commands(command_text,
     assert proposal.project_id == expected_project_id
     assert set(proposal.payload.keys()) == expected_payload_keys
     assert "parsed command" in proposal.reason
+
+
+def test_hermes_adapter_deterministic_parser_parses_draft_boss_escalation():
+    adapter = HermesAdapter()
+    command = "draft_boss_escalation customers are blocked by API outage"
+    proposal = adapter.propose("alice", command)
+
+    assert proposal.action == "draft_boss_escalation"
+    assert proposal.project_id is None
+    assert proposal.requires_approval is True
+    assert proposal.payload["raw_command"] == command
+    assert proposal.payload["escalation_message"] == "customers are blocked by API outage"
+    assert proposal.payload["risk_level"] == "high"
+    assert proposal.payload["trace_label"] == "draft_boss_escalation"
+
+
+def test_hermes_adapter_deterministic_parser_preserves_empty_draft_boss_escalation_message_for_validation():
+    adapter = HermesAdapter()
+    proposal = adapter.propose("alice", "draft_boss_escalation   ")
+
+    assert proposal.action == "draft_boss_escalation"
+    assert proposal.payload["escalation_message"] == ""
 
 
 def test_hermes_adapter_deterministic_parser_noop_on_unknown_command():
@@ -525,6 +583,181 @@ def test_command_service_approval_required_path_does_not_apply_action(db_session
     assert project.safe_paused is False
     audit = session.query(models.AuditEvent).filter_by(id=result.audit_id).one()
     assert audit.result == "awaiting_approval"
+
+
+def test_command_service_draft_boss_escalation_is_audit_only_and_no_mutation(db_session):
+    session = db_session
+    project = _create_project(session, name="Draft escalation", slug="draft-escalation")
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation project telemetry blocked",
+        project_id=project.id,
+    )
+    start_count = session.query(models.AuditEvent).count()
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+    end_count = session.query(models.AuditEvent).count()
+
+    assert result.success is True
+    assert result.result == "requires_approval"
+    assert end_count == start_count + 1
+
+    session.refresh(project)
+    assert project.safe_paused is False
+
+    audit = session.query(models.AuditEvent).filter_by(id=result.audit_id).one()
+    payload = json.loads(audit.payload)
+    assert audit.action == "draft_boss_escalation"
+    assert audit.result == "awaiting_approval"
+    assert payload["proposal"]["payload"]["raw_command"] == "draft_boss_escalation project telemetry blocked"
+    assert payload["proposal"]["payload"]["escalation_message"] == "project telemetry blocked"
+    assert payload["proposal"]["payload"]["risk_level"] == "high"
+    assert payload["proposal"]["payload"]["trace_label"] == "draft_boss_escalation"
+
+
+def test_command_service_draft_boss_escalation_is_allowed_in_safe_paused_project(db_session):
+    session = db_session
+    project = _create_project(session, name="Safe pause draft escalation", slug="safe-escalation")
+    project.safe_paused = True
+    session.flush()
+
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation customer impact escalation",
+        project_id=project.id,
+    )
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert result.success is True
+    assert result.result == "requires_approval"
+    assert project.safe_paused is True
+
+
+def test_command_service_draft_boss_escalation_rejects_viewer(db_session):
+    session = db_session
+    project = _create_project(session, name="Viewer blocked escalation", slug="viewer-escalation")
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation viewer blocked escalation",
+        project_id=project.id,
+    )
+    result = service.execute(
+        actor="alice",
+        role="viewer",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert result.success is False
+    assert result.result == "rejected"
+    assert result.detail == "requires operator role"
+
+
+def test_command_service_draft_boss_escalation_requires_project_context(db_session):
+    service = CommandService(db_session=db_session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation missing project context",
+        project_id=None,
+    )
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert result.success is False
+    assert result.result == "rejected"
+    assert result.detail == "project context required for draft_boss_escalation"
+
+
+def test_command_service_draft_boss_escalation_requires_existing_project(db_session):
+    service = CommandService(db_session=db_session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation project missing",
+        project_id="missing-project-id",
+    )
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert result.success is False
+    assert result.result == "rejected"
+    assert result.detail == "project not found for draft_boss_escalation"
+
+
+def test_command_service_draft_boss_escalation_requires_message(db_session):
+    session = db_session
+    project = _create_project(session, name="Message required escalation", slug="message-required")
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation   ",
+        project_id=project.id,
+    )
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert result.success is False
+    assert result.result == "rejected"
+    assert result.detail == "escalation message required for draft_boss_escalation"
+
+
+def test_command_service_draft_boss_escalation_idempotent_replay_reuses_audit_record(db_session):
+    session = db_session
+    project = _create_project(session, name="Idempotent escalation", slug="idem-escalation")
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation production incident escalation",
+        project_id=project.id,
+    )
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="escalation-idem-key",
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="escalation-idem-key",
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert first.result == "requires_approval"
+    assert second.result == "requires_approval"
+    assert first.audit_id == second.audit_id
 
 
 def test_command_service_rejects_idempotent_replay_when_stored_payload_is_invalid(db_session):
