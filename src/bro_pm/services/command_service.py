@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -38,6 +38,8 @@ class CommandService:
     """Convert parsed commands into durable audit-ready operations."""
 
     PENDING_INTEGRATION_STALE_AFTER = timedelta(minutes=5)
+    PENDING_INTEGRATION_WAIT_ATTEMPTS = 100
+    PENDING_INTEGRATION_WAIT_DELAY_SECONDS = 0.05
 
     def __init__(self, db_session: Session, hermes: HermesAdapter | None = None, policy: PolicyEngine | None = None):
         self.db = db_session
@@ -73,7 +75,8 @@ class CommandService:
             "execute_integration": execute_integration,
         }
         if idempotency_key:
-            existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+            with self.db.no_autoflush:
+                existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
             if (
                 existing
                 and existing.result == "pending_integration"
@@ -96,7 +99,8 @@ class CommandService:
             if not project_id:
                 decision = PolicyDecision(False, "project context required for draft_boss_escalation")
             else:
-                project = self.db.get(models.Project, project_id)
+                with self.db.no_autoflush:
+                    project = self.db.get(models.Project, project_id)
                 if not project:
                     decision = PolicyDecision(False, "project not found for draft_boss_escalation")
                 elif not proposal.payload.get("escalation_message"):
@@ -111,7 +115,8 @@ class CommandService:
         else:
             safe_paused = False
             if project_id:
-                project = self.db.get(models.Project, project_id)
+                with self.db.no_autoflush:
+                    project = self.db.get(models.Project, project_id)
                 if project:
                     safe_paused = bool(project.safe_paused)
 
@@ -127,6 +132,7 @@ class CommandService:
         detail = decision.reason
         stored_result = "denied"
         reserved_integration_record: models.AuditEvent | None = None
+        unexpected_execute_exc: Exception | None = None
 
         if decision.allowed:
             if validate_integration:
@@ -169,75 +175,98 @@ class CommandService:
                     stored_result = "simulated"
                 else:
                     if idempotency_key:
-                        reservation_payload = {
-                            "actor": actor,
-                            "auth": {
-                                "role": role,
-                                "actor_trusted": actor_trusted,
-                                "dry_run": dry_run,
-                                "validate_integration": validate_integration,
-                                "execute_integration": execute_integration,
-                            },
-                            "proposal": proposal.model_dump(),
-                            "policy": decision.__dict__,
-                            "integration": {
-                                "name": "notion",
-                                "action": proposal.action,
-                                "status": "pending",
-                                "detail": "integration execution pending",
-                            },
-                        }
-                        reserved_integration_record = models.AuditEvent(
-                            project_id=project_id,
-                            actor=actor,
-                            action=proposal.action,
-                            target_type="proposal",
-                            target_id=proposal.project_id,
-                            payload=json.dumps(reservation_payload, ensure_ascii=False),
-                            result="pending_integration",
-                            idempotency_key=idempotency_key,
-                            created_at=datetime.utcnow(),
-                        )
-                        self.db.add(reserved_integration_record)
-                        try:
-                            self.db.flush()
-                        except IntegrityError:
-                            self.db.rollback()
-                            existing = self._wait_for_existing_idempotent_record(
-                                idempotency_key,
-                                wait_for_stable_result=True,
-                            )
-                            if existing:
-                                return self._replay_existing_execution(
-                                    existing=existing,
-                                    replay_context=replay_context,
-                                    proposal=proposal,
-                                )
-                            raise
-
-                    try:
-                        integration_result = INTEGRATIONS["notion"].execute(
-                            action="create_task",
-                            payload={
-                                **proposal.payload,
-                                "project_id": project_id,
-                            },
-                        )
-                        if integration_result.ok:
-                            response_result = "executed"
-                            stored_result = "accepted"
-                            detail = integration_result.detail or "notion executed: create_task"
-                            success = True
-                        else:
+                        if self._caller_session_holds_sqlite_write_transaction():
                             response_result = "rejected"
                             stored_result = "denied"
-                            detail = integration_result.detail or "integration execution reported failure"
+                            detail = (
+                                "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+                            )
                             success = False
-                    except IntegrationError as exc:
-                        response_result = "rejected"
-                        stored_result = "denied"
-                        detail = str(exc)
-                        success = False
+                        else:
+                            reservation_payload = {
+                                "actor": actor,
+                                "auth": {
+                                    "role": role,
+                                    "actor_trusted": actor_trusted,
+                                    "dry_run": dry_run,
+                                    "validate_integration": validate_integration,
+                                    "execute_integration": execute_integration,
+                                },
+                                "proposal": proposal.model_dump(),
+                                "policy": decision.__dict__,
+                                "integration": {
+                                    "name": "notion",
+                                    "action": proposal.action,
+                                    "status": "pending",
+                                    "detail": "integration execution pending",
+                                },
+                            }
+                            reservation_id: str | None = None
+                            reservation_session = Session(bind=self.db.get_bind(), future=True)
+                            try:
+                                reserved_integration_record = models.AuditEvent(
+                                    project_id=project_id,
+                                    actor=actor,
+                                    action=proposal.action,
+                                    target_type="proposal",
+                                    target_id=proposal.project_id,
+                                    payload=json.dumps(reservation_payload, ensure_ascii=False),
+                                    result="pending_integration",
+                                    idempotency_key=idempotency_key,
+                                    created_at=datetime.utcnow(),
+                                )
+                                reservation_session.add(reserved_integration_record)
+                                reservation_session.commit()
+                                reservation_id = reserved_integration_record.id
+                            except IntegrityError:
+                                reservation_session.rollback()
+                                existing = self._wait_for_existing_idempotent_record(
+                                    idempotency_key,
+                                    wait_for_stable_result=True,
+                                )
+                                if existing:
+                                    return self._replay_existing_execution(
+                                        existing=existing,
+                                        replay_context=replay_context,
+                                        proposal=proposal,
+                                    )
+                                raise
+                            finally:
+                                reservation_session.close()
+
+                            with self.db.no_autoflush:
+                                reserved_integration_record = self.db.query(models.AuditEvent).filter_by(id=reservation_id).one()
+
+                    if success:
+                        try:
+                            integration_result = INTEGRATIONS["notion"].execute(
+                                action="create_task",
+                                payload={
+                                    **proposal.payload,
+                                    "project_id": project_id,
+                                },
+                            )
+                            if integration_result.ok:
+                                response_result = "executed"
+                                stored_result = "accepted"
+                                detail = integration_result.detail or "notion executed: create_task"
+                                success = True
+                            else:
+                                response_result = "rejected"
+                                stored_result = "denied"
+                                detail = integration_result.detail or "integration execution reported failure"
+                                success = False
+                        except IntegrationError as exc:
+                            response_result = "rejected"
+                            stored_result = "denied"
+                            detail = str(exc)
+                            success = False
+                        except Exception as exc:
+                            response_result = "failed"
+                            stored_result = "denied"
+                            detail = str(exc) or type(exc).__name__
+                            success = False
+                            unexpected_execute_exc = exc
             elif proposal.requires_approval or decision.requires_approval:
                 if dry_run:
                     response_result = "simulated"
@@ -275,10 +304,17 @@ class CommandService:
             }
 
         if reserved_integration_record is not None:
+            final_reserved_result = stored_result
+            if success and response_result == "executed" and not dry_run:
+                final_reserved_result = "executed"
+            self._persist_audit_event_result_isolated(
+                audit_event_id=reserved_integration_record.id,
+                payload=payload,
+                result=final_reserved_result,
+            )
             reserved_integration_record.payload = json.dumps(payload, ensure_ascii=False)
-            reserved_integration_record.result = stored_result
+            reserved_integration_record.result = final_reserved_result
             record = reserved_integration_record
-            self.db.flush()
         else:
             record = models.AuditEvent(
                 project_id=project_id,
@@ -307,10 +343,14 @@ class CommandService:
 
         if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
-            self.db.query(models.AuditEvent).filter_by(id=record.id).update(
-                {models.AuditEvent.result: "executed"},
-                synchronize_session=False,
-            )
+            if reserved_integration_record is None:
+                self.db.query(models.AuditEvent).filter_by(id=record.id).update(
+                    {models.AuditEvent.result: "executed"},
+                    synchronize_session=False,
+                )
+
+        if unexpected_execute_exc is not None:
+            raise unexpected_execute_exc.with_traceback(unexpected_execute_exc.__traceback__)
 
         return ProposalExecution(
             success=success,
@@ -589,12 +629,68 @@ class CommandService:
             detail="rollback action applied",
         )
 
+    def _caller_session_holds_sqlite_write_transaction(self) -> bool:
+        bind = self.db.get_bind()
+        if getattr(bind.dialect, "name", None) != "sqlite":
+            return False
+        if getattr(bind.url, "database", None) in (None, ""):
+            return False
+        connection = self.db.connection()
+        dbapi_connection = getattr(connection, "connection", None)
+        return bool(getattr(dbapi_connection, "in_transaction", False))
+
+    def _persist_audit_event_result_isolated(
+        self,
+        *,
+        audit_event_id: str,
+        payload: dict,
+        result: str,
+        attempts: int = PENDING_INTEGRATION_WAIT_ATTEMPTS,
+        delay_seconds: float = PENDING_INTEGRATION_WAIT_DELAY_SECONDS,
+    ) -> None:
+        for attempt in range(attempts):
+            persistence_session = Session(bind=self.db.get_bind(), future=True)
+            try:
+                audit_event = persistence_session.get(models.AuditEvent, audit_event_id)
+                if audit_event is None:
+                    raise RuntimeError(f"audit event missing: {audit_event_id}")
+                audit_event.payload = json.dumps(payload, ensure_ascii=False)
+                audit_event.result = result
+                persistence_session.commit()
+                return
+            except OperationalError as exc:
+                persistence_session.rollback()
+                if not self._is_retryable_sqlite_lock_error(exc) or attempt >= attempts - 1:
+                    raise
+                time.sleep(delay_seconds)
+            finally:
+                persistence_session.close()
+
+    def _is_retryable_sqlite_lock_error(self, exc: OperationalError) -> bool:
+        bind = self.db.get_bind()
+        if getattr(bind.dialect, "name", None) != "sqlite":
+            return False
+        return "database is locked" in str(exc).lower()
+
+    def _load_existing_idempotent_record_snapshot(
+        self,
+        idempotency_key: str,
+    ) -> models.AuditEvent | None:
+        read_session = Session(bind=self.db.get_bind(), future=True)
+        try:
+            existing = read_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+            if existing is not None:
+                read_session.expunge(existing)
+            return existing
+        finally:
+            read_session.close()
+
     def _wait_for_existing_idempotent_record(
         self,
         idempotency_key: str | None,
         *,
-        attempts: int = 50,
-        delay_seconds: float = 0.01,
+        attempts: int = PENDING_INTEGRATION_WAIT_ATTEMPTS,
+        delay_seconds: float = PENDING_INTEGRATION_WAIT_DELAY_SECONDS,
         wait_for_stable_result: bool = False,
     ) -> models.AuditEvent | None:
         if not idempotency_key:
@@ -602,7 +698,7 @@ class CommandService:
 
         existing: models.AuditEvent | None = None
         for attempt in range(attempts):
-            existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+            existing = self._load_existing_idempotent_record_snapshot(idempotency_key)
             if existing and (
                 not wait_for_stable_result
                 or existing.result != "pending_integration"
@@ -611,7 +707,6 @@ class CommandService:
                 return existing
             if attempt < attempts - 1:
                 time.sleep(delay_seconds)
-                self.db.expire_all()
         return existing
 
     def _is_stale_pending_integration(self, existing: models.AuditEvent) -> bool:
@@ -779,9 +874,13 @@ class CommandService:
             "status": "failed",
             "detail": detail,
         }
+        self._persist_audit_event_result_isolated(
+            audit_event_id=existing.id,
+            payload=payload,
+            result="denied",
+        )
         existing.payload = json.dumps(payload, ensure_ascii=False)
         existing.result = "denied"
-        self.db.flush()
         return existing, repair_payload
 
     def _replay_existing_execution(

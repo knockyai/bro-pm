@@ -401,6 +401,7 @@ def test_command_service_create_task_assisted_execution_calls_integrations_execu
         name="Assisted execution project",
         slug="assisted-execution",
     )
+    session.commit()
     service = CommandService(db_session=session)
     notion = INTEGRATIONS["notion"]
     call_counter = {"execute": 0, "validate": 0}
@@ -458,6 +459,741 @@ def test_command_service_create_task_assisted_execution_calls_integrations_execu
     assert payload["integration"]["detail"] == "notion executed assisted create_task"
 
 
+def test_command_service_create_task_assisted_execution_commits_pending_reservation_before_integration_execute(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted durable pending project",
+            slug="assisted-durable-pending",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-durable-pending-key"
+    observed: dict[str, dict | None] = {}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        observer_session = database.SessionLocal()
+        try:
+            record = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+            observed["record"] = (
+                None
+                if record is None
+                else {
+                    "result": record.result,
+                    "target_id": record.target_id,
+                    "payload": json.loads(record.payload),
+                }
+            )
+        finally:
+            observer_session.close()
+        return IntegrationResult(ok=True, detail="notion executed assisted create_task")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(notion, "execute", execute_stub)
+    try:
+        session = database.SessionLocal()
+        try:
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task durable pending reservation",
+                project_id=project_id,
+            )
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key=idempotency_key,
+                execute_integration=True,
+            )
+            session.commit()
+        finally:
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+    assert execution.result == "executed"
+    assert observed["record"] == {
+        "result": "pending_integration",
+        "target_id": project_id,
+        "payload": {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "integration execution pending",
+            },
+        },
+    }
+
+
+def test_command_service_create_task_assisted_execution_pending_reservation_does_not_commit_unrelated_session_changes(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted pending isolated transaction project",
+            slug="assisted-pending-isolated-transaction",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    observed: dict[str, str | None] = {}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        observer_session = database.SessionLocal()
+        try:
+            observed_project = observer_session.get(models.Project, project_id)
+            observed["description"] = None if observed_project is None else observed_project.description
+        finally:
+            observer_session.close()
+        return IntegrationResult(ok=True, detail="notion executed assisted create_task")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(notion, "execute", execute_stub)
+    try:
+        session = database.SessionLocal()
+        try:
+            session.autoflush = True
+            project = session.get(models.Project, project_id)
+            assert project is not None
+            project.description = "caller-owned pending change"
+
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task durable pending reservation",
+                project_id=project_id,
+            )
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="assisted-durable-pending-isolated-key",
+                execute_integration=True,
+            )
+
+            assert execution.result == "executed"
+            assert observed["description"] is None
+            assert project.description == "caller-owned pending change"
+        finally:
+            session.rollback()
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+
+def test_command_service_create_task_assisted_execution_rejects_sqlite_write_locked_caller_session(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted sqlite lock guard project",
+            slug="assisted-sqlite-lock-guard",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+
+    def execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:
+        raise AssertionError("integration execute must not run when sqlite caller transaction already holds a write lock")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(notion, "execute", execute_forbidden)
+    try:
+        session = database.SessionLocal()
+        try:
+            project = session.get(models.Project, project_id)
+            assert project is not None
+            project.description = "already flushed caller change"
+            session.flush()
+
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task durable pending reservation",
+                project_id=project_id,
+            )
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="assisted-sqlite-lock-guard-key",
+                execute_integration=True,
+            )
+            session.commit()
+        finally:
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+    assert execution.result == "rejected"
+    assert execution.detail == "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+
+    observer_session = database.SessionLocal()
+    try:
+        audit = observer_session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    finally:
+        observer_session.close()
+
+    assert audit.result == "denied"
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["status"] == "rejected"
+    assert payload["integration"]["detail"] == execution.detail
+
+
+def test_command_service_create_task_assisted_execution_rejects_in_memory_sqlite_write_locked_caller_session():
+    database, setup_session = _make_isolated_db_session()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted sqlite memory lock guard project",
+            slug=f"assisted-sqlite-memory-lock-guard-{uuid4().hex[:8]}",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    execute_counter = {"count": 0}
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        notion,
+        "execute",
+        lambda *, action, payload: execute_counter.__setitem__("count", execute_counter["count"] + 1)
+        or IntegrationResult(ok=True, detail="unexpected in-memory sqlite execution"),
+    )
+    try:
+        session = database.SessionLocal()
+        try:
+            project = session.get(models.Project, project_id)
+            assert project is not None
+            project.description = "already flushed caller change"
+            session.flush()
+
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task durable pending reservation",
+                project_id=project_id,
+            )
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="assisted-sqlite-memory-lock-guard-key",
+                execute_integration=True,
+            )
+        finally:
+            session.rollback()
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+    observer_session = database.SessionLocal()
+    try:
+        observed_project = observer_session.get(models.Project, project_id)
+        audit = observer_session.query(models.AuditEvent).filter_by(
+            idempotency_key="assisted-sqlite-memory-lock-guard-key"
+        ).one_or_none()
+    finally:
+        observer_session.close()
+
+    assert observed_project is not None
+    assert observed_project.description is None
+    assert audit is None
+    assert execute_counter == {"count": 0}
+    assert execution.result == "rejected"
+    assert execution.detail == "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+
+
+def test_command_service_create_task_assisted_execution_persists_terminal_audit_state_even_if_caller_rolls_back(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted durable terminal state project",
+            slug="assisted-durable-terminal-state",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        notion,
+        "execute",
+        lambda *, action, payload: IntegrationResult(ok=True, detail="notion executed assisted create_task"),
+    )
+    try:
+        session = database.SessionLocal()
+        try:
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task durable pending reservation",
+                project_id=project_id,
+            )
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="assisted-durable-terminal-state-key",
+                execute_integration=True,
+            )
+            session.rollback()
+        finally:
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+    observer_session = database.SessionLocal()
+    try:
+        audit = observer_session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    finally:
+        observer_session.close()
+
+    assert audit.result == "executed"
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["status"] == "executed"
+    assert payload["integration"]["detail"] == "notion executed assisted create_task"
+
+
+def test_command_service_create_task_assisted_execution_persists_terminal_failure_before_reraising_unexpected_exception(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted unexpected integration exception project",
+            slug="assisted-unexpected-integration-exception",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    failure_detail = "unexpected notion explode"
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        raise RuntimeError(failure_detail)
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task durable unexpected integration failure",
+            project_id=project_id,
+        )
+
+        with pytest.raises(RuntimeError, match=failure_detail):
+            service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="assisted-unexpected-integration-exception-key",
+                execute_integration=True,
+            )
+    finally:
+        session.rollback()
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        audit = observer_session.query(models.AuditEvent).filter_by(
+            idempotency_key="assisted-unexpected-integration-exception-key"
+        ).one()
+    finally:
+        observer_session.close()
+
+    assert audit.result == "denied"
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["status"] == "failed"
+    assert payload["integration"]["detail"] == failure_detail
+
+
+def test_command_service_wait_for_existing_idempotent_record_preserves_unrelated_pending_caller_changes(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "wait-preserves-caller-session-key"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Wait preserves caller session project",
+            slug="wait-preserves-caller-session",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload=json.dumps({}, ensure_ascii=False),
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "caller-owned pending change"
+
+        service = CommandService(db_session=session)
+        update_counter = {"sleep": 0}
+
+        def fake_sleep(delay_seconds: float) -> None:
+            update_counter["sleep"] += 1
+            updater_session = database.SessionLocal()
+            try:
+                audit = updater_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+                audit.result = "denied"
+                audit.payload = json.dumps(
+                    {
+                        "integration": {
+                            "status": "failed",
+                            "detail": "updated from isolated waiter",
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+                updater_session.commit()
+            finally:
+                updater_session.close()
+
+        monkeypatch.setattr("bro_pm.services.command_service.time.sleep", fake_sleep)
+
+        existing = service._wait_for_existing_idempotent_record(
+            idempotency_key,
+            attempts=2,
+            delay_seconds=0.01,
+            wait_for_stable_result=True,
+        )
+
+        assert existing is not None
+        assert existing.result == "denied"
+        assert update_counter == {"sleep": 1}
+        assert project.description == "caller-owned pending change"
+        assert session.is_modified(project)
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_command_service_waited_stale_pending_replay_rewrites_storage_durably(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "waited-stale-detached-repair"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Waited stale detached repair project",
+            slug="waited-stale-detached-repair",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: (_ for _ in ()).throw(
+            AssertionError("integration execute must not run when waited pending replay is repaired as stale")
+        ),
+    )
+
+    waited_updates = {"sleep": 0}
+
+    def fake_sleep(delay_seconds: float) -> None:
+        waited_updates["sleep"] += 1
+        updater_session = database.SessionLocal()
+        try:
+            audit = updater_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+            audit.created_at = datetime.utcnow() - timedelta(minutes=10)
+            updater_session.commit()
+        finally:
+            updater_session.close()
+
+    monkeypatch.setattr("bro_pm.services.command_service.time.sleep", fake_sleep)
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task waited stale repair",
+            project_id=project_id,
+        )
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        stored = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    finally:
+        observer_session.close()
+
+    assert waited_updates == {"sleep": 1}
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == stale_detail
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert stored_payload["replay_repair"] == {
+        "source": "unreadable_pending_integration_payload",
+    }
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+def test_command_service_waited_stale_pending_replay_repair_survives_caller_rollback(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "waited-stale-repair-survives-rollback"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Waited stale repair rollback durability project",
+            slug="waited-stale-repair-rollback-durability",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: (_ for _ in ()).throw(
+            AssertionError("integration execute must not run when waited pending replay is repaired as stale")
+        ),
+    )
+
+    waited_updates = {"sleep": 0}
+
+    def fake_sleep(delay_seconds: float) -> None:
+        waited_updates["sleep"] += 1
+        updater_session = database.SessionLocal()
+        try:
+            audit = updater_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+            audit.created_at = datetime.utcnow() - timedelta(minutes=10)
+            updater_session.commit()
+        finally:
+            updater_session.close()
+
+    monkeypatch.setattr("bro_pm.services.command_service.time.sleep", fake_sleep)
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task waited stale rollback durability",
+            project_id=project_id,
+        )
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+        session.rollback()
+    finally:
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        stored = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    finally:
+        observer_session.close()
+
+    assert waited_updates == {"sleep": 1}
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == stale_detail
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert stored_payload["replay_repair"] == {
+        "source": "unreadable_pending_integration_payload",
+    }
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+
+def test_command_service_stale_pending_replay_repair_does_not_flush_unrelated_caller_changes(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "stale-repair-no-caller-flush"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale repair no caller flush project",
+            slug="stale-repair-no-caller-flush",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: (_ for _ in ()).throw(
+            AssertionError("integration execute must not run when stale replay is repaired as denied")
+        ),
+    )
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "caller-owned dirty description"
+
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task stale repair no flush",
+            project_id=project_id,
+        )
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+
+        assert execution.success is False
+        assert execution.result == "rejected"
+        assert execution.detail == stale_detail
+        assert project.description == "caller-owned dirty description"
+        assert session.is_modified(project) is True
+    finally:
+        session.rollback()
+        session.close()
+
+
+
+def test_command_service_pending_integration_wait_budget_matches_reporting_baseline():
+    assert CommandService.PENDING_INTEGRATION_WAIT_ATTEMPTS == 100
+    assert CommandService.PENDING_INTEGRATION_WAIT_DELAY_SECONDS == 0.05
+
+
+
 def test_command_service_create_task_assisted_execution_respects_policy_before_integrations_execute(db_session, monkeypatch):
     session = db_session
     project = _create_project(
@@ -498,6 +1234,7 @@ def test_command_service_create_task_assisted_execution_replay_preserves_integra
         name="Assisted execution replay project",
         slug="assisted-replay",
     )
+    session.commit()
     service = CommandService(db_session=session)
     notion = INTEGRATIONS["notion"]
     call_counter = {"execute": 0}
@@ -2003,6 +2740,7 @@ def test_command_service_create_task_assisted_execution_returns_integration_erro
         name="Assisted integration failure project",
         slug="assisted-failure",
     )
+    session.commit()
     service = CommandService(db_session=session)
     notion = INTEGRATIONS["notion"]
     failure_detail = "notion execute failed: api timeout"
@@ -2085,6 +2823,7 @@ def test_command_service_create_task_assisted_execution_is_idempotency_mode_isol
         name="Assisted idempotency isolation",
         slug="assisted-idem",
     )
+    session.commit()
     service = CommandService(db_session=session)
     notion = INTEGRATIONS["notion"]
 
