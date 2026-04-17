@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +36,8 @@ class RollbackExecution:
 
 class CommandService:
     """Convert parsed commands into durable audit-ready operations."""
+
+    PENDING_INTEGRATION_STALE_AFTER = timedelta(minutes=5)
 
     def __init__(self, db_session: Session, hermes: HermesAdapter | None = None, policy: PolicyEngine | None = None):
         self.db = db_session
@@ -72,7 +74,11 @@ class CommandService:
         }
         if idempotency_key:
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
-            if existing and existing.result == "pending_integration":
+            if (
+                existing
+                and existing.result == "pending_integration"
+                and not self._is_stale_pending_integration(existing)
+            ):
                 existing = self._wait_for_existing_idempotent_record(
                     idempotency_key,
                     wait_for_stable_result=True,
@@ -597,12 +603,158 @@ class CommandService:
         existing: models.AuditEvent | None = None
         for attempt in range(attempts):
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
-            if existing and (not wait_for_stable_result or existing.result != "pending_integration"):
+            if existing and (
+                not wait_for_stable_result
+                or existing.result != "pending_integration"
+                or self._is_stale_pending_integration(existing)
+            ):
                 return existing
             if attempt < attempts - 1:
                 time.sleep(delay_seconds)
                 self.db.expire_all()
         return existing
+
+    def _is_stale_pending_integration(self, existing: models.AuditEvent) -> bool:
+        return (
+            existing.result == "pending_integration"
+            and existing.created_at is not None
+            and datetime.utcnow() - existing.created_at >= self.PENDING_INTEGRATION_STALE_AFTER
+        )
+
+    def _partial_mapping_matches(self, stored: object, current: object) -> bool:
+        if isinstance(stored, dict):
+            if not isinstance(current, dict):
+                return False
+            return all(
+                key in current and self._partial_mapping_matches(value, current.get(key))
+                for key, value in stored.items()
+            )
+        return stored == current
+
+    def _stored_payload_has_complete_replay_context(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        auth = payload.get("auth")
+        proposal_payload = payload.get("proposal")
+        required_auth_keys = {
+            "role",
+            "actor_trusted",
+            "dry_run",
+            "validate_integration",
+            "execute_integration",
+        }
+        return (
+            isinstance(auth, dict)
+            and required_auth_keys.issubset(auth)
+            and isinstance(proposal_payload, dict)
+        )
+
+    def _can_repair_stale_pending_integration_replay(
+        self,
+        *,
+        existing: models.AuditEvent,
+        replay_context: dict,
+        proposal: CommandProposal,
+    ) -> bool:
+        if not (
+            existing.result == "pending_integration"
+            and self._is_stale_pending_integration(existing)
+            and proposal.action == "create_task"
+            and existing.action == "create_task"
+            and replay_context.get("execute_integration", False)
+            and not replay_context.get("dry_run", False)
+            and not replay_context.get("validate_integration", False)
+        ):
+            return False
+
+        if existing.actor != replay_context.get("actor"):
+            return False
+
+        try:
+            payload = json.loads(existing.payload) if existing.payload else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return True
+
+        if isinstance(payload, dict):
+            payload_actor = payload.get("actor")
+            if payload_actor is not None and payload_actor != replay_context.get("actor"):
+                return False
+
+            auth = payload.get("auth")
+            if auth is not None:
+                if not isinstance(auth, dict):
+                    return False
+                for key in (
+                    "role",
+                    "actor_trusted",
+                    "dry_run",
+                    "validate_integration",
+                    "execute_integration",
+                ):
+                    if key in auth and auth.get(key) != replay_context.get(key):
+                        return False
+
+            proposal_payload = payload.get("proposal")
+            if proposal_payload is not None and not self._partial_mapping_matches(
+                proposal_payload,
+                replay_context.get("proposal"),
+            ):
+                return False
+        if not self._stored_payload_has_complete_replay_context(payload):
+            return True
+
+        auth = payload.get("auth")
+        proposal_payload = payload.get("proposal")
+        existing_context = {
+            "actor": existing.actor,
+            "role": auth.get("role"),
+            "actor_trusted": auth.get("actor_trusted"),
+            "proposal": proposal_payload,
+            "dry_run": auth.get("dry_run", False),
+            "validate_integration": auth.get("validate_integration", False),
+            "execute_integration": auth.get("execute_integration", False),
+        }
+        return existing_context == replay_context
+
+    def _mark_stale_pending_integration_denied(
+        self,
+        *,
+        existing: models.AuditEvent,
+        replay_context: dict,
+    ) -> tuple[models.AuditEvent, bool]:
+        detail = "stale pending integration request requires manual reconciliation before retry"
+        try:
+            payload = json.loads(existing.payload) if existing.payload else {}
+            repair_payload = not isinstance(payload, dict) or not payload
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+            repair_payload = True
+
+        if repair_payload:
+            integration_payload = (payload.get("integration") or {}) if isinstance(payload, dict) else {}
+            payload = {
+                **(payload if isinstance(payload, dict) else {}),
+                "actor": (payload.get("actor") if isinstance(payload, dict) else None) or existing.actor,
+                "replay_repair": {
+                    "source": "unreadable_pending_integration_payload",
+                },
+                "integration": {
+                    **integration_payload,
+                    "action": integration_payload.get("action") or existing.action,
+                },
+            }
+
+        integration_payload = payload.get("integration") or {}
+        payload["integration"] = {
+            **integration_payload,
+            "status": "failed",
+            "detail": detail,
+        }
+        existing.payload = json.dumps(payload, ensure_ascii=False)
+        existing.result = "denied"
+        self.db.flush()
+        return existing, repair_payload
 
     def _replay_existing_execution(
         self,
@@ -611,6 +763,17 @@ class CommandService:
         replay_context: dict,
         proposal: CommandProposal,
     ) -> ProposalExecution:
+        repaired_stale_payload = False
+        if self._can_repair_stale_pending_integration_replay(
+            existing=existing,
+            replay_context=replay_context,
+            proposal=proposal,
+        ):
+            existing, repaired_stale_payload = self._mark_stale_pending_integration_denied(
+                existing=existing,
+                replay_context=replay_context,
+            )
+
         try:
             existing_payload = json.loads(existing.payload)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -621,6 +784,32 @@ class CommandService:
                 result="rejected",
                 detail="idempotency key already used for unreadable stored request context",
             )
+
+        detail = existing_payload.get("policy", {}).get("reason", "replayed idempotent result")
+        integration_detail = (
+            existing_payload.get("integration", {}) or {}
+        ).get("detail")
+        if (
+            existing_payload.get("auth", {}).get("validate_integration", False)
+            or existing_payload.get("auth", {}).get("execute_integration", False)
+        ) and integration_detail:
+            detail = integration_detail
+        if repaired_stale_payload or (
+            existing.result == "denied"
+            and integration_detail == "stale pending integration request requires manual reconciliation before retry"
+            and not self._stored_payload_has_complete_replay_context(existing_payload)
+        ) or (
+            (existing_payload.get("replay_repair", {}) or {}).get("source")
+            == "unreadable_pending_integration_payload"
+        ):
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="rejected",
+                detail=integration_detail or detail,
+            )
+
         existing_context = {
             "actor": existing.actor,
             "role": existing_payload.get("auth", {}).get("role"),
@@ -638,16 +827,6 @@ class CommandService:
                 result="rejected",
                 detail="idempotency key already used for different request context",
             )
-
-        detail = existing_payload.get("policy", {}).get("reason", "replayed idempotent result")
-        integration_detail = (
-            existing_payload.get("integration", {}) or {}
-        ).get("detail")
-        if (
-            existing_payload.get("auth", {}).get("validate_integration", False)
-            or existing_payload.get("auth", {}).get("execute_integration", False)
-        ) and integration_detail:
-            detail = integration_detail
 
         if existing.result == "denied":
             return ProposalExecution(

@@ -5,6 +5,7 @@ import importlib
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from uuid import uuid4
@@ -543,6 +544,1016 @@ def test_command_service_create_task_assisted_execution_replay_preserves_integra
     audit = session.query(models.AuditEvent).filter_by(id=first.audit_id).one()
     stored_payload = json.loads(audit.payload)
     assert stored_payload["integration"]["detail"] == expected_detail
+
+
+def test_command_service_create_task_assisted_execution_recovers_stale_pending_idempotency_reservation_with_unreadable_payload(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale unreadable recovery",
+        slug="assisted-stale-unreadable",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-unreadable"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale unreadable replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale unreadable recovery",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload="{legacy-pending-json",
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == stale_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == stale_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert stored_payload["replay_repair"] == {
+        "source": "unreadable_pending_integration_payload",
+    }
+    assert "auth" not in stored_payload
+    assert "proposal" not in stored_payload
+    assert "name" not in stored_payload["integration"]
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+
+def test_command_service_create_task_assisted_execution_recovers_stale_pending_idempotency_reservation_with_empty_payload(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale empty payload recovery",
+        slug="assisted-stale-empty",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-empty"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale empty replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale empty recovery",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps({}, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == stale_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == stale_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert stored_payload["replay_repair"] == {
+        "source": "unreadable_pending_integration_payload",
+    }
+    assert "auth" not in stored_payload
+    assert "proposal" not in stored_payload
+    assert "name" not in stored_payload["integration"]
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+
+def test_command_service_create_task_assisted_execution_preserves_readable_partial_stale_payload_without_repair(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale partial payload recovery",
+        slug="assisted-stale-partial",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-partial"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale partial replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale partial recovery",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(
+                {
+                    "actor": "alice",
+                    "integration": {
+                        "name": "legacy-partial-adapter",
+                        "action": "create_task",
+                        "status": "pending",
+                        "detail": "integration execution pending",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == stale_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == stale_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert "auth" not in stored_payload
+    assert "proposal" not in stored_payload
+    assert stored_payload["integration"]["name"] == "legacy-partial-adapter"
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+
+def test_command_service_create_task_assisted_execution_stale_auth_only_payload_returns_manual_reconciliation_rejection(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale auth-only payload",
+        slug="assisted-stale-auth-only",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-auth-only"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale auth-only replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale auth only payload",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(
+                {
+                    "actor": "alice",
+                    "auth": {
+                        "role": "admin",
+                        "actor_trusted": True,
+                        "dry_run": False,
+                        "validate_integration": False,
+                        "execute_integration": True,
+                    },
+                    "integration": {
+                        "name": "legacy-auth-only-adapter",
+                        "action": "create_task",
+                        "status": "pending",
+                        "detail": "integration execution pending",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == stale_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == stale_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert "proposal" not in stored_payload
+    assert stored_payload["auth"] == {
+        "role": "admin",
+        "actor_trusted": True,
+        "dry_run": False,
+        "validate_integration": False,
+        "execute_integration": True,
+    }
+    assert stored_payload["integration"]["name"] == "legacy-auth-only-adapter"
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+
+def test_command_service_create_task_assisted_execution_different_actor_does_not_tombstone_readable_partial_stale_payload(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale partial payload different actor",
+        slug="assisted-stale-partial-different-actor",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-partial-different-actor"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale partial mismatch replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    original_proposal = service.parse(
+        actor="alice",
+        command="create task original stale partial request",
+        project_id=project.id,
+    )
+    replay_proposal = service.parse(
+        actor="bob",
+        command="create task replay stale partial request",
+        project_id=project.id,
+    )
+    original_payload = {
+        "actor": "alice",
+        "integration": {
+            "name": "legacy-partial-adapter",
+            "action": "create_task",
+            "status": "pending",
+            "detail": "integration execution pending",
+        },
+    }
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(original_payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    execution = service.execute(
+        actor="bob",
+        role="operator",
+        proposal=replay_proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "idempotency key already used for different request context"
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "pending_integration"
+    assert stored.actor == "alice"
+    assert stored_payload == original_payload
+
+
+
+
+def test_command_service_create_task_assisted_execution_stale_auth_only_payload_preserves_reservation_for_different_actor(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale auth-only different actor",
+        slug="assisted-stale-auth-only-different-actor",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-auth-only-different-actor"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale auth-only different-actor replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    original_payload = {
+        "actor": "alice",
+        "auth": {
+            "role": "admin",
+            "actor_trusted": True,
+            "dry_run": False,
+            "validate_integration": False,
+            "execute_integration": True,
+        },
+        "integration": {
+            "name": "legacy-auth-only-adapter",
+            "action": "create_task",
+            "status": "pending",
+            "detail": "integration execution pending",
+        },
+    }
+    replay_proposal = service.parse(
+        actor="bob",
+        command="create task stale auth only different actor",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(original_payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    execution = service.execute(
+        actor="bob",
+        role="admin",
+        proposal=replay_proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "idempotency key already used for different request context"
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "pending_integration"
+    assert stored.actor == "alice"
+    assert stored_payload == original_payload
+
+
+
+def test_command_service_create_task_assisted_execution_stale_proposal_only_payload_preserves_reservation_for_different_request(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale proposal-only different request",
+        slug="assisted-stale-proposal-only-different-request",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-proposal-only-different-request"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale proposal-only different-request replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    original_proposal = service.parse(
+        actor="alice",
+        command="create task original stale proposal only request",
+        project_id=project.id,
+    )
+    replay_proposal = service.parse(
+        actor="alice",
+        command="create task replay stale proposal only request",
+        project_id=project.id,
+    )
+    original_payload = {
+        "actor": "alice",
+        "proposal": {
+            "action": original_proposal.action,
+            "project_id": original_proposal.project_id,
+            "payload": {
+                "title": original_proposal.payload["title"],
+            },
+        },
+        "integration": {
+            "name": "legacy-proposal-only-adapter",
+            "action": "create_task",
+            "status": "pending",
+            "detail": "integration execution pending",
+        },
+    }
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(original_payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=replay_proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "idempotency key already used for different request context"
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "pending_integration"
+    assert stored.actor == "alice"
+    assert stored_payload == original_payload
+
+
+
+def test_command_service_create_task_assisted_execution_same_mode_different_context_preserves_stale_pending_reservation(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale different context",
+        slug="assisted-stale-different-context",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-different-context"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected execution after stale different-context replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    original_proposal = service.parse(
+        actor="alice",
+        command="create task original stale assisted request",
+        project_id=project.id,
+    )
+    replay_proposal = service.parse(
+        actor="bob",
+        command="create task replay with different context",
+        project_id=project.id,
+    )
+    original_payload = {
+        "actor": "alice",
+        "auth": {
+            "role": "admin",
+            "actor_trusted": True,
+            "dry_run": False,
+            "validate_integration": False,
+            "execute_integration": True,
+        },
+        "proposal": original_proposal.model_dump(),
+        "policy": {
+            "allowed": True,
+            "reason": "policy accepted",
+            "requires_approval": False,
+            "safe_pause_blocked": False,
+        },
+        "integration": {
+            "name": "legacy-notion-adapter",
+            "action": "create_task",
+            "status": "pending",
+            "detail": "integration execution pending",
+        },
+    }
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(original_payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    execution = service.execute(
+        actor="bob",
+        role="operator",
+        proposal=replay_proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "idempotency key already used for different request context"
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "pending_integration"
+    assert stored.actor == "alice"
+    assert stored_payload == original_payload
+
+
+
+def test_command_service_validate_mode_does_not_tombstone_stale_assisted_pending_idempotency_reservation(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Validate mode stale assisted idempotency",
+        slug="validate-stale-assisted-idempotency",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "validate-stale-assisted-idempotency"
+    validation_counter = {"validate": 0}
+
+    def validate_stub(*, action: str, payload: dict) -> None:
+        validation_counter["validate"] += 1
+
+    monkeypatch.setattr(notion, "validate", validate_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale assisted validate mismatch",
+        project_id=project.id,
+    )
+    original_payload = {
+        "actor": "alice",
+        "auth": {
+            "role": "admin",
+            "actor_trusted": True,
+            "dry_run": False,
+            "validate_integration": False,
+            "execute_integration": True,
+        },
+        "proposal": proposal.model_dump(),
+        "policy": {
+            "allowed": True,
+            "reason": "policy accepted",
+            "requires_approval": False,
+            "safe_pause_blocked": False,
+        },
+        "integration": {
+            "name": "legacy-notion-adapter",
+            "action": "create_task",
+            "status": "pending",
+            "detail": "integration execution pending",
+        },
+    }
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(original_payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        validate_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "idempotency key already used for different request context"
+    assert validation_counter["validate"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "pending_integration"
+    assert stored_payload == original_payload
+
+
+
+def test_command_service_create_task_assisted_execution_recovers_stale_pending_idempotency_reservation(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted stale pending recovery",
+        slug="assisted-stale-pending",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-pending"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected second execution")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task stale pending recovery",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(
+                {
+                    "actor": "alice",
+                    "auth": {
+                        "role": "admin",
+                        "actor_trusted": True,
+                        "dry_run": False,
+                        "validate_integration": False,
+                        "execute_integration": True,
+                    },
+                    "proposal": proposal.model_dump(),
+                    "policy": {
+                        "allowed": True,
+                        "reason": "policy accepted",
+                        "requires_approval": False,
+                        "safe_pause_blocked": False,
+                    },
+                    "integration": {
+                        "name": "legacy-notion-adapter",
+                        "action": "create_task",
+                        "status": "pending",
+                        "detail": "integration execution pending",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
+    session.commit()
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == stale_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == stale_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 0
+
+    stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_payload = json.loads(stored.payload)
+    assert stored.result == "denied"
+    assert stored_payload["actor"] == "alice"
+    assert stored_payload["auth"] == {
+        "role": "admin",
+        "actor_trusted": True,
+        "dry_run": False,
+        "validate_integration": False,
+        "execute_integration": True,
+    }
+    assert stored_payload["proposal"] == proposal.model_dump()
+    assert stored_payload["integration"]["name"] == "legacy-notion-adapter"
+    assert stored_payload["integration"]["action"] == "create_task"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
+def test_command_service_create_task_assisted_execution_waits_for_fresh_pending_idempotency_reservation(
+    db_session, monkeypatch
+):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted fresh pending wait",
+        slug="assisted-fresh-pending",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-fresh-pending"
+    call_counter = {"execute": 0, "wait": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="unexpected live execution")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task fresh pending wait",
+        project_id=project.id,
+    )
+
+    session.add(
+        models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(
+                {
+                    "actor": "alice",
+                    "auth": {
+                        "role": "admin",
+                        "actor_trusted": True,
+                        "dry_run": False,
+                        "validate_integration": False,
+                        "execute_integration": True,
+                    },
+                    "proposal": proposal.model_dump(),
+                    "policy": {
+                        "allowed": True,
+                        "reason": "policy accepted",
+                        "requires_approval": False,
+                        "safe_pause_blocked": False,
+                    },
+                    "integration": {
+                        "name": "notion",
+                        "action": "create_task",
+                        "status": "pending",
+                        "detail": "integration execution pending",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow(),
+        )
+    )
+    session.commit()
+
+    def wait_stub(idempotency_key_arg: str | None, *, attempts: int = 50, delay_seconds: float = 0.01, wait_for_stable_result: bool = False):
+        call_counter["wait"] += 1
+        assert idempotency_key_arg == idempotency_key
+        assert wait_for_stable_result is True
+        existing = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        existing.result = "executed"
+        existing.payload = json.dumps(
+            {
+                "actor": "alice",
+                "auth": {
+                    "role": "admin",
+                    "actor_trusted": True,
+                    "dry_run": False,
+                    "validate_integration": False,
+                    "execute_integration": True,
+                },
+                "proposal": proposal.model_dump(),
+                "policy": {
+                    "allowed": True,
+                    "reason": "policy accepted",
+                    "requires_approval": False,
+                    "safe_pause_blocked": False,
+                },
+                "integration": {
+                    "name": "notion",
+                    "action": "create_task",
+                    "status": "executed",
+                    "detail": "notion executed after wait",
+                },
+            },
+            ensure_ascii=False,
+        )
+        session.flush()
+        return existing
+
+    monkeypatch.setattr(service, "_wait_for_existing_idempotent_record", wait_stub)
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+        execute_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "executed"
+    assert execution.detail == "notion executed after wait"
+    assert call_counter == {"execute": 0, "wait": 1}
+
 
 
 def test_command_service_create_task_assisted_execution_returns_integration_error_detail(db_session, monkeypatch):
