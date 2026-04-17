@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 import uuid
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, text
+from sqlalchemy import Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -27,6 +28,31 @@ class Project(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     tasks: Mapped[list["Task"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    goals: Mapped[list["Goal"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+    __table_args__ = (
+        Index(
+            "uq_goals_project_active",
+            "project_id",
+            unique=True,
+            sqlite_where=text("lower(trim(status)) = 'active'"),
+            postgresql_where=text("lower(trim(status)) = 'active'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(String, ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    project: Mapped[Project] = relationship(back_populates="goals")
+    tasks: Mapped[list["Task"]] = relationship(back_populates="goal", cascade="all, delete-orphan")
 
 
 class Task(Base):
@@ -34,6 +60,7 @@ class Task(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str] = mapped_column(String, ForeignKey("projects.id"), index=True)
+    goal_id: Mapped[str | None] = mapped_column(String, ForeignKey("goals.id"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="todo")
@@ -45,6 +72,7 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     project: Mapped[Project] = relationship(back_populates="tasks")
+    goal: Mapped[Goal | None] = relationship(back_populates="tasks")
 
 
 class AuditEvent(Base):

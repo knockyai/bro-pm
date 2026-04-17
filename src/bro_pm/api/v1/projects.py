@@ -3,14 +3,42 @@ from __future__ import annotations
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...database import get_db_session
 from ... import models
-from ...schemas import ProjectCreate, ProjectResponse, TaskCreate, TaskResponse, AuditResponse, RollbackRequest, RollbackResponse
+from ...schemas import (
+    ProjectCreate,
+    ProjectResponse,
+    TaskCreate,
+    TaskResponse,
+    GoalCreate,
+    GoalResponse,
+    AuditResponse,
+    RollbackRequest,
+    RollbackResponse,
+)
 from ...services.command_service import CommandService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+def _is_active_goal_conflict(exc: IntegrityError, *, status: str) -> bool:
+    """Detect the IntegrityError raised by active-goal uniqueness collisions."""
+
+    if status.strip().lower() != "active":
+        return False
+
+    statement = (exc.statement or "").lower()
+    error_text = str(exc).lower()
+    if "insert into goals" not in statement:
+        return False
+    if "uq_goals_project_active" in error_text:
+        return True
+
+    return "goals.project_id" in error_text and "unique" in error_text
 
 
 def _project_to_response(project: models.Project) -> ProjectResponse:
@@ -45,6 +73,7 @@ def _task_to_response(task: models.Task) -> TaskResponse:
     return TaskResponse(
         id=str(task.id),
         project_id=str(task.project_id),
+        goal_id=str(task.goal_id) if task.goal_id else None,
         title=task.title,
         description=task.description,
         status=task.status,
@@ -54,6 +83,19 @@ def _task_to_response(task: models.Task) -> TaskResponse:
         created_at=task.created_at,
         updated_at=task.updated_at,
         due_at=task.due_at,
+    )
+
+
+def _goal_to_response(goal: models.Goal) -> GoalResponse:
+    return GoalResponse(
+        id=str(goal.id),
+        project_id=str(goal.project_id),
+        title=goal.title,
+        description=goal.description,
+        status=goal.status,
+        created_at=goal.created_at,
+        updated_at=goal.updated_at,
+        tasks=[_task_to_response(task) for task in goal.tasks],
     )
 
 
@@ -107,6 +149,61 @@ def create_task(project_id: str, payload: TaskCreate, db: Session = Depends(get_
     db.flush()
     db.refresh(task)
     return _task_to_response(task)
+
+
+@router.post("/{project_id}/goals", response_model=GoalResponse, status_code=status.HTTP_201_CREATED)
+def create_goal(project_id: str, payload: GoalCreate, db: Session = Depends(get_db_session)) -> GoalResponse:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    if payload.status == "active":
+        active_goal = (
+            db.query(models.Goal)
+            .filter(
+                models.Goal.project_id == project_id,
+                func.lower(func.trim(models.Goal.status)) == "active",
+            )
+            .first()
+        )
+        if active_goal:
+            raise HTTPException(status_code=409, detail="an active goal already exists for this project")
+
+    goal = models.Goal(
+        project_id=project_id,
+        title=payload.title,
+        description=payload.description,
+        status=payload.status,
+    )
+
+    try:
+        db.add(goal)
+        db.flush()
+
+        for child_task in payload.tasks:
+            task = models.Task(
+                project_id=project_id,
+                goal_id=goal.id,
+                title=child_task.title,
+                description=child_task.description,
+                status=child_task.status,
+                assignee=child_task.assignee,
+                priority=child_task.priority,
+                policy_flags=child_task.policy_flags,
+                due_at=child_task.due_at,
+            )
+            db.add(task)
+
+        db.flush()
+        db.refresh(goal)
+        return _goal_to_response(goal)
+    except IntegrityError as exc:
+        if _is_active_goal_conflict(exc, status=payload.status):
+            raise HTTPException(
+                status_code=409,
+                detail="an active goal already exists for this project",
+            ) from exc
+        raise
 
 
 @router.get("/{project_id}/tasks", response_model=List[TaskResponse])

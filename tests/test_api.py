@@ -7,6 +7,9 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from bro_pm import models
 
@@ -44,7 +47,162 @@ def _create_project(client: TestClient) -> dict:
     return data
 
 
+def _goal_payload() -> dict:
+    return {
+        "title": "Deliver first onboarding milestone",
+        "description": "Decompose high-level goal into executable tasks",
+        "status": "active",
+        "tasks": [
+            {
+                "title": "Design project plan",
+                "description": "Write the first execution plan",
+                "status": "todo",
+                "priority": "medium",
+            },
+            {
+                "title": "Assign owners",
+                "description": "Identify owners for execution",
+                "status": "todo",
+                "priority": "medium",
+            },
+        ],
+    }
+
+
+def test_api_goal_intake_creates_goal_and_decomposes_tasks(api_client: TestClient):
+    project = _create_project(api_client)
+    goal_payload = _goal_payload()
+
+    response = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=goal_payload)
+    assert response.status_code == 201
+
+    created_goal = response.json()
+    assert created_goal["title"] == goal_payload["title"]
+    assert created_goal["status"] == goal_payload["status"]
+    assert created_goal["project_id"] == project["id"]
+    assert len(created_goal["tasks"]) == 2
+
+    goal_task_titles = {task["title"] for task in created_goal["tasks"]}
+    expected_titles = {child["title"] for child in goal_payload["tasks"]}
+    assert goal_task_titles == expected_titles
+
+    listed_tasks = api_client.get(f"/api/v1/projects/{project['id']}/tasks").json()
+    assert len(listed_tasks) == 2
+    assert {task["project_id"] for task in listed_tasks} == {project["id"]}
+    assert {task["goal_id"] for task in listed_tasks} == {created_goal["id"]}
+
+
+def test_api_project_rejects_second_active_goal(api_client: TestClient):
+    project = _create_project(api_client)
+
+    first_goal = {
+        "title": "Onboard goal",
+        "description": "first intake",
+        "status": "active",
+        "tasks": [],
+    }
+    first_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=first_goal)
+    assert first_resp.status_code == 201
+
+    second_goal = {
+        "title": "Second active goal",
+        "description": "should fail",
+        "status": "active",
+        "tasks": [],
+    }
+    second_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=second_goal)
+    assert second_resp.status_code == 409
+    assert second_resp.json()["detail"] == "an active goal already exists for this project"
+
+
+def test_api_goal_status_is_normalized_for_active_goal_semantics(api_client: TestClient):
+    project = _create_project(api_client)
+
+    first_goal = {
+        "title": "Onboard goal",
+        "description": "first intake",
+        "status": " Active ",
+        "tasks": [],
+    }
+    first_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=first_goal)
+    assert first_resp.status_code == 201
+    assert first_resp.json()["status"] == "active"
+
+    second_goal = {
+        "title": "Second active goal",
+        "description": "should fail",
+        "status": "active",
+        "tasks": [],
+    }
+    second_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=second_goal)
+    assert second_resp.status_code == 409
+    assert second_resp.json()["detail"] == "an active goal already exists for this project"
+
+
+def test_api_goal_intake_handles_inconsistent_multiple_active_goals(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.execute(text("DROP INDEX IF EXISTS uq_goals_project_active"))
+        database_session.add_all(
+            [
+                models.Goal(
+                    id=f"goal-dup-{uuid4().hex[:8]}",
+                    project_id=project["id"],
+                    title="Existing active goal A",
+                    status="active",
+                ),
+                models.Goal(
+                    id=f"goal-dup-{uuid4().hex[:8]}",
+                    project_id=project["id"],
+                    title="Existing active goal B",
+                    status="active",
+                ),
+            ]
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "an active goal already exists for this project"
+
+
+def test_api_goal_intake_does_not_mask_unrelated_integrity_errors(tmp_path, monkeypatch):
+    db_path = tmp_path / f"bro_pm_api_integrity_{uuid4().hex}.db"
+    db_url = f"sqlite:///{db_path}"
+
+    for mod_name in (
+        "bro_pm.database",
+        "bro_pm.api.app",
+        "bro_pm.api",
+        "bro_pm.api.v1",
+        "bro_pm.api.v1.commands",
+        "bro_pm.api.v1.projects",
+    ):
+        sys.modules.pop(mod_name, None)
+
+    api_app = importlib.import_module("bro_pm.api.app")
+    with TestClient(api_app.create_app(database_url=db_url), raise_server_exceptions=False) as client:
+        project = _create_project(client)
+
+        def explode_flush(self, *args, **kwargs):
+            raise IntegrityError("INSERT INTO goals ...", {}, Exception("different constraint failure"))
+
+        monkeypatch.setattr(Session, "flush", explode_flush)
+
+        response = client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+
+    assert response.status_code == 500
+
+
+
 def test_api_create_and_list_project(api_client: TestClient):
+
     project_data = _create_project(api_client)
 
     response = api_client.get("/api/v1/projects")

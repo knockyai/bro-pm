@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
@@ -50,6 +50,7 @@ class TaskResponse(BaseModel):
 
     id: str
     project_id: str
+    goal_id: str | None = None
     title: str
     description: str | None
     status: str
@@ -59,6 +60,47 @@ class TaskResponse(BaseModel):
     due_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class GoalTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=3, max_length=140)
+    description: str | None = None
+    status: str = "todo"
+    assignee: str | None = None
+    priority: str = "medium"
+    policy_flags: list[str] | None = None
+    due_at: datetime | None = None
+
+
+class GoalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=3, max_length=255)
+    description: str | None = None
+    status: str = "draft"
+    tasks: list[GoalTaskCreate] = Field(default_factory=list)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value: str) -> str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class GoalResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    title: str
+    description: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    tasks: list[TaskResponse] = Field(default_factory=list)
 
 
 class CommandRequest(BaseModel):
