@@ -254,6 +254,10 @@ class AuditResponse(BaseModel):
     created_at: datetime
 
 
+class AuditEventDetailResponse(AuditResponse):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class RollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

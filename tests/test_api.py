@@ -1086,6 +1086,502 @@ def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient
     assert events[0]["id"] == "event-omega"
     assert events[1]["id"] == "event-alpha"
 
+
+def test_api_project_audit_event_detail_returns_summary_and_sanitized_payload(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-detail-success",
+                project_id=project["id"],
+                actor="alice",
+                action="pause_project",
+                target_type="proposal",
+                target_id=project["id"],
+                payload=json.dumps(
+                    {
+                        "actor": "alice",
+                        "auth": {
+                            "role": "admin",
+                            "actor_trusted": True,
+                            "dry_run": False,
+                            "validate_integration": True,
+                            "execute_integration": False,
+                            "unsafe_key": "blocked",
+                        },
+                        "proposal": {
+                            "action": "pause_project",
+                            "reason": "operator requested pause",
+                            "project_id": project["id"],
+                            "payload": {"command": "pause project"},
+                        },
+                        "policy": {
+                            "allowed": True,
+                            "reason": "policy accepted",
+                            "requires_approval": False,
+                            "unsafe_flag": "blocked",
+                        },
+                        "integration": {
+                            "name": "notion",
+                            "action": "pause_project",
+                            "status": "executed",
+                            "detail": "pause command completed",
+                            "report": "sensitive report body",
+                        },
+                        "report": {
+                            "raw": "raw report body must never be surfaced",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                result="executed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-detail-success",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "event-detail-success"
+    assert response.json()["project_id"] == project["id"]
+    assert response.json()["actor"] == "alice"
+    assert response.json()["action"] == "pause_project"
+    assert response.json()["result"] == "executed"
+    assert response.json()["detail"] == "pause command completed"
+
+    payload = response.json()["payload"]
+    assert payload["auth"] == {
+        "role": "admin",
+        "actor_trusted": True,
+        "dry_run": False,
+        "validate_integration": True,
+        "execute_integration": False,
+    }
+    assert payload["proposal"]["action"] == "pause_project"
+    assert payload["proposal"]["reason"] == "operator requested pause"
+    assert payload["policy"]["reason"] == "policy accepted"
+    assert payload["integration"]["name"] == "notion"
+    assert payload["integration"]["status"] == "executed"
+    assert payload["integration"]["detail"] == "pause command completed"
+    assert "report" not in payload
+    assert "idempotency" not in payload
+
+
+def test_api_project_audit_event_detail_missing_project_returns_404(api_client: TestClient):
+    response = api_client.get(
+        "/api/v1/projects/does-not-exist/audit-events/does-not-exist",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
+
+
+def test_api_project_audit_event_detail_missing_or_foreign_event_returns_404(api_client: TestClient):
+    project = _create_project(api_client)
+    response = api_client.post(
+        "/api/v1/projects",
+        json={
+            "name": f"Project Nova {uuid4().hex[:8]}",
+            "slug": f"project-nova-other-{uuid4().hex[:8]}",
+            "description": "project under test",
+            "visibility": "internal",
+            "safe_paused": False,
+            "metadata": {"team": "ops"},
+        },
+    )
+    assert response.status_code == 201
+    other_project = response.json()
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-other-project",
+                project_id=other_project["id"],
+                actor="alice",
+                action="pause_project",
+                target_type="proposal",
+                target_id=other_project["id"],
+                payload=json.dumps({"integration": {"detail": "should not cross projects"}}, ensure_ascii=False),
+                result="executed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    missing_response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-missing",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+    assert missing_response.status_code == 404
+
+    foreign_response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-other-project",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+    assert foreign_response.status_code == 404
+
+
+def test_api_project_audit_event_detail_rejects_untrusted_and_viewer_requests(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-guarded",
+                project_id=project["id"],
+                actor="alice",
+                action="pause_project",
+                target_type="proposal",
+                target_id=project["id"],
+                payload=json.dumps({"detail": "blocked access test"}, ensure_ascii=False),
+                result="executed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    untrusted = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-guarded",
+        params={"role": "operator"},
+    )
+    assert untrusted.status_code == 403
+    assert untrusted.json()["detail"] == "untrusted actor blocked"
+
+    viewer = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-guarded",
+        params={"role": "viewer"},
+        headers={"x-actor-trusted": "true"},
+    )
+    assert viewer.status_code == 403
+    assert viewer.json()["detail"] == "requires operator role"
+
+
+def test_api_project_audit_event_detail_preserves_long_integration_detail(api_client: TestClient):
+    project = _create_project(api_client)
+    long_detail = "publish integration unavailable: " + ("x" * 4100)
+    assert len(long_detail) > 4000
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-long-detail-detail",
+                project_id=project["id"],
+                actor="alice",
+                action="publish_report",
+                target_type="report",
+                target_id=project["id"],
+                payload=json.dumps(
+                    {
+                        "integration": {
+                            "name": "notion",
+                            "action": "publish_report",
+                            "status": "failed",
+                            "detail": long_detail,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                result="failed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-long-detail-detail",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == long_detail
+
+
+def test_api_project_audit_event_detail_preserves_exact_top_level_detail_text(api_client: TestClient):
+    project = _create_project(api_client)
+    exact_detail = "  publish integration unavailable  "
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-exact-detail-text",
+                project_id=project["id"],
+                actor="alice",
+                action="publish_report",
+                target_type="report",
+                target_id=project["id"],
+                payload=json.dumps(
+                    {
+                        "integration": {
+                            "name": "notion",
+                            "action": "publish_report",
+                            "status": "failed",
+                            "detail": exact_detail,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                result="failed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-exact-detail-text",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == exact_detail
+
+
+def test_api_project_audit_event_detail_allowlists_safe_proposal_payload_fields(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-raw-command",
+                project_id=project["id"],
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project["id"],
+                payload=json.dumps(
+                    {
+                        "proposal": {
+                            "action": "create_task",
+                            "project_id": project["id"],
+                            "payload": {
+                                "title": "operator safe task",
+                                "raw_command": "create task operator safe task with secret token abc123",
+                                "token": "abc123",
+                                "api_key": "hidden-api-key",
+                                "password": "hidden-password",
+                                "secret_blob": {
+                                    "nested": "should never surface",
+                                },
+                            },
+                        },
+                        "integration": {
+                            "name": "notion",
+                            "action": "create_task",
+                            "status": "validated",
+                            "detail": "validated without execution",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                result="validated",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-raw-command",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["payload"]["proposal"]["payload"] == {
+        "title": "operator safe task",
+    }
+
+
+def test_api_project_audit_event_detail_sanitizes_publish_report_and_replay_blobs(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-safe-publish",
+                project_id=project["id"],
+                actor="alice",
+                action="publish_report",
+                target_type="report",
+                target_id=f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+                payload=json.dumps(
+                    {
+                        "integration": {
+                            "name": "notion",
+                            "action": "publish_report",
+                            "status": "failed",
+                            "detail": "publish integration unavailable",
+                        },
+                        "visibility": "internal",
+                        "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+                        "created_via": "project_report",
+                        "actor": "alice",
+                        "report": {
+                            "summary": "do not expose this",
+                            "records": [
+                                {
+                                    "id": "record-1",
+                                    "payload": {"sensitive": "blob"},
+                                }
+                            ],
+                        },
+                        "idempotency": {
+                            "request": {
+                                "project_id": project["id"],
+                                "actor": "alice",
+                                "role": "admin",
+                                "actor_trusted": True,
+                                "execute_publish": True,
+                                "secret_blob": {"raw": "never expose"},
+                            },
+                            "replay": {
+                                "kind": "response",
+                                "detail": "response replay metadata should stay hidden when raw response exists",
+                                "response": {
+                                    "publish": {
+                                        "status": "failed",
+                                        "detail": "this is a full replay body",
+                                        "raw": "also raw sensitive",
+                                    },
+                                    "project": {"raw": "should never be exposed"},
+                                },
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                result="failed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-safe-publish",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == "publish integration unavailable"
+    payload = response.json()["payload"]
+    assert payload["integration"]["detail"] == "publish integration unavailable"
+    assert payload["visibility"] == "internal"
+    assert payload["target"] == f"Bro-PM/Reports/internal/Projects/{project['slug']}"
+    assert payload["created_via"] == "project_report"
+    assert payload["idempotency"]["request"] == {
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "actor_trusted": True,
+        "execute_publish": True,
+    }
+    assert payload["idempotency"]["replay"] == {
+        "kind": "response",
+    }
+    assert "report" not in payload
+
+
+def test_api_project_audit_event_detail_preserves_safe_non_response_replay_metadata(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        database_session.add(
+            models.AuditEvent(
+                id="event-safe-error-replay",
+                project_id=project["id"],
+                actor="alice",
+                action="publish_report",
+                target_type="report",
+                target_id=f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+                payload=json.dumps(
+                    {
+                        "integration": {
+                            "name": "notion",
+                            "action": "publish_report",
+                            "status": "failed",
+                            "detail": "publish integration unavailable",
+                        },
+                        "created_via": "project_report",
+                        "idempotency": {
+                            "request": {
+                                "project_id": project["id"],
+                                "actor": "alice",
+                                "role": "admin",
+                                "actor_trusted": True,
+                                "execute_publish": True,
+                            },
+                            "replay": {
+                                "kind": "error",
+                                "detail": "timeout talking to notion after 5s",
+                                "response": {
+                                    "raw": "should never leak",
+                                },
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                result="failed",
+            )
+        )
+        database_session.commit()
+    finally:
+        database_session.close()
+
+    response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events/event-safe-error-replay",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["payload"]
+    assert payload["created_via"] == "project_report"
+    assert payload["idempotency"]["request"] == {
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "actor_trusted": True,
+        "execute_publish": True,
+    }
+    assert payload["idempotency"]["replay"] == {
+        "kind": "error",
+        "detail": "timeout talking to notion after 5s",
+    }
+
+
 def test_api_project_rollback_reverses_pause_and_persists_rollback_record(api_client: TestClient):
     project = _create_project(api_client)
 

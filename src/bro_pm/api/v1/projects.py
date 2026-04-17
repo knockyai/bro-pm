@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import List
+from typing import Any, List
 
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from ...schemas import (
     GoalCreate,
     GoalResponse,
     AuditResponse,
+    AuditEventDetailResponse,
     ProjectReportRequest,
     ProjectReportResponse,
     RollbackRequest,
@@ -153,6 +154,181 @@ def _audit_event_detail(raw_payload: str | None) -> str:
     if isinstance(fallback, str) and fallback:
         return fallback
     return ""
+
+
+def _safe_audit_event_detail(raw_payload: str | None) -> str:
+    return _audit_event_detail(raw_payload)
+
+
+def _safe_audit_text(value: Any, *, max_length: int | None = 4000) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if max_length is not None and len(text) > max_length:
+        return None
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        return None
+    return text
+
+
+def _safe_audit_string_map(source: Any, allowed_keys: set[str]) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key in allowed_keys:
+        value = _safe_audit_text(source.get(key))
+        if value is not None:
+            sanitized[key] = value
+    return sanitized
+
+
+def _safe_audit_bool_map(source: Any, allowed_keys: set[str]) -> dict[str, bool]:
+    if not isinstance(source, dict):
+        return {}
+    sanitized: dict[str, bool] = {}
+    for key in allowed_keys:
+        value = source.get(key)
+        if isinstance(value, bool):
+            sanitized[key] = value
+    return sanitized
+
+
+def _safe_audit_proposal_payload(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+
+    safe_payload = _safe_audit_string_map(
+        source,
+        {
+            "mode",
+            "title",
+            "target_type",
+            "target_id",
+            "escalation_message",
+            "risk_level",
+            "trace_label",
+            "rollback_of_audit_event_id",
+            "rollback_of_action",
+        },
+    )
+    safe_payload.update(_safe_audit_bool_map(source, {"operator_confirmation"}))
+    return safe_payload
+
+
+def _safe_audit_idempotency_request(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+
+    safe_request = _safe_audit_string_map(source, {"project_id", "actor", "role"})
+    safe_request.update(
+        _safe_audit_bool_map(
+            source,
+            {"actor_trusted", "execute_publish", "dry_run", "validate_integration", "execute_integration"},
+        )
+    )
+    return safe_request
+
+
+def _safe_audit_idempotency_replay(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+
+    kind = _safe_audit_text(source.get("kind"))
+    if kind is None:
+        return {}
+
+    safe_replay: dict[str, Any] = {"kind": kind}
+    if kind != "response":
+        detail = _safe_audit_text(source.get("detail"))
+        if detail is not None:
+            safe_replay["detail"] = detail
+    return safe_replay
+
+
+def _safe_audit_event_payload(raw_payload: str | None) -> dict[str, Any]:
+    payload = _audit_event_payload(raw_payload)
+    if not payload:
+        return {}
+
+    safe_payload: dict[str, Any] = {}
+
+    auth = payload.get("auth")
+    if isinstance(auth, dict):
+        safe_auth = _safe_audit_string_map(auth, {"role"})
+        safe_auth.update(
+            _safe_audit_bool_map(auth, {"actor_trusted", "dry_run", "validate_integration", "execute_integration"})
+        )
+        if safe_auth:
+            safe_payload["auth"] = safe_auth
+
+    proposal = payload.get("proposal")
+    if isinstance(proposal, dict):
+        safe_proposal = _safe_audit_string_map(proposal, {"action", "project_id", "reason", "target_type", "target_id"})
+        safe_proposal.update(_safe_audit_bool_map(proposal, {"requires_approval"}))
+        proposal_payload = _safe_audit_proposal_payload(proposal.get("payload"))
+        if proposal_payload:
+            safe_proposal["payload"] = proposal_payload
+        if safe_proposal:
+            safe_payload["proposal"] = safe_proposal
+
+    policy = payload.get("policy")
+    if isinstance(policy, dict):
+        safe_policy = _safe_audit_string_map(policy, {"reason"})
+        safe_policy.update(_safe_audit_bool_map(policy, {"allowed", "requires_approval", "safe_pause_blocked"}))
+        if safe_policy:
+            safe_payload["policy"] = safe_policy
+
+    integration = payload.get("integration")
+    if isinstance(integration, dict):
+        safe_integration = _safe_audit_string_map(integration, {"name", "action", "status", "detail"})
+        if safe_integration:
+            safe_payload["integration"] = safe_integration
+
+    actor = _safe_audit_text(payload.get("actor"))
+    if actor is not None:
+        safe_payload["actor"] = actor
+
+    visibility = _safe_audit_text(payload.get("visibility"))
+    if visibility is not None:
+        safe_payload["visibility"] = visibility
+
+    target = _safe_audit_text(payload.get("target"))
+    if target is not None:
+        safe_payload["target"] = target
+
+    created_via = _safe_audit_text(payload.get("created_via"))
+    if created_via is not None:
+        safe_payload["created_via"] = created_via
+
+    idempotency = payload.get("idempotency")
+    if isinstance(idempotency, dict):
+        safe_idempotency: dict[str, Any] = {}
+        request = _safe_audit_idempotency_request(idempotency.get("request"))
+        if request:
+            safe_idempotency["request"] = request
+        replay = _safe_audit_idempotency_replay(idempotency.get("replay"))
+        if replay:
+            safe_idempotency["replay"] = replay
+        if safe_idempotency:
+            safe_payload["idempotency"] = safe_idempotency
+
+    return safe_payload
+
+def _audit_event_to_detail_response(event: models.AuditEvent) -> AuditEventDetailResponse:
+    return AuditEventDetailResponse(
+        id=str(event.id),
+        project_id=str(event.project_id) if event.project_id else None,
+        actor=event.actor,
+        action=event.action,
+        target_type=event.target_type,
+        target_id=event.target_id,
+        result=event.result,
+        detail=_safe_audit_event_detail(event.payload),
+        created_at=event.created_at,
+        payload=_safe_audit_event_payload(event.payload),
+    )
 
 
 def _task_to_response(task: models.Task) -> TaskResponse:
@@ -481,6 +657,34 @@ def list_audit_events(
         .all()
     )
     return [_audit_event_to_response(event) for event in events]
+
+
+@router.get("/{project_id}/audit-events/{audit_event_id}", response_model=AuditEventDetailResponse)
+def get_audit_event_detail(
+    project_id: str,
+    audit_event_id: str,
+    role: str = Query(..., pattern="^(owner|admin|operator|viewer)$"),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> AuditEventDetailResponse:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    decision = PolicyEngine().evaluate(
+        actor_role=role,
+        actor_trusted=bool(actor_trusted),
+        action="audit_view",
+        safe_paused=bool(project.safe_paused),
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    event = db.query(models.AuditEvent).filter_by(id=audit_event_id, project_id=project_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="audit event not found")
+
+    return _audit_event_to_detail_response(event)
 
 
 @router.post("/{project_id}/reports/project", response_model=ProjectReportResponse)
