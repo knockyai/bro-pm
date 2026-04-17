@@ -6,7 +6,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..integrations import INTEGRATIONS
+from ..integrations import INTEGRATIONS, IntegrationError
 from ..schemas import (
     ProjectReportDecision,
     ProjectReportKpis,
@@ -42,7 +42,21 @@ class ReportingService:
         }
 
         if execute_publish:
-            integration_result = self.notion.execute(action="publish_report", payload=publish_payload)
+            try:
+                integration_result = self.notion.execute(action="publish_report", payload=publish_payload)
+            except IntegrationError as exc:
+                publish_detail = str(exc)
+                self._record_publish_audit(
+                    project=project,
+                    actor=actor,
+                    visibility=visibility,
+                    publish_target=publish_target,
+                    status="failed",
+                    detail=publish_detail,
+                )
+                self.db.commit()
+                raise
+
             publish_status = "executed" if integration_result.ok else "failed"
             publish_detail = integration_result.detail or "notion publish_report execution failed"
             self._record_publish_audit(

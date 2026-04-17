@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bro_pm import models
-from bro_pm.integrations import INTEGRATIONS, IntegrationResult
+from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
 
 
 @pytest.fixture
@@ -1218,6 +1218,59 @@ def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_
             "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
             "result": "executed",
             "detail": "notion executed: publish_report",
+            "created_at": audit_events[0]["created_at"],
+        }
+    ]
+
+
+def test_api_project_report_execute_publish_rejects_viewer_role(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(role="viewer", execute_publish=True),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "requires operator role"
+
+
+def test_api_project_report_execute_publish_returns_422_on_integration_error(monkeypatch, tmp_path):
+    db_path = tmp_path / f"bro_pm_api_{uuid4().hex}.db"
+    db_url = f"sqlite:///{db_path}"
+
+    for mod_name in ("bro_pm.database", "bro_pm.api.app", "bro_pm.api", "bro_pm.api.v1", "bro_pm.api.v1.commands", "bro_pm.api.v1.projects"):
+        sys.modules.pop(mod_name, None)
+
+    api_app = importlib.import_module("bro_pm.api.app")
+    with TestClient(api_app.create_app(database_url=db_url), raise_server_exceptions=False) as client:
+        project = _create_project(client)
+
+        def boom(*, action: str, payload: dict) -> IntegrationResult:
+            raise IntegrationError("publish integration unavailable")
+
+        monkeypatch.setattr(INTEGRATIONS["notion"], "execute", boom)
+
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/reports/project",
+            headers={"x-actor-trusted": "true"},
+            json=_report_auth_payload(execute_publish=True),
+        )
+        audit_events = client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "publish integration unavailable"
+    assert audit_events == [
+        {
+            "id": audit_events[0]["id"],
+            "project_id": project["id"],
+            "actor": "alice",
+            "action": "publish_report",
+            "target_type": "report",
+            "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+            "result": "failed",
+            "detail": "publish integration unavailable",
             "created_at": audit_events[0]["created_at"],
         }
     ]

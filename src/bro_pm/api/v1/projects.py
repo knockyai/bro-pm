@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...database import get_db_session
+from ...integrations import IntegrationError
 from ... import models
 from ...schemas import (
     ProjectCreate,
@@ -291,7 +292,7 @@ def generate_project_report(
             actor=payload.actor,
             execute_publish=payload.execute_publish,
         )
-    except ValueError as exc:
+    except (ValueError, IntegrationError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
