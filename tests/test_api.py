@@ -315,3 +315,79 @@ def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient
     assert len(events) == 2
     assert events[0]["id"] == "event-omega"
     assert events[1]["id"] == "event-alpha"
+
+
+def test_api_project_rollback_reverses_pause_and_persists_rollback_record(api_client: TestClient):
+    project = _create_project(api_client)
+
+    pause_payload = {
+        "command_text": f"pause project {project['id']}",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+    }
+    pause_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=pause_payload,
+    )
+    assert pause_resp.status_code == 200
+    pause_result = pause_resp.json()
+    assert pause_result["result"] == "executed"
+
+    rollback_payload = {
+        "actor": "alice",
+        "role": "admin",
+        "audit_event_id": pause_result["audit_id"],
+        "reason": "undo accidental pause",
+    }
+    rollback_resp = api_client.post(
+        f"/api/v1/projects/{project['id']}/rollback",
+        headers={"x-actor-trusted": "true"},
+        json=rollback_payload,
+    )
+    assert rollback_resp.status_code == 200
+    rollback_result = rollback_resp.json()
+    assert rollback_result["accepted"] is True
+    assert rollback_result["result"] == "executed"
+    assert rollback_result["action"] == "rollback_action"
+    assert rollback_result["target"] == project["id"]
+    assert rollback_result["rollback_record_id"]
+
+    projects = api_client.get("/api/v1/projects").json()
+    assert projects[0]["safe_paused"] is False
+
+    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    assert len(audit_events) == 2
+    assert {event["action"] for event in audit_events} == {"rollback_action", "pause_project"}
+    assert {event["id"] for event in audit_events} == {
+        rollback_result["audit_id"],
+        pause_result["audit_id"],
+    }
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        rollback_record = database_session.query(models.RollbackRecord).filter_by(id=rollback_result["rollback_record_id"]).one()
+        assert rollback_record.audit_event_id == pause_result["audit_id"]
+        assert rollback_record.actor == "alice"
+        assert rollback_record.reason == "undo accidental pause"
+        assert rollback_record.executed is True
+    finally:
+        database_session.close()
+
+
+def test_api_project_rollback_missing_project_returns_404(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects/does-not-exist/rollback",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "actor": "alice",
+            "role": "admin",
+            "audit_event_id": "missing-audit",
+            "reason": "undo accidental pause",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"

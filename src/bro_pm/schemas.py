@@ -77,7 +77,7 @@ class CommandProposal(BaseModel):
     action: str
     project_id: str | None = None
     reason: str
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = Field(default_factory=dict)
     requires_approval: bool = False
 
 
@@ -114,5 +114,16 @@ class RollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor: str = Field(min_length=2, max_length=120)
+    role: str = Field(pattern="^(owner|admin|operator|viewer)$")
     audit_event_id: str
     reason: str = Field(min_length=5, max_length=1000)
+
+
+class RollbackResponse(BaseModel):
+    accepted: bool
+    result: str
+    action: str
+    target: str | None = None
+    detail: str
+    audit_id: str
+    rollback_record_id: str

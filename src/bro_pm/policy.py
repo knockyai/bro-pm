@@ -27,13 +27,16 @@ class PolicyEngine:
         if not actor_trusted:
             return PolicyDecision(False, "untrusted actor blocked", safe_pause_blocked=False)
 
+        if actor_role not in self.role_order:
+            return PolicyDecision(False, "unknown actor role")
+
         privileged = self._can_escalate(actor_role, "admin")
 
         # safe pause is a hard stop for unsafe operations in MVP
-        if safe_paused and action not in {"unpause_project", "get_status", "audit_view"}:
+        if safe_paused and action not in {"unpause_project", "get_status", "audit_view", "rollback_action"}:
             return PolicyDecision(False, "project is safe-paused", safe_pause_blocked=True)
 
-        if action in {"delete_project", "set_trust_policy", "rollback_action"} and not privileged:
+        if action in {"delete_project", "set_trust_policy"} and not privileged:
             return PolicyDecision(False, "requires admin or owner role")
 
         if action == "pause_project" and actor_role == "viewer":

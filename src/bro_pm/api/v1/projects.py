@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.orm import Session
 
 from ...database import get_db_session
 from ... import models
-from ...schemas import ProjectCreate, ProjectResponse, TaskCreate, TaskResponse, AuditResponse
+from ...schemas import ProjectCreate, ProjectResponse, TaskCreate, TaskResponse, AuditResponse, RollbackRequest, RollbackResponse
+from ...services.command_service import CommandService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -136,3 +137,38 @@ def list_audit_events(
         .all()
     )
     return [_audit_event_to_response(event) for event in events]
+
+
+@router.post("/{project_id}/rollback", response_model=RollbackResponse)
+def rollback_project_action(
+    project_id: str,
+    payload: RollbackRequest,
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> RollbackResponse:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    service = CommandService(db_session=db)
+    execution = service.rollback(
+        actor=payload.actor,
+        role=payload.role,
+        audit_event_id=payload.audit_event_id,
+        reason=payload.reason,
+        actor_trusted=bool(actor_trusted),
+        expected_project_id=project_id,
+    )
+
+    if execution.detail in {"audit event not found", "audit event does not target this project"}:
+        raise HTTPException(status_code=404, detail=execution.detail)
+
+    return RollbackResponse(
+        accepted=execution.success,
+        result=execution.result,
+        action=execution.proposal.action,
+        target=execution.proposal.project_id,
+        detail=execution.detail,
+        audit_id=execution.audit_id,
+        rollback_record_id=execution.rollback_record_id,
+    )

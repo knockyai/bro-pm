@@ -94,6 +94,20 @@ def test_policy_engine_safe_pause_blocks_unsafe_actions():
     assert allowed.safe_pause_blocked is False
 
 
+def test_policy_engine_allows_rollback_action_in_safe_pause_for_privileged_role():
+    engine = PolicyEngine()
+    allowed = engine.evaluate(
+        actor_role="admin",
+        actor_trusted=True,
+        action="rollback_action",
+        safe_paused=True,
+    )
+
+    assert allowed.allowed is True
+    assert allowed.reason == "policy accepted"
+    assert allowed.safe_pause_blocked is False
+
+
 def test_policy_engine_high_risk_action_requires_approval():
     engine = PolicyEngine()
     decision = engine.evaluate(
@@ -226,6 +240,261 @@ def test_command_service_pause_and_unpause_toggle_project_safe_state(db_session)
     session.flush()
     session.refresh(project)
     assert project.safe_paused is False
+
+
+def test_command_service_rollback_of_pause_action_reverses_state_and_records_rollback(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback project", slug="rollback")
+    service = CommandService(db_session=session)
+
+    pause_proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=pause_proposal,
+        actor_trusted=True,
+    )
+    assert pause_result.success is True
+    assert pause_result.result == "executed"
+
+    session.flush()
+    session.refresh(project)
+    assert project.safe_paused is True
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="mistaken command",
+        actor_trusted=True,
+    )
+    assert rollback_result.success is True
+    assert rollback_result.result == "executed"
+    assert rollback_result.proposal.action == "rollback_action"
+
+    session.flush()
+    session.refresh(project)
+    assert project.safe_paused is False
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    assert rollback_audit.action == "rollback_action"
+    assert rollback_audit.result == "executed"
+    rollback_record = session.query(models.RollbackRecord).filter_by(audit_event_id=pause_result.audit_id).one()
+    assert rollback_record.actor == "alice"
+    assert rollback_record.reason == "mistaken command"
+    assert rollback_record.executed is True
+
+
+def test_command_service_rejects_rollback_for_unauthorized_role(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback deny project", slug="rollback-deny")
+    service = CommandService(db_session=session)
+
+    pause_proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=pause_proposal,
+        actor_trusted=True,
+    )
+    assert pause_result.success is True
+
+    rollback_result = service.rollback(
+        actor="eve",
+        role="viewer",
+        audit_event_id=pause_result.audit_id,
+        reason="attempted rollback by wrong role",
+        actor_trusted=True,
+    )
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == "rollback requires admin or owner"
+
+    session.flush()
+    session.refresh(project)
+    assert project.safe_paused is True
+
+
+def test_command_service_rejects_rollback_for_non_executed_audit_event(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback pending project", slug="rollback-pending")
+    service = CommandService(db_session=session)
+
+    gated_proposal = CommandProposal(
+        action="pause_project",
+        project_id=project.id,
+        reason="approval required before pause",
+        payload={"note": "approval gate"},
+        requires_approval=True,
+    )
+    gated_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=gated_proposal,
+        actor_trusted=True,
+    )
+    assert gated_result.success is True
+    assert gated_result.result == "requires_approval"
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=gated_result.audit_id,
+        reason="cannot roll back non-executed audit",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == "only executed audit events can be rolled back"
+    assert rollback_result.rollback_record_id == ""
+
+    session.flush()
+    session.refresh(project)
+    assert project.safe_paused is False
+    rollback_records = session.query(models.RollbackRecord).filter_by(audit_event_id=gated_result.audit_id).count()
+    assert rollback_records == 0
+
+
+def test_command_service_rejects_repeated_rollback_of_same_event(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback repeat project", slug="rollback-repeat")
+    service = CommandService(db_session=session)
+
+    pause_proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=pause_proposal,
+        actor_trusted=True,
+    )
+    assert pause_result.success is True
+    assert pause_result.result == "executed"
+
+    first_rollback = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="undo accidental pause",
+        actor_trusted=True,
+    )
+    assert first_rollback.success is True
+    assert first_rollback.result == "executed"
+
+    session.flush()
+    session.refresh(project)
+    assert project.safe_paused is False
+
+    second_rollback = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="repeat rollback attempt",
+        actor_trusted=True,
+    )
+    assert second_rollback.success is False
+    assert second_rollback.result == "rejected"
+    assert second_rollback.detail == "audit event already rolled back"
+    assert second_rollback.rollback_record_id == ""
+
+    session.refresh(project)
+    assert project.safe_paused is False
+    rollback_records = (
+        session.query(models.RollbackRecord)
+        .filter_by(audit_event_id=pause_result.audit_id, executed=True)
+        .count()
+    )
+    assert rollback_records == 1
+
+
+def test_command_service_rejects_concurrent_rollback_of_same_event(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Rollback concurrent project",
+            slug="rollback-concurrent",
+        )
+        setup_service = CommandService(db_session=setup_session)
+        pause_proposal = setup_service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        )
+        pause_result = setup_service.execute(
+            actor="alice",
+            role="admin",
+            proposal=pause_proposal,
+            actor_trusted=True,
+        )
+        assert pause_result.success is True
+        assert pause_result.result == "executed"
+        setup_project_id = project.id
+        setup_session.commit()
+    finally:
+        setup_session.close()
+
+    start_barrier = Barrier(2)
+
+    def _run_once():
+        session = database.SessionLocal()
+        try:
+            service = CommandService(db_session=session)
+            start_barrier.wait(timeout=5)
+            execution = service.rollback(
+                actor="alice",
+                role="admin",
+                audit_event_id=pause_result.audit_id,
+                reason="duplicate concurrent rollback",
+                actor_trusted=True,
+            )
+            session.commit()
+            return {
+                "status": "ok",
+                "success": execution.success,
+                "result": execution.result,
+                "rollback_record_id": execution.rollback_record_id,
+            }
+        except Exception as exc:
+            session.rollback()
+            return {"status": "error", "error_type": type(exc).__name__, "detail": str(exc)}
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [future.result() for future in [executor.submit(_run_once), executor.submit(_run_once)]]
+
+    assert all(outcome["status"] == "ok" for outcome in outcomes)
+    assert {outcome["result"] for outcome in outcomes} == {"executed", "rejected"}
+
+    verify_session = database.SessionLocal()
+    try:
+        verify_project = verify_session.get(models.Project, setup_project_id)
+        assert verify_project is not None
+        assert verify_project.safe_paused is False
+
+        rollback_records = (
+            verify_session.query(models.RollbackRecord)
+            .filter_by(audit_event_id=pause_result.audit_id, executed=True)
+            .count()
+        )
+        assert rollback_records == 1
+    finally:
+        verify_session.close()
 
 
 def test_command_service_approval_required_path_does_not_apply_action(db_session):

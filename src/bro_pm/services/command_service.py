@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from dataclasses import dataclass
 
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +19,16 @@ class ProposalExecution:
     success: bool
     proposal: CommandProposal
     audit_id: str
+    result: str
+    detail: str
+
+
+@dataclass
+class RollbackExecution:
+    success: bool
+    proposal: CommandProposal
+    audit_id: str
+    rollback_record_id: str
     result: str
     detail: str
 
@@ -106,6 +117,7 @@ class CommandService:
             payload=json.dumps(payload, ensure_ascii=False),
             result=stored_result,
             idempotency_key=idempotency_key,
+            created_at=datetime.utcnow(),
         )
         self.db.add(record)
         try:
@@ -134,6 +146,275 @@ class CommandService:
             audit_id=record.id,
             result=response_result,
             detail=detail,
+        )
+
+    def rollback(
+        self,
+        *,
+        actor: str,
+        role: str,
+        audit_event_id: str,
+        reason: str,
+        actor_trusted: bool = True,
+        expected_project_id: str | None = None,
+    ) -> RollbackExecution:
+        original = self.db.get(models.AuditEvent, audit_event_id)
+        if not original:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=None,
+                    reason="no target action found",
+                    payload={"rollback_of_audit_event_id": audit_event_id},
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="audit event not found",
+            )
+
+        project_id = original.project_id
+        if expected_project_id is not None and project_id != expected_project_id:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="rollback target mismatch",
+                    payload={"rollback_of_audit_event_id": audit_event_id},
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="audit event does not target this project",
+            )
+
+        if not project_id:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=None,
+                    reason="target action lacks project context",
+                    payload={"rollback_of_audit_event_id": audit_event_id},
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="target action lacks project context",
+            )
+
+        project = self.db.get(models.Project, project_id)
+        if not project:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="target action project not found",
+                    payload={"rollback_of_audit_event_id": audit_event_id},
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="target action project not found",
+            )
+
+        if original.result != "executed":
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="only executed audit events can be rolled back",
+                    payload={
+                        "rollback_of_audit_event_id": audit_event_id,
+                        "rollback_of_action": original.action,
+                    },
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="only executed audit events can be rolled back",
+            )
+
+        existing_rollback = (
+            self.db.query(models.RollbackRecord)
+            .filter_by(audit_event_id=original.id, executed=True)
+            .one_or_none()
+        )
+        if existing_rollback:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="audit event already rolled back",
+                    payload={
+                        "rollback_of_audit_event_id": audit_event_id,
+                        "rollback_of_action": original.action,
+                        "rollback_record_id": existing_rollback.id,
+                    },
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="audit event already rolled back",
+            )
+
+        rollback_action = self._rollback_action_for(original.action)
+        if not rollback_action:
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="non-reversible action",
+                    payload={
+                        "rollback_of_audit_event_id": audit_event_id,
+                        "rollback_of_action": original.action,
+                    },
+                ),
+                audit_id=audit_event_id,
+                rollback_record_id="",
+                result="rejected",
+                detail="non-reversible action",
+            )
+
+        rollback_payload = {
+            "rollback_of_audit_event_id": original.id,
+            "rollback_of_action": original.action,
+            "rollback_target_action": rollback_action,
+        }
+        rollback_proposal = CommandProposal(
+            action="rollback_action",
+            project_id=project_id,
+            reason="rollback of action",
+            payload=rollback_payload,
+        )
+
+        decision: PolicyDecision = self.policy.evaluate(
+            actor_role=role,
+            actor_trusted=actor_trusted,
+            action="rollback_action",
+            safe_paused=bool(project.safe_paused),
+        )
+        if not decision.allowed:
+            payload = {
+                "actor": actor,
+                "auth": {
+                    "role": role,
+                    "actor_trusted": actor_trusted,
+                },
+                "proposal": {
+                    "action": "rollback_action",
+                    "project_id": project_id,
+                    "reason": "rollback of audit event",
+                    "payload": rollback_payload,
+                },
+                "policy": decision.__dict__,
+            }
+            record = models.AuditEvent(
+                project_id=project_id,
+                actor=actor,
+                action="rollback_action",
+                target_type="rollback",
+                target_id=original.id,
+                payload=json.dumps(payload, ensure_ascii=False),
+                result="denied",
+                created_at=datetime.utcnow(),
+            )
+            self.db.add(record)
+            self.db.flush()
+            return RollbackExecution(
+                success=False,
+                proposal=rollback_proposal,
+                audit_id=record.id,
+                rollback_record_id="",
+                result="rejected",
+                detail=decision.reason,
+            )
+
+        rollback_record = models.RollbackRecord(
+            audit_event_id=original.id,
+            actor=actor,
+            reason=reason,
+            executed=True,
+            created_at=datetime.utcnow(),
+        )
+        self.db.add(rollback_record)
+        try:
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            return RollbackExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="rollback_action",
+                    project_id=project_id,
+                    reason="audit event already rolled back",
+                    payload={
+                        "rollback_of_audit_event_id": audit_event_id,
+                        "rollback_of_action": original.action,
+                    },
+                ),
+                audit_id=original.id,
+                rollback_record_id="",
+                result="rejected",
+                detail="audit event already rolled back",
+            )
+
+        payload = {
+            "actor": actor,
+            "auth": {
+                "role": role,
+                "actor_trusted": actor_trusted,
+            },
+            "proposal": {
+                "action": "rollback_action",
+                "project_id": project_id,
+                "reason": "rollback of action",
+                "payload": rollback_payload,
+            },
+            "policy": decision.__dict__,
+        }
+        record = models.AuditEvent(
+            project_id=project_id,
+            actor=actor,
+            action="rollback_action",
+            target_type="rollback",
+            target_id=original.id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="accepted",
+            created_at=datetime.utcnow(),
+        )
+        self.db.add(record)
+        self.db.flush()
+
+        rollback_proposal = CommandProposal(
+            action="rollback_action",
+            project_id=project_id,
+            reason="rollback of action",
+            payload={
+                "rollback_of_audit_event_id": original.id,
+                "rollback_of_action": original.action,
+                "rollback_target_action": rollback_action,
+            },
+        )
+        self._apply_action(action=rollback_action, project_id=project_id)
+        self.db.query(models.AuditEvent).filter_by(id=record.id).update(
+            {models.AuditEvent.result: "executed"},
+            synchronize_session=False,
+        )
+
+        return RollbackExecution(
+            success=True,
+            proposal=rollback_proposal,
+            audit_id=record.id,
+            rollback_record_id=rollback_record.id,
+            result="executed",
+            detail="rollback action applied",
         )
 
     def _wait_for_existing_idempotent_record(
@@ -212,15 +493,29 @@ class CommandService:
             detail=detail,
         )
 
-    def _apply_action(self, proposal: CommandProposal) -> None:
+    def _apply_action(self, proposal: CommandProposal | None = None, *, action: str | None = None, project_id: str | None = None) -> None:
         # Minimal command semantics for MVP: pause/unpause safe switch.
-        if proposal.action == "pause_project" and proposal.project_id:
-            self.db.query(models.Project).filter_by(id=proposal.project_id).update(
+        resolved_action = action or (proposal.action if proposal else None)
+        resolved_project_id = project_id or (proposal.project_id if proposal else None)
+
+        if not resolved_action or not resolved_project_id:
+            return
+
+        if resolved_action == "pause_project":
+            self.db.query(models.Project).filter_by(id=resolved_project_id).update(
                 {models.Project.safe_paused: True},
                 synchronize_session=False,
             )
-        elif proposal.action == "unpause_project" and proposal.project_id:
-            self.db.query(models.Project).filter_by(id=proposal.project_id).update(
+        elif resolved_action == "unpause_project":
+            self.db.query(models.Project).filter_by(id=resolved_project_id).update(
                 {models.Project.safe_paused: False},
                 synchronize_session=False,
             )
+
+    @staticmethod
+    def _rollback_action_for(action: str) -> str | None:
+        rollback_map = {
+            "pause_project": "unpause_project",
+            "unpause_project": "pause_project",
+        }
+        return rollback_map.get(action)
