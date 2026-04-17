@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bro_pm import models
+from bro_pm.integrations import INTEGRATIONS, IntegrationResult
 
 
 @pytest.fixture
@@ -30,13 +31,13 @@ def api_client(tmp_path):
         yield client
 
 
-def _create_project(client: TestClient) -> dict:
+def _create_project(client: TestClient, *, visibility: str = "internal") -> dict:
     slug = f"project-nova-{uuid4().hex[:8]}"
     payload = {
         "name": "Project Nova",
         "slug": slug,
         "description": "project under test",
-        "visibility": "internal",
+        "visibility": visibility,
         "safe_paused": False,
         "metadata": {"team": "ops"},
     }
@@ -67,6 +68,14 @@ def _goal_payload() -> dict:
                 "priority": "medium",
             },
         ],
+    }
+
+
+
+def _report_auth_payload(*, actor: str = "alice", role: str = "admin") -> dict:
+    return {
+        "actor": actor,
+        "role": role,
     }
 
 
@@ -214,6 +223,65 @@ def test_api_create_and_list_project(api_client: TestClient):
     assert len(listed) == 1
     assert listed[0]["id"] == project_data["id"]
     assert listed[0]["slug"] == project_data["slug"]
+
+
+def test_api_create_project_rejects_path_like_slug(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Project Nova",
+            "slug": "reports/project-nova",
+            "description": "project under test",
+            "visibility": "internal",
+            "safe_paused": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "must not contain '/'" in response.text
+
+
+def test_api_create_project_rejects_path_like_visibility(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Project Nova",
+            "slug": f"project-nova-{uuid4().hex[:8]}",
+            "description": "project under test",
+            "visibility": "internal/restricted",
+            "safe_paused": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "must not contain '/'" in response.text
+
+
+def test_api_create_project_normalizes_whitespace_only_visibility_to_internal(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Project Nova",
+            "slug": f"project-nova-{uuid4().hex[:8]}",
+            "description": "project under test",
+            "visibility": "   ",
+            "safe_paused": False,
+        },
+    )
+
+    assert response.status_code == 201
+    project = response.json()
+    assert project["visibility"] == "internal"
+
+    report_response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert report_response.status_code == 200
+    assert report_response.json()["visibility"] == "internal"
+
 
 
 def test_api_create_and_list_task_for_project(api_client: TestClient):
@@ -671,3 +739,304 @@ def test_api_project_rollback_missing_project_returns_404(api_client: TestClient
 
     assert response.status_code == 404
     assert response.json()["detail"] == "project not found"
+
+
+def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contract(api_client: TestClient, monkeypatch):
+    project = _create_project(api_client)
+    goal = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+    assert goal.status_code == 201
+
+    pause_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": f"pause project {project['id']}",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+    assert pause_resp.status_code == 200
+    pause_result = pause_resp.json()
+    assert pause_result["result"] == "executed"
+
+    escalation_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "draft_boss_escalation customers are blocked by API outage",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+    assert escalation_resp.status_code == 200
+    escalation_result = escalation_resp.json()
+    assert escalation_result["result"] == "requires_approval"
+
+    def fail_if_publish_executes(*, action: str, payload: dict) -> IntegrationResult:
+        raise AssertionError(f"report endpoint must not execute {action}")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", fail_if_publish_executes)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["project_id"] == project["id"]
+    assert report["report_type"] == "project_report"
+    assert report["visibility"] == "internal"
+    assert "Project Nova" in report["summary"]
+    assert "publish_report" not in report["summary"]
+    assert report["kpis"] == {
+        "total_tasks": 2,
+        "completed_tasks": 0,
+        "open_tasks": 2,
+        "active_goals": 1,
+        "audit_events": 2,
+    }
+    assert report["risks"] == [
+        {
+            "kind": "boss_escalation",
+            "audit_id": escalation_result["audit_id"],
+            "action": "draft_boss_escalation",
+            "status": "awaiting_approval",
+            "summary": "customers are blocked by API outage",
+        }
+    ]
+    assert report["decisions"] == [
+        {
+            "audit_id": pause_result["audit_id"],
+            "action": "pause_project",
+            "result": "executed",
+            "summary": "policy accepted",
+        }
+    ]
+    assert report["action_ids"] == [escalation_result["audit_id"], pause_result["audit_id"]]
+    assert report["links"] == {
+        "project": f"Bro-PM/Projects/internal/{project['slug']}",
+        "tasks": f"Bro-PM/Projects/internal/{project['slug']}/Tasks",
+        "audit_events": f"Bro-PM/Projects/internal/{project['slug']}/Audit",
+        "report": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "notion_parent": "Bro-PM/Reports/internal",
+        "notion_project": f"Bro-PM/Projects/internal/{project['slug']}",
+    }
+    assert report["publish"] == {
+        "integration": "notion",
+        "action": "publish_report",
+        "status": "contract_ready",
+        "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "detail": "Notion-ready publish contract prepared; external publish not executed",
+        "visibility": "internal",
+    }
+
+    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    assert len(audit_events) == 2
+    assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project"}
+
+
+def test_api_project_report_requires_trusted_actor(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "untrusted actor blocked"
+
+
+def test_api_project_report_rejects_viewer_role(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(role="viewer"),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "requires operator role"
+
+
+
+def test_api_project_report_ignores_publish_audits_in_report_content(api_client: TestClient):
+    project = _create_project(api_client)
+
+    pause_resp = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": f"pause project {project['id']}",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+    assert pause_resp.status_code == 200
+    pause_result = pause_resp.json()
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        legacy_publish = models.AuditEvent(
+            id=f"audit-publish-{uuid4().hex[:8]}",
+            project_id=project["id"],
+            actor="legacy-bot",
+            action="publish_report",
+            target_type="report",
+            target_id=project["id"],
+            payload=json.dumps({"report": {"project_id": project["id"]}}, ensure_ascii=False),
+            result="executed",
+            created_at=datetime(2026, 1, 2, 0, 0, 0),
+        )
+        session.add(legacy_publish)
+        session.commit()
+    finally:
+        session.close()
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    assert "Latest audit signal: pause_project." in report["summary"]
+    assert report["kpis"]["audit_events"] == 1
+    assert report["decisions"] == [
+        {
+            "audit_id": pause_result["audit_id"],
+            "action": "pause_project",
+            "result": "executed",
+            "summary": "policy accepted",
+        }
+    ]
+    assert report["action_ids"] == [pause_result["audit_id"]]
+
+
+
+def test_api_project_report_uses_project_visibility_in_notion_paths(api_client: TestClient):
+    project = _create_project(api_client, visibility="private")
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["visibility"] == "private"
+    assert report["links"] == {
+        "project": f"Bro-PM/Projects/private/{project['slug']}",
+        "tasks": f"Bro-PM/Projects/private/{project['slug']}/Tasks",
+        "audit_events": f"Bro-PM/Projects/private/{project['slug']}/Audit",
+        "report": f"Bro-PM/Reports/private/Projects/{project['slug']}",
+        "notion_parent": "Bro-PM/Reports/private",
+        "notion_project": f"Bro-PM/Projects/private/{project['slug']}",
+    }
+    assert report["publish"]["target"] == f"Bro-PM/Reports/private/Projects/{project['slug']}"
+    assert report["publish"]["visibility"] == "private"
+
+
+def test_api_project_report_rejects_path_like_stored_slug(api_client: TestClient):
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        project = models.Project(
+            name="Project Nova",
+            slug=f"projects/{uuid4().hex[:8]}",
+            description="project with unsafe stored slug",
+            visibility="internal",
+            safe_paused=False,
+            metadata_json={"team": "ops"},
+        )
+        session.add(project)
+        session.commit()
+        project_id = project.id
+    finally:
+        session.close()
+
+    response = api_client.post(
+        f"/api/v1/projects/{project_id}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "slug must not contain '/'"
+
+
+def test_api_project_report_rejects_whitespace_only_stored_visibility(api_client: TestClient):
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        project = models.Project(
+            name="Project Nova",
+            slug=f"project-nova-{uuid4().hex[:8]}",
+            description="project under test",
+            visibility="   ",
+            safe_paused=False,
+            metadata_json={"team": "ops"},
+        )
+        session.add(project)
+        session.commit()
+        project_id = project.id
+    finally:
+        session.close()
+
+    response = api_client.post(
+        f"/api/v1/projects/{project_id}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "visibility must not be empty"
+
+
+def test_api_project_report_rejects_path_like_stored_visibility(api_client: TestClient):
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        project = models.Project(
+            name="Project Nova",
+            slug=f"project-nova-{uuid4().hex[:8]}",
+            description="project under test",
+            visibility="internal/restricted",
+            safe_paused=False,
+            metadata_json={"team": "ops"},
+        )
+        session.add(project)
+        session.commit()
+        project_id = project.id
+    finally:
+        session.close()
+
+    response = api_client.post(
+        f"/api/v1/projects/{project_id}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "visibility must not contain '/'"
+
+
+def test_api_project_report_missing_project_returns_404(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects/does-not-exist/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
+

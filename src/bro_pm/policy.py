@@ -47,6 +47,9 @@ class PolicyEngine:
         if action == "draft_boss_escalation" and not self._can_escalate(actor_role, "operator"):
             return PolicyDecision(False, "requires operator role")
 
+        if action == "audit_view" and not self._can_escalate(actor_role, "operator"):
+            return PolicyDecision(False, "requires operator role")
+
         if action in {"delete_project", "set_trust_policy"} and not privileged:
             return PolicyDecision(False, "requires admin or owner role")
 

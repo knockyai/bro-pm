@@ -17,10 +17,14 @@ from ...schemas import (
     GoalCreate,
     GoalResponse,
     AuditResponse,
+    ProjectReportRequest,
+    ProjectReportResponse,
     RollbackRequest,
     RollbackResponse,
 )
+from ...policy import PolicyEngine
 from ...services.command_service import CommandService
+from ...services.reporting_service import ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -234,6 +238,33 @@ def list_audit_events(
         .all()
     )
     return [_audit_event_to_response(event) for event in events]
+
+
+@router.post("/{project_id}/reports/project", response_model=ProjectReportResponse)
+def generate_project_report(
+    project_id: str,
+    payload: ProjectReportRequest,
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> ProjectReportResponse:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    decision = PolicyEngine().evaluate(
+        actor_role=payload.role,
+        actor_trusted=bool(actor_trusted),
+        action="audit_view",
+        safe_paused=bool(project.safe_paused),
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    service = ReportingService(db_session=db)
+    try:
+        return service.generate_project_report(project=project)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/{project_id}/rollback", response_model=RollbackResponse)

@@ -27,8 +27,13 @@ class NotionIntegration:
     name: str = "notion"
 
     def validate(self, *, action: str, payload: dict) -> None:
-        if action not in {"noop", "create_task", "close_task"}:
+        if action not in {"noop", "create_task", "close_task", "publish_report"}:
             raise IntegrationError(f"unsupported action for notion: {action}")
+        if action == "publish_report":
+            if not payload.get("report"):
+                raise IntegrationError("missing report payload for notion publish_report")
+            if not payload.get("visibility"):
+                raise IntegrationError("missing visibility for notion publish_report")
 
     def execute(self, *, action: str, payload: dict) -> IntegrationResult:
         self.validate(action=action, payload=payload)

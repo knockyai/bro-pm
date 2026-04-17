@@ -17,6 +17,23 @@ class ProjectCreate(BaseModel):
     safe_paused: bool = False
     metadata: dict[str, Any] | None = None
 
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, value: str) -> str:
+        if isinstance(value, str) and "/" in value:
+            raise ValueError("slug must not contain '/'")
+        return value
+
+    @field_validator("visibility")
+    @classmethod
+    def validate_visibility(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return "internal"
+        if "/" in normalized:
+            raise ValueError("visibility must not contain '/'")
+        return normalized
+
 
 class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -161,6 +178,13 @@ class RollbackRequest(BaseModel):
     reason: str = Field(min_length=5, max_length=1000)
 
 
+class ProjectReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=2, max_length=120)
+    role: str = Field(pattern="^(owner|admin|operator|viewer)$")
+
+
 class RollbackResponse(BaseModel):
     accepted: bool
     result: str
@@ -169,3 +193,57 @@ class RollbackResponse(BaseModel):
     detail: str
     audit_id: str
     rollback_record_id: str
+
+
+class ProjectReportKpis(BaseModel):
+    total_tasks: int
+    completed_tasks: int
+    open_tasks: int
+    active_goals: int
+    audit_events: int
+
+
+class ProjectReportRisk(BaseModel):
+    kind: str
+    audit_id: str | None = None
+    action: str | None = None
+    status: str | None = None
+    summary: str
+
+
+class ProjectReportDecision(BaseModel):
+    audit_id: str
+    action: str
+    result: str
+    summary: str
+
+
+class ProjectReportLinks(BaseModel):
+    project: str
+    tasks: str
+    audit_events: str
+    report: str
+    notion_parent: str
+    notion_project: str
+
+
+class ReportPublishResult(BaseModel):
+    integration: str
+    action: str
+    status: str
+    target: str
+    detail: str
+    visibility: str
+
+
+class ProjectReportResponse(BaseModel):
+    project_id: str
+    report_type: str
+    visibility: str
+    summary: str
+    kpis: ProjectReportKpis
+    risks: list[ProjectReportRisk] = Field(default_factory=list)
+    decisions: list[ProjectReportDecision] = Field(default_factory=list)
+    action_ids: list[str] = Field(default_factory=list)
+    links: ProjectReportLinks
+    publish: ReportPublishResult
