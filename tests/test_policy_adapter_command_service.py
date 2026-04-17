@@ -229,6 +229,37 @@ def test_command_service_parse_fills_project_id_when_omitted(db_session):
     assert proposal.project_id == project.id
 
 
+def test_command_service_rejects_unrecognized_noop_command_and_persists_denied_audit(db_session):
+    session = db_session
+    project = _create_project(session, name="Unknown command project", slug="unknown-command")
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command="sing a song",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "unrecognized command"
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    assert audit.project_id == project.id
+    assert audit.action == "noop"
+    assert audit.result == "denied"
+    payload = json.loads(audit.payload)
+    assert payload["proposal"]["action"] == "noop"
+    assert payload["proposal"]["reason"] == "unrecognized command"
+    assert payload["policy"]["reason"] == "unrecognized command"
+
+
 def test_command_service_execute_writes_audit_event(db_session):
     session = db_session
     project = _create_project(session, name="Audit project", slug="audit")

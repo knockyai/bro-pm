@@ -728,6 +728,43 @@ def test_api_command_denial_and_approval_paths(api_client: TestClient):
     assert approval_result["detail"] == "approved with human confirmation"
 
 
+def test_api_unknown_command_is_rejected_and_audited(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "sing a song",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+
+    assert response.status_code == 200
+    command_result = response.json()
+    assert command_result["accepted"] is False
+    assert command_result["result"] == "rejected"
+    assert command_result["action"] == "noop"
+    assert command_result["target"] == project["id"]
+    assert command_result["detail"] == "unrecognized command"
+
+    database = importlib.import_module("bro_pm.database")
+    session = database.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(id=command_result["audit_id"]).one()
+        payload = json.loads(audit.payload)
+        assert audit.project_id == project["id"]
+        assert audit.action == "noop"
+        assert audit.result == "denied"
+        assert payload["proposal"]["action"] == "noop"
+        assert payload["proposal"]["reason"] == "unrecognized command"
+        assert payload["policy"]["reason"] == "unrecognized command"
+    finally:
+        session.close()
+
+
 def test_api_draft_boss_escalation_is_audit_only_and_requires_confirmation(api_client: TestClient):
     project = _create_project(api_client)
     command_payload = {

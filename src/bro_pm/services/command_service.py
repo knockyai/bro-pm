@@ -84,7 +84,9 @@ class CommandService:
                     proposal=proposal,
                 )
 
-        if proposal.action == "draft_boss_escalation":
+        if proposal.action == "noop":
+            decision = PolicyDecision(False, proposal.reason or "unrecognized command")
+        elif proposal.action == "draft_boss_escalation":
             if not project_id:
                 decision = PolicyDecision(False, "project context required for draft_boss_escalation")
             else:
