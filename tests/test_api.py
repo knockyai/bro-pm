@@ -109,6 +109,30 @@ def _get_project_audit_events(
     )
 
 
+def _get_project_audit_event_detail(
+    client: TestClient,
+    project_id: str,
+    audit_event_id: str,
+    *,
+    role: str = "operator",
+    trusted: bool = True,
+):
+    headers = {"x-actor-trusted": "true"} if trusted else None
+    return client.get(
+        f"/api/v1/projects/{project_id}/audit-events/{audit_event_id}",
+        params={"role": role},
+        headers=headers,
+    )
+
+
+def _assert_role_query_error(response, expected_type: str) -> None:
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ["query", "role"]
+    assert errors[0]["type"] == expected_type
+
+
 def test_api_goal_intake_creates_goal_and_decomposes_tasks(api_client: TestClient):
     project = _create_project(api_client)
     goal_payload = _goal_payload()
@@ -961,6 +985,22 @@ def test_api_project_audit_list_rejects_untrusted_and_viewer_requests(api_client
     assert viewer.json()["detail"] == "requires operator role"
 
 
+def test_api_project_audit_list_requires_valid_role_query(api_client: TestClient):
+    missing = api_client.get(
+        "/api/v1/projects/does-not-exist/audit-events",
+        headers={"x-actor-trusted": "true"},
+    )
+    _assert_role_query_error(missing, "missing")
+
+    invalid = _get_project_audit_events(api_client, "does-not-exist", role="boss")
+    _assert_role_query_error(invalid, "string_pattern_mismatch")
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "operator", "viewer"])
+def test_api_project_audit_list_accepts_supported_role_query_values(api_client: TestClient, role: str):
+    response = _get_project_audit_events(api_client, "does-not-exist", role=role)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
 
 
 def test_api_project_audit_list_handles_non_mapping_integration_payload(api_client: TestClient):
@@ -1279,20 +1319,31 @@ def test_api_project_audit_event_detail_rejects_untrusted_and_viewer_requests(ap
     finally:
         database_session.close()
 
-    untrusted = api_client.get(
-        f"/api/v1/projects/{project['id']}/audit-events/event-guarded",
-        params={"role": "operator"},
-    )
+    untrusted = _get_project_audit_event_detail(api_client, project["id"], "event-guarded", trusted=False)
     assert untrusted.status_code == 403
     assert untrusted.json()["detail"] == "untrusted actor blocked"
 
-    viewer = api_client.get(
-        f"/api/v1/projects/{project['id']}/audit-events/event-guarded",
-        params={"role": "viewer"},
-        headers={"x-actor-trusted": "true"},
-    )
+    viewer = _get_project_audit_event_detail(api_client, project["id"], "event-guarded", role="viewer")
     assert viewer.status_code == 403
     assert viewer.json()["detail"] == "requires operator role"
+
+
+def test_api_project_audit_event_detail_requires_valid_role_query(api_client: TestClient):
+    missing = api_client.get(
+        "/api/v1/projects/does-not-exist/audit-events/does-not-exist",
+        headers={"x-actor-trusted": "true"},
+    )
+    _assert_role_query_error(missing, "missing")
+
+    invalid = _get_project_audit_event_detail(api_client, "does-not-exist", "does-not-exist", role="boss")
+    _assert_role_query_error(invalid, "string_pattern_mismatch")
+
+
+@pytest.mark.parametrize("role", ["owner", "admin", "operator", "viewer"])
+def test_api_project_audit_event_detail_accepts_supported_role_query_values(api_client: TestClient, role: str):
+    response = _get_project_audit_event_detail(api_client, "does-not-exist", "does-not-exist", role=role)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
 
 
 def test_api_project_audit_event_detail_preserves_long_integration_detail(api_client: TestClient):
