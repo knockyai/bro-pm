@@ -129,6 +129,7 @@ class CommandRequest(BaseModel):
     role: str = Field(pattern="^(owner|admin|operator|viewer)$")
     idempotency_key: str | None = None
     dry_run: bool = False
+    validate_integration: bool = False
 
 
 class CommandProposal(BaseModel):

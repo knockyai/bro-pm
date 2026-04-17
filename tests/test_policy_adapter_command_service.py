@@ -13,6 +13,7 @@ import pytest
 from bro_pm.policy import PolicyEngine
 from bro_pm.adapters.hermes_runtime import HermesAdapter
 from bro_pm.schemas import CommandProposal
+from bro_pm.integrations import INTEGRATIONS, IntegrationError
 from bro_pm.services.command_service import CommandService
 from bro_pm import models
 
@@ -293,6 +294,250 @@ def test_command_service_dry_run_pause_does_not_apply_action(db_session):
     payload = json.loads(audit.payload)
     assert payload["proposal"]["action"] == "pause_project"
     assert payload["auth"]["actor_trusted"] is True
+
+
+def test_command_service_create_task_read_only_integration_validation_calls_validate_not_execute(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(session, name="Read-only integration project", slug="readonly-integration")
+
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    integration_events = {
+        "validate_calls": 0,
+        "execute_calls": 0,
+    }
+
+    def validate_stub(*, action: str, payload: dict) -> None:
+        integration_events["validate_calls"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "implement read-only validation"
+        assert payload["raw_command"] == "create task implement read-only validation"
+
+    def execute_forbidden(*, action: str, payload: dict) -> None:
+        integration_events["execute_calls"] += 1
+        raise AssertionError("integration execute must not run in read-only validation mode")
+
+    monkeypatch.setattr(notion, "validate", validate_stub)
+    monkeypatch.setattr(notion, "execute", execute_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task implement read-only validation",
+        project_id=project.id,
+    )
+    start_task_count = session.query(models.Task).count()
+    start_audit_count = session.query(models.AuditEvent).count()
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-create-task-key",
+        dry_run=False,
+        validate_integration=True,
+    )
+
+    end_task_count = session.query(models.Task).count()
+    end_audit_count = session.query(models.AuditEvent).count()
+
+    assert execution.success is True
+    assert execution.result == "validated"
+    assert "validated" in execution.detail.lower()
+    assert integration_events["validate_calls"] == 1
+    assert integration_events["execute_calls"] == 0
+    assert start_task_count == end_task_count
+    assert end_audit_count == start_audit_count + 1
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    assert audit.action == "create_task"
+    assert audit.result == "validated"
+    payload = json.loads(audit.payload)
+    assert payload["auth"]["validate_integration"] is True
+    assert payload["integration"]["name"] == "notion"
+    assert payload["integration"]["action"] == "create_task"
+    assert payload["integration"]["status"] == "validated"
+    assert payload["integration"]["detail"]
+
+
+def test_command_service_create_task_read_only_integration_idempotency_isolated_from_live_and_dry_run(db_session):
+    session = db_session
+    project = _create_project(session, name="Read-only idempotency project", slug="readonly-idem")
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task release checklist",
+        project_id=project.id,
+    )
+
+    read_only = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="integration-mode-isolation-key",
+        validate_integration=True,
+    )
+    assert read_only.success is True
+    assert read_only.result == "validated"
+
+    live = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="integration-mode-isolation-key",
+        dry_run=False,
+    )
+    assert live.success is False
+    assert live.result == "rejected"
+    assert live.detail == "idempotency key already used for different request context"
+    assert live.audit_id == read_only.audit_id
+
+    dry_run = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="integration-mode-isolation-key",
+        dry_run=True,
+    )
+    assert dry_run.success is False
+    assert dry_run.result == "rejected"
+    assert dry_run.detail == "idempotency key already used for different request context"
+    assert dry_run.audit_id == read_only.audit_id
+
+
+def test_command_service_read_only_integration_validation_replay_preserves_validation_detail(db_session):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Read-only validation replay detail",
+        slug="readonly-validation-detail",
+    )
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task validate replay detail",
+        project_id=project.id,
+    )
+    expected_detail = "policy accepted; notion validated create_task without execution"
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-replay-detail",
+        validate_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-replay-detail",
+        validate_integration=True,
+    )
+
+    assert first.success is True
+    assert first.result == "validated"
+    assert first.detail == expected_detail
+    assert second.success is True
+    assert second.result == "validated"
+    assert second.detail == expected_detail
+    assert second.audit_id == first.audit_id
+
+
+def test_command_service_read_only_integration_validation_replay_preserves_unsupported_action_detail(db_session):
+    session = db_session
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command="close task t-1",
+        project_id=None,
+    )
+    expected_detail = "integration validation mode currently supports create_task only"
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-unsupported-detail",
+        validate_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-unsupported-detail",
+        validate_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == expected_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == expected_detail
+    assert second.audit_id == first.audit_id
+
+    stored = session.query(models.AuditEvent).filter_by(id=first.audit_id).one()
+    payload = json.loads(stored.payload)
+    assert payload["integration"]["detail"] == expected_detail
+
+
+def test_command_service_read_only_integration_validation_failure_replay_preserves_integration_error_detail(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Read-only validation failure detail",
+        slug="readonly-validation-failure-detail",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    failure_detail = "notion validate rejected missing required title field"
+
+    def validate_stub(*, action: str, payload: dict) -> None:
+        raise IntegrationError(failure_detail)
+
+    monkeypatch.setattr(notion, "validate", validate_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task validate replay failure",
+        project_id=project.id,
+    )
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-failure-detail",
+        validate_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="readonly-validation-failure-detail",
+        validate_integration=True,
+    )
+
+    assert first.success is False
+    assert first.result == "rejected"
+    assert first.detail == failure_detail
+    assert second.success is False
+    assert second.result == "rejected"
+    assert second.detail == failure_detail
+    assert second.audit_id == first.audit_id
 
 
 def test_command_service_pause_and_unpause_toggle_project_safe_state(db_session):

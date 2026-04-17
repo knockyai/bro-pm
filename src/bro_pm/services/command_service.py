@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..adapters.hermes_runtime import HermesAdapter
+from ..integrations import INTEGRATIONS, IntegrationError
 from ..policy import PolicyDecision, PolicyEngine
 from ..schemas import CommandProposal
 
@@ -56,6 +57,7 @@ class CommandService:
         actor_trusted: bool = True,
         idempotency_key: str | None = None,
         dry_run: bool = False,
+        validate_integration: bool = False,
     ) -> ProposalExecution:
         project_id = proposal.project_id
         replay_context = {
@@ -64,6 +66,7 @@ class CommandService:
             "actor_trusted": actor_trusted,
             "proposal": proposal.model_dump(),
             "dry_run": dry_run,
+            "validate_integration": validate_integration,
         }
         if idempotency_key:
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
@@ -110,7 +113,28 @@ class CommandService:
         stored_result = "denied"
 
         if decision.allowed:
-            if proposal.requires_approval or decision.requires_approval:
+            if validate_integration:
+                if proposal.action != "create_task":
+                    response_result = "rejected"
+                    stored_result = "denied"
+                    detail = "integration validation mode currently supports create_task only"
+                    success = False
+                else:
+                    try:
+                        INTEGRATIONS["notion"].validate(action="create_task", payload={
+                            **proposal.payload,
+                            "project_id": project_id,
+                        })
+                        response_result = "validated"
+                        stored_result = "validated"
+                        detail = "policy accepted; notion validated create_task without execution"
+                        success = True
+                    except IntegrationError as exc:
+                        response_result = "rejected"
+                        stored_result = "denied"
+                        detail = str(exc)
+                        success = False
+            elif proposal.requires_approval or decision.requires_approval:
                 if dry_run:
                     response_result = "simulated"
                     stored_result = "simulated"
@@ -132,10 +156,19 @@ class CommandService:
                 "role": role,
                 "actor_trusted": actor_trusted,
                 "dry_run": dry_run,
+                "validate_integration": validate_integration,
             },
             "proposal": proposal.model_dump(),
             "policy": decision.__dict__,
         }
+        if validate_integration:
+            payload["integration"] = {
+                "name": "notion",
+                "action": proposal.action,
+                "status": response_result,
+                "detail": detail,
+            }
+
         record = models.AuditEvent(
             project_id=project_id,
             actor=actor,
@@ -487,6 +520,7 @@ class CommandService:
             "actor_trusted": existing_payload.get("auth", {}).get("actor_trusted"),
             "proposal": existing_payload.get("proposal", {}),
             "dry_run": existing_payload.get("auth", {}).get("dry_run", False),
+            "validate_integration": existing_payload.get("auth", {}).get("validate_integration", False),
         }
         if existing_context != replay_context:
             return ProposalExecution(
@@ -498,6 +532,11 @@ class CommandService:
             )
 
         detail = existing_payload.get("policy", {}).get("reason", "replayed idempotent result")
+        integration_detail = (
+            existing_payload.get("integration", {}) or {}
+        ).get("detail")
+        if existing_payload.get("auth", {}).get("validate_integration") and integration_detail:
+            detail = integration_detail
         if existing.result == "denied":
             return ProposalExecution(
                 success=False,
@@ -520,6 +559,14 @@ class CommandService:
                 proposal=proposal,
                 audit_id=existing.id,
                 result="requires_approval",
+                detail=detail,
+            )
+        if existing.result == "validated":
+            return ProposalExecution(
+                success=True,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="validated",
                 detail=detail,
             )
         return ProposalExecution(
