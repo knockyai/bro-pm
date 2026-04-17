@@ -33,7 +33,7 @@ from ...schemas import (
 
 from ...policy import PolicyEngine
 from ...services.command_service import CommandService
-from ...services.reporting_service import ReportingService
+from ...services.reporting_service import ReportIdempotencyConflictError, ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -489,24 +489,44 @@ def generate_project_report(
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
 
-    policy_action = "publish_report" if payload.execute_publish else "audit_view"
-    decision = PolicyEngine().evaluate(
-        actor_role=payload.role,
-        actor_trusted=bool(actor_trusted),
-        action=policy_action,
-        safe_paused=bool(project.safe_paused),
-    )
-    if not decision.allowed:
-        raise HTTPException(status_code=403, detail=decision.reason)
-
     service = ReportingService(db_session=db)
     try:
+        replayed = service.replay_existing_publish_if_available(
+            project_id=project.id,
+            actor=payload.actor,
+            role=payload.role,
+            actor_trusted=bool(actor_trusted),
+            idempotency_key=payload.idempotency_key,
+            execute_publish=payload.execute_publish,
+        )
+        if replayed is not None:
+            return replayed
+
+        policy_action = "publish_report" if payload.execute_publish else "audit_view"
+        decision = PolicyEngine().evaluate(
+            actor_role=payload.role,
+            actor_trusted=bool(actor_trusted),
+            action=policy_action,
+            safe_paused=bool(project.safe_paused),
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail=decision.reason)
+
         return service.generate_project_report(
             project=project,
             actor=payload.actor,
+            role=payload.role,
+            actor_trusted=bool(actor_trusted),
             execute_publish=payload.execute_publish,
+            idempotency_key=payload.idempotency_key,
         )
-    except (ValueError, IntegrationError) as exc:
+    except ReportIdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrationError as exc:
+        if payload.execute_publish and not payload.idempotency_key:
+            db.commit()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

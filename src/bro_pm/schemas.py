@@ -269,6 +269,7 @@ class ProjectReportRequest(BaseModel):
     actor: str = Field(min_length=2, max_length=120)
     role: str = Field(pattern="^(owner|admin|operator|viewer)$")
     execute_publish: bool = False
+    idempotency_key: str | None = Field(default=None, max_length=120)
 
 
 class RollbackResponse(BaseModel):
