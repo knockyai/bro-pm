@@ -58,6 +58,7 @@ class CommandService:
         idempotency_key: str | None = None,
         dry_run: bool = False,
         validate_integration: bool = False,
+        execute_integration: bool = False,
     ) -> ProposalExecution:
         project_id = proposal.project_id
         replay_context = {
@@ -67,9 +68,15 @@ class CommandService:
             "proposal": proposal.model_dump(),
             "dry_run": dry_run,
             "validate_integration": validate_integration,
+            "execute_integration": execute_integration,
         }
         if idempotency_key:
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+            if existing and existing.result == "pending_integration":
+                existing = self._wait_for_existing_idempotent_record(
+                    idempotency_key,
+                    wait_for_stable_result=True,
+                )
             if existing:
                 return self._replay_existing_execution(
                     existing=existing,
@@ -111,6 +118,7 @@ class CommandService:
         response_result = "rejected"
         detail = decision.reason
         stored_result = "denied"
+        reserved_integration_record: models.AuditEvent | None = None
 
         if decision.allowed:
             if validate_integration:
@@ -121,14 +129,102 @@ class CommandService:
                     success = False
                 else:
                     try:
-                        INTEGRATIONS["notion"].validate(action="create_task", payload={
-                            **proposal.payload,
-                            "project_id": project_id,
-                        })
+                        INTEGRATIONS["notion"].validate(
+                            action="create_task",
+                            payload={
+                                **proposal.payload,
+                                "project_id": project_id,
+                            },
+                        )
                         response_result = "validated"
                         stored_result = "validated"
                         detail = "policy accepted; notion validated create_task without execution"
                         success = True
+                    except IntegrationError as exc:
+                        response_result = "rejected"
+                        stored_result = "denied"
+                        detail = str(exc)
+                        success = False
+            elif execute_integration:
+                if proposal.action != "create_task":
+                    response_result = "rejected"
+                    stored_result = "denied"
+                    detail = "execute_integration mode currently supports create_task only"
+                    success = False
+                elif not project_id:
+                    response_result = "rejected"
+                    stored_result = "denied"
+                    detail = "project context required for assisted create_task"
+                    success = False
+                elif dry_run:
+                    response_result = "simulated"
+                    stored_result = "simulated"
+                else:
+                    if idempotency_key:
+                        reservation_payload = {
+                            "actor": actor,
+                            "auth": {
+                                "role": role,
+                                "actor_trusted": actor_trusted,
+                                "dry_run": dry_run,
+                                "validate_integration": validate_integration,
+                                "execute_integration": execute_integration,
+                            },
+                            "proposal": proposal.model_dump(),
+                            "policy": decision.__dict__,
+                            "integration": {
+                                "name": "notion",
+                                "action": proposal.action,
+                                "status": "pending",
+                                "detail": "integration execution pending",
+                            },
+                        }
+                        reserved_integration_record = models.AuditEvent(
+                            project_id=project_id,
+                            actor=actor,
+                            action=proposal.action,
+                            target_type="proposal",
+                            target_id=proposal.project_id,
+                            payload=json.dumps(reservation_payload, ensure_ascii=False),
+                            result="pending_integration",
+                            idempotency_key=idempotency_key,
+                            created_at=datetime.utcnow(),
+                        )
+                        self.db.add(reserved_integration_record)
+                        try:
+                            self.db.flush()
+                        except IntegrityError:
+                            self.db.rollback()
+                            existing = self._wait_for_existing_idempotent_record(
+                                idempotency_key,
+                                wait_for_stable_result=True,
+                            )
+                            if existing:
+                                return self._replay_existing_execution(
+                                    existing=existing,
+                                    replay_context=replay_context,
+                                    proposal=proposal,
+                                )
+                            raise
+
+                    try:
+                        integration_result = INTEGRATIONS["notion"].execute(
+                            action="create_task",
+                            payload={
+                                **proposal.payload,
+                                "project_id": project_id,
+                            },
+                        )
+                        if integration_result.ok:
+                            response_result = "executed"
+                            stored_result = "accepted"
+                            detail = integration_result.detail or "notion executed: create_task"
+                            success = True
+                        else:
+                            response_result = "rejected"
+                            stored_result = "denied"
+                            detail = integration_result.detail or "integration execution reported failure"
+                            success = False
                     except IntegrationError as exc:
                         response_result = "rejected"
                         stored_result = "denied"
@@ -157,11 +253,12 @@ class CommandService:
                 "actor_trusted": actor_trusted,
                 "dry_run": dry_run,
                 "validate_integration": validate_integration,
+                "execute_integration": execute_integration,
             },
             "proposal": proposal.model_dump(),
             "policy": decision.__dict__,
         }
-        if validate_integration:
+        if validate_integration or execute_integration:
             payload["integration"] = {
                 "name": "notion",
                 "action": proposal.action,
@@ -169,30 +266,36 @@ class CommandService:
                 "detail": detail,
             }
 
-        record = models.AuditEvent(
-            project_id=project_id,
-            actor=actor,
-            action=proposal.action,
-            target_type="proposal",
-            target_id=proposal.project_id,
-            payload=json.dumps(payload, ensure_ascii=False),
-            result=stored_result,
-            idempotency_key=idempotency_key,
-            created_at=datetime.utcnow(),
-        )
-        self.db.add(record)
-        try:
+        if reserved_integration_record is not None:
+            reserved_integration_record.payload = json.dumps(payload, ensure_ascii=False)
+            reserved_integration_record.result = stored_result
+            record = reserved_integration_record
             self.db.flush()
-        except IntegrityError:
-            self.db.rollback()
-            existing = self._wait_for_existing_idempotent_record(idempotency_key)
-            if existing:
-                return self._replay_existing_execution(
-                    existing=existing,
-                    replay_context=replay_context,
-                    proposal=proposal,
-                )
-            raise
+        else:
+            record = models.AuditEvent(
+                project_id=project_id,
+                actor=actor,
+                action=proposal.action,
+                target_type="proposal",
+                target_id=proposal.project_id,
+                payload=json.dumps(payload, ensure_ascii=False),
+                result=stored_result,
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+            self.db.add(record)
+            try:
+                self.db.flush()
+            except IntegrityError:
+                self.db.rollback()
+                existing = self._wait_for_existing_idempotent_record(idempotency_key)
+                if existing:
+                    return self._replay_existing_execution(
+                        existing=existing,
+                        replay_context=replay_context,
+                        proposal=proposal,
+                    )
+                raise
 
         if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
@@ -482,20 +585,22 @@ class CommandService:
         self,
         idempotency_key: str | None,
         *,
-        attempts: int = 20,
+        attempts: int = 50,
         delay_seconds: float = 0.01,
+        wait_for_stable_result: bool = False,
     ) -> models.AuditEvent | None:
         if not idempotency_key:
             return None
 
+        existing: models.AuditEvent | None = None
         for attempt in range(attempts):
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
-            if existing:
+            if existing and (not wait_for_stable_result or existing.result != "pending_integration"):
                 return existing
             if attempt < attempts - 1:
                 time.sleep(delay_seconds)
                 self.db.expire_all()
-        return None
+        return existing
 
     def _replay_existing_execution(
         self,
@@ -521,6 +626,7 @@ class CommandService:
             "proposal": existing_payload.get("proposal", {}),
             "dry_run": existing_payload.get("auth", {}).get("dry_run", False),
             "validate_integration": existing_payload.get("auth", {}).get("validate_integration", False),
+            "execute_integration": existing_payload.get("auth", {}).get("execute_integration", False),
         }
         if existing_context != replay_context:
             return ProposalExecution(
@@ -535,8 +641,12 @@ class CommandService:
         integration_detail = (
             existing_payload.get("integration", {}) or {}
         ).get("detail")
-        if existing_payload.get("auth", {}).get("validate_integration") and integration_detail:
+        if (
+            existing_payload.get("auth", {}).get("validate_integration", False)
+            or existing_payload.get("auth", {}).get("execute_integration", False)
+        ) and integration_detail:
             detail = integration_detail
+
         if existing.result == "denied":
             return ProposalExecution(
                 success=False,
@@ -568,6 +678,14 @@ class CommandService:
                 audit_id=existing.id,
                 result="validated",
                 detail=detail,
+            )
+        if existing.result == "pending_integration":
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="rejected",
+                detail="idempotent request still pending integration execution",
             )
         return ProposalExecution(
             success=True,

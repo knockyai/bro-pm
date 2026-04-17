@@ -40,6 +40,7 @@ def propose_and_execute(
         idempotency_key=payload.idempotency_key,
         dry_run=payload.dry_run,
         validate_integration=payload.validate_integration,
+        execute_integration=payload.execute_integration,
     )
 
     return CommandResponse(

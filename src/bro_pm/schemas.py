@@ -130,6 +130,7 @@ class CommandRequest(BaseModel):
     idempotency_key: str | None = None
     dry_run: bool = False
     validate_integration: bool = False
+    execute_integration: bool = False
 
 
 class CommandProposal(BaseModel):

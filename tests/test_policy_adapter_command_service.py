@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import importlib
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -13,7 +14,7 @@ import pytest
 from bro_pm.policy import PolicyEngine
 from bro_pm.adapters.hermes_runtime import HermesAdapter
 from bro_pm.schemas import CommandProposal
-from bro_pm.integrations import INTEGRATIONS, IntegrationError
+from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
 from bro_pm.services.command_service import CommandService
 from bro_pm import models
 
@@ -359,6 +360,426 @@ def test_command_service_create_task_read_only_integration_validation_calls_vali
     assert payload["integration"]["action"] == "create_task"
     assert payload["integration"]["status"] == "validated"
     assert payload["integration"]["detail"]
+
+
+def test_command_service_create_task_assisted_execution_calls_integrations_execute_not_validate(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted execution project",
+        slug="assisted-execution",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"execute": 0, "validate": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "assisted sync"
+        assert payload["raw_command"] == "create task assisted sync"
+        return IntegrationResult(ok=True, detail="notion executed assisted create_task")
+
+    def validate_forbidden(*, action: str, payload: dict) -> None:
+        call_counter["validate"] += 1
+        raise AssertionError("integration validate should not be called in assisted execution mode")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+    monkeypatch.setattr(notion, "validate", validate_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task assisted sync",
+        project_id=project.id,
+    )
+    start_task_count = session.query(models.Task).count()
+    start_audit_count = session.query(models.AuditEvent).count()
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-integration-key",
+        execute_integration=True,
+    )
+
+    end_task_count = session.query(models.Task).count()
+    end_audit_count = session.query(models.AuditEvent).count()
+
+    assert execution.success is True
+    assert execution.result == "executed"
+    assert execution.detail == "notion executed assisted create_task"
+    assert call_counter["execute"] == 1
+    assert call_counter["validate"] == 0
+    assert start_task_count == end_task_count
+    assert end_audit_count == start_audit_count + 1
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    assert audit.result == "executed"
+    payload = json.loads(audit.payload)
+    assert payload["auth"]["execute_integration"] is True
+    assert payload["integration"]["name"] == "notion"
+    assert payload["integration"]["action"] == "create_task"
+    assert payload["integration"]["status"] == "executed"
+    assert payload["integration"]["detail"] == "notion executed assisted create_task"
+
+
+def test_command_service_create_task_assisted_execution_respects_policy_before_integrations_execute(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted execution policy project",
+        slug="assisted-policy",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+
+    def execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:
+        raise AssertionError("integration execute must not run when policy rejects")
+
+    monkeypatch.setattr(notion, "execute", execute_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task policy blocked assisted task",
+        project_id=project.id,
+    )
+    execution = service.execute(
+        actor="alice",
+        role="operator",
+        proposal=proposal,
+        actor_trusted=False,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "untrusted actor blocked"
+
+
+def test_command_service_create_task_assisted_execution_replay_preserves_integration_detail(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted execution replay project",
+        slug="assisted-replay",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        return IntegrationResult(ok=True, detail="notion executed assisted replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task replay assisted detail",
+        project_id=project.id,
+    )
+    expected_detail = "notion executed assisted replay"
+
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-replay",
+        execute_integration=True,
+    )
+    second = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-replay",
+        execute_integration=True,
+    )
+
+    assert first.success is True
+    assert first.result == "executed"
+    assert first.detail == expected_detail
+    assert second.success is True
+    assert second.result == "executed"
+    assert second.detail == expected_detail
+    assert second.audit_id == first.audit_id
+    assert call_counter["execute"] == 1
+
+    audit = session.query(models.AuditEvent).filter_by(id=first.audit_id).one()
+    stored_payload = json.loads(audit.payload)
+    assert stored_payload["integration"]["detail"] == expected_detail
+
+
+def test_command_service_create_task_assisted_execution_returns_integration_error_detail(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted integration failure project",
+        slug="assisted-failure",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    failure_detail = "notion execute failed: api timeout"
+    start_task_count = session.query(models.Task).count()
+    start_audit_count = session.query(models.AuditEvent).count()
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        raise IntegrationError(failure_detail)
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task assisted integration failure",
+        project_id=project.id,
+    )
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-integration-failure",
+        execute_integration=True,
+    )
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == failure_detail
+    assert session.query(models.Task).count() == start_task_count
+    assert session.query(models.AuditEvent).count() == start_audit_count + 1
+
+
+def test_command_service_create_task_assisted_execution_rejects_integration_result_false(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted integration result false project",
+        slug="assisted-result-false",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    rejected_detail = "notion returned integration-level failure"
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "assisted rejected"
+        return IntegrationResult(ok=False, detail=rejected_detail)
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task assisted rejected",
+        project_id=project.id,
+    )
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == rejected_detail
+    assert session.query(models.Task).count() == 0
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    assert audit.result == "denied"
+    stored_payload = json.loads(audit.payload)
+    assert stored_payload["integration"]["status"] == "rejected"
+    assert stored_payload["integration"]["detail"] == rejected_detail
+
+
+def test_command_service_create_task_assisted_execution_is_idempotency_mode_isolated_from_live_dry_run_validate(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted idempotency isolation",
+        slug="assisted-idem",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        return IntegrationResult(ok=True, detail="notion executed assisted")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task idempotency mode isolation",
+        project_id=project.id,
+    )
+
+    assisted = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-mode-isolation",
+        execute_integration=True,
+    )
+    live = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-mode-isolation",
+    )
+    dry_run = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-mode-isolation",
+        dry_run=True,
+    )
+    validate = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-mode-isolation",
+        validate_integration=True,
+    )
+
+    assert assisted.success is True
+    assert assisted.result == "executed"
+    assert live.success is False
+    assert live.result == "rejected"
+    assert live.detail == "idempotency key already used for different request context"
+    assert live.audit_id == assisted.audit_id
+    assert dry_run.success is False
+    assert dry_run.result == "rejected"
+    assert dry_run.detail == "idempotency key already used for different request context"
+    assert dry_run.audit_id == assisted.audit_id
+    assert validate.success is False
+    assert validate.result == "rejected"
+    assert validate.detail == "idempotency key already used for different request context"
+    assert validate.audit_id == assisted.audit_id
+
+
+
+def test_command_service_create_task_assisted_execution_rejects_missing_project_context(db_session, monkeypatch):
+    session = db_session
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        raise AssertionError("integration execute should not run without project context")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task requires project id",
+        project_id=None,
+    )
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "project context required for assisted create_task"
+    assert call_counter["execute"] == 0
+
+
+def test_command_service_execute_integration_rejects_unsupported_action_without_execute_or_validate_call(db_session, monkeypatch):
+    session = db_session
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"execute": 0, "validate": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        raise AssertionError("integration execute should not run for unsupported action")
+
+    def validate_stub(*, action: str, payload: dict) -> None:
+        call_counter["validate"] += 1
+        raise AssertionError("integration validate should not run for unsupported execute_integration request")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+    monkeypatch.setattr(notion, "validate", validate_stub)
+
+    proposal = service.parse(
+        actor="alice",
+        command="close task T-1",
+        project_id=None,
+    )
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        execute_integration=True,
+    )
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "execute_integration mode currently supports create_task only"
+    assert call_counter["execute"] == 0
+    assert call_counter["validate"] == 0
+
+
+def test_command_service_create_task_execute_integration_and_validate_integration_precedence(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(
+        session,
+        name="Assisted validate precedence",
+        slug="assisted-validate-precedence",
+    )
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+
+    calls = {"execute": 0, "validate": 0}
+
+    def validate_stub(*, action: str, payload: dict) -> None:
+        calls["validate"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "precedence test"
+
+    def execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:
+        calls["execute"] += 1
+        raise AssertionError("integration execute should not run in validate-only mode")
+
+    monkeypatch.setattr(notion, "validate", validate_stub)
+    monkeypatch.setattr(notion, "execute", execute_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task precedence test",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-validate-precedence",
+        execute_integration=True,
+        validate_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "validated"
+    assert execution.detail == "policy accepted; notion validated create_task without execution"
+    assert calls["validate"] == 1
+    assert calls["execute"] == 0
 
 
 def test_command_service_create_task_read_only_integration_idempotency_isolated_from_live_and_dry_run(db_session):
@@ -1200,3 +1621,79 @@ def test_command_service_idempotency_replays_under_concurrent_duplicate_requests
     assert all(outcome["status"] == "ok" for outcome in outcomes)
     assert {outcome["result"] for outcome in outcomes} == {"requires_approval"}
     assert len({outcome["audit_id"] for outcome in outcomes}) == 1
+
+
+def test_command_service_concurrent_assisted_create_task_execution_runs_integration_once_and_replays_result(tmp_path):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Concurrent assisted create_task project",
+            slug="assisted-concurrent",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"execute": 0}
+    start_barrier = Barrier(2)
+    idempotency_key = "assisted-concurrent-duplicate-key"
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project_id
+        time.sleep(0.05)
+        return IntegrationResult(ok=True, detail="notion executed assisted create_task")
+
+    original_execute = notion.execute
+    notion.execute = execute_stub
+
+    def _run_once():
+        session = database.SessionLocal()
+        try:
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task concurrent assisted duplicate",
+                project_id=project_id,
+            )
+            start_barrier.wait(timeout=5)
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key=idempotency_key,
+                execute_integration=True,
+            )
+            session.commit()
+            return {
+                "status": "ok",
+                "result": execution.result,
+                "detail": execution.detail,
+                "audit_id": execution.audit_id,
+                "success": execution.success,
+            }
+        except Exception as exc:
+            session.rollback()
+            return {"status": "error", "error_type": type(exc).__name__, "detail": str(exc)}
+        finally:
+            session.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [future.result() for future in [executor.submit(_run_once), executor.submit(_run_once)]]
+    finally:
+        notion.execute = original_execute
+
+    assert all(outcome["status"] == "ok" for outcome in outcomes)
+    assert {outcome["result"] for outcome in outcomes} == {"executed"}
+    assert {outcome["success"] for outcome in outcomes} == {True}
+    assert len({outcome["detail"] for outcome in outcomes}) == 1
+    assert outcomes[0]["detail"] == "notion executed assisted create_task"
+    assert len({outcome["audit_id"] for outcome in outcomes}) == 1
+    assert call_counter["execute"] == 1

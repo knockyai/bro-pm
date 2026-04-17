@@ -494,7 +494,152 @@ def test_api_create_task_validation_idempotency_isolation_between_validation_and
     assert tasks_response.json() == []
 
 
+
+
+def test_api_create_task_assisted_execution_mode_calls_integration_execute_and_returns_detail(api_client: TestClient, monkeypatch):
+    project = _create_project(api_client)
+    notion = INTEGRATIONS["notion"]
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        assert action == "create_task"
+        assert payload["project_id"] == project["id"]
+        assert payload["title"] == "create notion task from api"
+        assert payload["raw_command"] == "create task create notion task from api"
+        return IntegrationResult(ok=True, detail="notion API created task")
+
+    def validate_forbidden(*, action: str, payload: dict) -> None:
+        raise AssertionError("validate should not run in assisted execution mode")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+    monkeypatch.setattr(notion, "validate", validate_forbidden)
+
+    command_payload = {
+        "command_text": "create task create notion task from api",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "execute_integration": True,
+    }
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+
+    assert response.status_code == 200
+    command_result = response.json()
+    assert command_result["accepted"] is True
+    assert command_result["result"] == "executed"
+    assert command_result["action"] == "create_task"
+    assert command_result["target"] == project["id"]
+    assert command_result["detail"] == "notion API created task"
+
+    database = importlib.import_module("bro_pm.database")
+    session = database.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(id=command_result["audit_id"]).one()
+        payload = json.loads(audit.payload)
+        assert payload["auth"]["execute_integration"] is True
+        assert payload["integration"]["name"] == "notion"
+        assert payload["integration"]["action"] == "create_task"
+        assert payload["integration"]["status"] == "executed"
+        assert payload["integration"]["detail"] == "notion API created task"
+    finally:
+        session.close()
+
+    tasks_response = api_client.get(f"/api/v1/projects/{project['id']}/tasks")
+    assert tasks_response.status_code == 200
+    assert tasks_response.json() == []
+
+
+def test_api_create_task_assisted_execution_idempotency_isolated_from_live_dry_run_and_validation_modes(api_client: TestClient, monkeypatch):
+    project = _create_project(api_client)
+    notion = INTEGRATIONS["notion"]
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        return IntegrationResult(ok=True, detail="notion API created task")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    base_payload = {
+        "command_text": "create task api assisted idempotency isolation",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "execute_integration": True,
+        "idempotency_key": "api-assist-mode-key",
+    }
+    assisted = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=base_payload,
+    )
+    assert assisted.status_code == 200
+
+    live = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "create task api assisted idempotency isolation",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+            "idempotency_key": "api-assist-mode-key",
+        },
+    )
+    dry = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "create task api assisted idempotency isolation",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+            "dry_run": True,
+            "idempotency_key": "api-assist-mode-key",
+        },
+    )
+    validated = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "create task api assisted idempotency isolation",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+            "validate_integration": True,
+            "idempotency_key": "api-assist-mode-key",
+        },
+    )
+
+    assisted_result = assisted.json()
+    live_result = live.json()
+    dry_result = dry.json()
+    validated_result = validated.json()
+
+    assert assisted_result["result"] == "executed"
+    assert assisted_result["accepted"] is True
+    assert assisted_result["detail"] == "notion API created task"
+
+    assert live_result["accepted"] is False
+    assert live_result["result"] == "rejected"
+    assert live_result["detail"] == "idempotency key already used for different request context"
+
+    assert dry_result["accepted"] is False
+    assert dry_result["result"] == "rejected"
+    assert dry_result["detail"] == "idempotency key already used for different request context"
+
+    assert validated_result["accepted"] is False
+    assert validated_result["result"] == "rejected"
+    assert validated_result["detail"] == "idempotency key already used for different request context"
+
+    assert live_result["audit_id"] == assisted_result["audit_id"]
+    assert dry_result["audit_id"] == assisted_result["audit_id"]
+    assert validated_result["audit_id"] == assisted_result["audit_id"]
+
+
 def test_api_command_denial_and_approval_paths(api_client: TestClient):
+
     project = _create_project(api_client)
 
     deny_payload = {
