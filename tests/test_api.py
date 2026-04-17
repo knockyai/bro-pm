@@ -72,11 +72,14 @@ def _goal_payload() -> dict:
 
 
 
-def _report_auth_payload(*, actor: str = "alice", role: str = "admin") -> dict:
-    return {
+def _report_auth_payload(*, actor: str = "alice", role: str = "admin", execute_publish: bool | None = None) -> dict:
+    payload = {
         "actor": actor,
         "role": role,
     }
+    if execute_publish is not None:
+        payload["execute_publish"] = execute_publish
+    return payload
 
 
 def test_api_goal_intake_creates_goal_and_decomposes_tasks(api_client: TestClient):
@@ -1140,6 +1143,84 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
     audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
     assert len(audit_events) == 2
     assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project"}
+
+
+def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_client: TestClient, monkeypatch):
+    project = _create_project(api_client)
+    captured: dict[str, dict] = {}
+
+    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
+        captured["call"] = {"action": action, "payload": payload}
+        return IntegrationResult(ok=True, detail="notion executed: publish_report")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(execute_publish=True),
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["summary"].endswith("Latest audit signal: no recent audit signal.")
+    assert report["kpis"]["audit_events"] == 0
+    assert report["publish"] == {
+        "integration": "notion",
+        "action": "publish_report",
+        "status": "executed",
+        "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "detail": "notion executed: publish_report",
+        "visibility": "internal",
+    }
+    assert captured["call"] == {
+        "action": "publish_report",
+        "payload": {
+            "workspace_root": "Bro-PM",
+            "parent_page": "Bro-PM/Reports/internal",
+            "project_page": f"Bro-PM/Projects/internal/{project['slug']}",
+            "visibility": "internal",
+            "report": {
+                "project_id": project["id"],
+                "report_type": "project_report",
+                "visibility": "internal",
+                "summary": "Project Nova is tracking no active goal with 0 open tasks. Latest audit signal: no recent audit signal.",
+                "kpis": {
+                    "total_tasks": 0,
+                    "completed_tasks": 0,
+                    "open_tasks": 0,
+                    "active_goals": 0,
+                    "audit_events": 0,
+                },
+                "risks": [],
+                "decisions": [],
+                "action_ids": [],
+                "links": {
+                    "project": f"Bro-PM/Projects/internal/{project['slug']}",
+                    "tasks": f"Bro-PM/Projects/internal/{project['slug']}/Tasks",
+                    "audit_events": f"Bro-PM/Projects/internal/{project['slug']}/Audit",
+                    "report": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+                    "notion_parent": "Bro-PM/Reports/internal",
+                    "notion_project": f"Bro-PM/Projects/internal/{project['slug']}",
+                },
+            },
+        },
+    }
+
+    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    assert audit_events == [
+        {
+            "id": audit_events[0]["id"],
+            "project_id": project["id"],
+            "actor": "alice",
+            "action": "publish_report",
+            "target_type": "report",
+            "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+            "result": "executed",
+            "detail": "notion executed: publish_report",
+            "created_at": audit_events[0]["created_at"],
+        }
+    ]
 
 
 def test_api_project_report_requires_trusted_actor(api_client: TestClient):

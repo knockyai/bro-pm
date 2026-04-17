@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -21,7 +22,13 @@ class ReportingService:
         self.db = db_session
         self.notion = INTEGRATIONS["notion"]
 
-    def generate_project_report(self, *, project: models.Project) -> ProjectReportResponse:
+    def generate_project_report(
+        self,
+        *,
+        project: models.Project,
+        actor: str,
+        execute_publish: bool = False,
+    ) -> ProjectReportResponse:
         visibility = self._normalize_visibility(project.visibility)
         slug = self._normalize_slug(project.slug)
         report_core = self._build_report_core(project=project, visibility=visibility, slug=slug)
@@ -33,6 +40,32 @@ class ReportingService:
             "visibility": visibility,
             "report": report_core,
         }
+
+        if execute_publish:
+            integration_result = self.notion.execute(action="publish_report", payload=publish_payload)
+            publish_status = "executed" if integration_result.ok else "failed"
+            publish_detail = integration_result.detail or "notion publish_report execution failed"
+            self._record_publish_audit(
+                project=project,
+                actor=actor,
+                visibility=visibility,
+                publish_target=publish_target,
+                status=publish_status,
+                detail=publish_detail,
+            )
+            publish = ReportPublishResult(
+                integration="notion",
+                action="publish_report",
+                status=publish_status,
+                target=publish_target,
+                detail=publish_detail,
+                visibility=visibility,
+            )
+            return ProjectReportResponse(
+                **report_core,
+                publish=publish,
+            )
+
         self.notion.validate(action="publish_report", payload=publish_payload)
         publish = ReportPublishResult(
             integration="notion",
@@ -138,6 +171,41 @@ class ReportingService:
             "action_ids": action_ids,
             "links": links.model_dump(),
         }
+
+    def _record_publish_audit(
+        self,
+        *,
+        project: models.Project,
+        actor: str,
+        visibility: str,
+        publish_target: str,
+        status: str,
+        detail: str,
+    ) -> None:
+        payload = {
+            "integration": {
+                "name": "notion",
+                "action": "publish_report",
+                "status": status,
+                "detail": detail,
+            },
+            "visibility": visibility,
+            "target": publish_target,
+            "created_via": "project_report",
+            "actor": actor,
+        }
+        self.db.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor=actor,
+                action="publish_report",
+                target_type="report",
+                target_id=publish_target,
+                payload=json.dumps(payload, ensure_ascii=False),
+                result=status,
+                created_at=datetime.utcnow(),
+            )
+        )
 
     @staticmethod
     def _normalize_visibility(raw_visibility: str | None) -> str:

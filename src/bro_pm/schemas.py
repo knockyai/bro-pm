@@ -169,6 +169,7 @@ class AuditResponse(BaseModel):
     target_type: str
     target_id: str | None
     result: str
+    detail: str
     created_at: datetime
 
 
@@ -186,6 +187,7 @@ class ProjectReportRequest(BaseModel):
 
     actor: str = Field(min_length=2, max_length=120)
     role: str = Field(pattern="^(owner|admin|operator|viewer)$")
+    execute_publish: bool = False
 
 
 class RollbackResponse(BaseModel):

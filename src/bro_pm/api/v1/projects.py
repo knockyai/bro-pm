@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
@@ -69,8 +70,30 @@ def _audit_event_to_response(event: models.AuditEvent) -> AuditResponse:
         target_type=event.target_type,
         target_id=event.target_id,
         result=event.result,
+        detail=_audit_event_detail(event.payload),
         created_at=event.created_at,
     )
+
+
+def _audit_event_detail(raw_payload: str | None) -> str:
+    try:
+        payload = json.loads(raw_payload or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    detail = payload.get("integration", {}).get("detail")
+    if isinstance(detail, str) and detail:
+        return detail
+    policy = payload.get("policy", {})
+    if isinstance(policy, dict):
+        reason = policy.get("reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    fallback = payload.get("detail")
+    if isinstance(fallback, str):
+        return fallback
+    return ""
 
 
 def _task_to_response(task: models.Task) -> TaskResponse:
@@ -251,10 +274,11 @@ def generate_project_report(
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
 
+    policy_action = "publish_report" if payload.execute_publish else "audit_view"
     decision = PolicyEngine().evaluate(
         actor_role=payload.role,
         actor_trusted=bool(actor_trusted),
-        action="audit_view",
+        action=policy_action,
         safe_paused=bool(project.safe_paused),
     )
     if not decision.allowed:
@@ -262,7 +286,11 @@ def generate_project_report(
 
     service = ReportingService(db_session=db)
     try:
-        return service.generate_project_report(project=project)
+        return service.generate_project_report(
+            project=project,
+            actor=payload.actor,
+            execute_publish=payload.execute_publish,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
