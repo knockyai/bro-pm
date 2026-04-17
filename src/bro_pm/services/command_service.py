@@ -55,6 +55,7 @@ class CommandService:
         proposal: CommandProposal,
         actor_trusted: bool = True,
         idempotency_key: str | None = None,
+        dry_run: bool = False,
     ) -> ProposalExecution:
         project_id = proposal.project_id
         replay_context = {
@@ -62,6 +63,7 @@ class CommandService:
             "role": role,
             "actor_trusted": actor_trusted,
             "proposal": proposal.model_dump(),
+            "dry_run": dry_run,
         }
         if idempotency_key:
             existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
@@ -109,18 +111,27 @@ class CommandService:
 
         if decision.allowed:
             if proposal.requires_approval or decision.requires_approval:
-                response_result = "requires_approval"
-                stored_result = "awaiting_approval"
+                if dry_run:
+                    response_result = "simulated"
+                    stored_result = "simulated"
+                else:
+                    response_result = "requires_approval"
+                    stored_result = "awaiting_approval"
             else:
-                response_result = "executed"
-                stored_result = "accepted"
-                detail = "policy accepted"
+                if dry_run:
+                    response_result = "simulated"
+                    stored_result = "simulated"
+                else:
+                    response_result = "executed"
+                    stored_result = "accepted"
+                    detail = "policy accepted"
 
         payload = {
             "actor": actor,
             "auth": {
                 "role": role,
                 "actor_trusted": actor_trusted,
+                "dry_run": dry_run,
             },
             "proposal": proposal.model_dump(),
             "policy": decision.__dict__,
@@ -150,7 +161,7 @@ class CommandService:
                 )
             raise
 
-        if success and response_result == "executed":
+        if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
             self.db.query(models.AuditEvent).filter_by(id=record.id).update(
                 {models.AuditEvent.result: "executed"},
@@ -475,6 +486,7 @@ class CommandService:
             "role": existing_payload.get("auth", {}).get("role"),
             "actor_trusted": existing_payload.get("auth", {}).get("actor_trusted"),
             "proposal": existing_payload.get("proposal", {}),
+            "dry_run": existing_payload.get("auth", {}).get("dry_run", False),
         }
         if existing_context != replay_context:
             return ProposalExecution(
@@ -492,6 +504,14 @@ class CommandService:
                 proposal=proposal,
                 audit_id=existing.id,
                 result="rejected",
+                detail=detail,
+            )
+        if existing.result == "simulated":
+            return ProposalExecution(
+                success=True,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="simulated",
                 detail=detail,
             )
         if existing.result == "awaiting_approval":

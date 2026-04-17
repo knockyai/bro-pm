@@ -38,6 +38,7 @@ def propose_and_execute(
         proposal=proposal,
         actor_trusted=bool(actor_trusted),
         idempotency_key=payload.idempotency_key,
+        dry_run=payload.dry_run,
     )
 
     return CommandResponse(

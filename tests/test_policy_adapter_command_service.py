@@ -257,6 +257,44 @@ def test_command_service_execute_writes_audit_event(db_session):
     assert audit.result == "executed"
 
 
+# dry-run path intentionally reuses policy and audit evidence
+# while never applying any mutating project state changes.
+def test_command_service_dry_run_pause_does_not_apply_action(db_session):
+    session = db_session
+    project = _create_project(session, name="Dry run project", slug="dry-run")
+
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+    start_count = session.query(models.AuditEvent).count()
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        dry_run=True,
+    )
+    end_count = session.query(models.AuditEvent).count()
+
+    assert execution.success is True
+    assert execution.result == "simulated"
+    assert end_count == start_count + 1
+
+    session.refresh(project)
+    assert project.safe_paused is False
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    assert audit.action == "pause_project"
+    assert audit.result == "simulated"
+    payload = json.loads(audit.payload)
+    assert payload["proposal"]["action"] == "pause_project"
+    assert payload["auth"]["actor_trusted"] is True
+
+
 def test_command_service_pause_and_unpause_toggle_project_safe_state(db_session):
     session = db_session
     project = _create_project(session, name="Safe project", slug="safe")
@@ -298,6 +336,46 @@ def test_command_service_pause_and_unpause_toggle_project_safe_state(db_session)
     session.flush()
     session.refresh(project)
     assert project.safe_paused is False
+
+
+def test_command_service_dry_run_and_live_idempotency_modes_are_isolated(db_session):
+    session = db_session
+    project = _create_project(session, name="Mode isolation", slug="mode-isolation")
+    service = CommandService(db_session=session)
+
+    proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+
+    dry_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="mode-isolated-key",
+        dry_run=True,
+    )
+    assert dry_result.success is True
+    assert dry_result.result == "simulated"
+
+    live_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="mode-isolated-key",
+        dry_run=False,
+    )
+
+    assert live_result.success is False
+    assert live_result.result == "rejected"
+    assert live_result.detail == "idempotency key already used for different request context"
+    assert live_result.audit_id == dry_result.audit_id
+    session.refresh(project)
+    assert project.safe_paused is False
+
 
 
 def test_command_service_rollback_of_pause_action_reverses_state_and_records_rollback(db_session):
@@ -758,6 +836,55 @@ def test_command_service_draft_boss_escalation_idempotent_replay_reuses_audit_re
     assert first.result == "requires_approval"
     assert second.result == "requires_approval"
     assert first.audit_id == second.audit_id
+
+
+def test_command_service_replays_legacy_idempotent_record_without_dry_run_flag(db_session):
+    session = db_session
+    legacy_proposal = {
+        "action": "close_task",
+        "project_id": None,
+        "reason": "parsed command",
+        "payload": {
+            "target_type": "task",
+            "target_id": "t-1",
+            "raw_command": "close task T-1",
+        },
+        "requires_approval": False,
+    }
+    session.add(
+        models.AuditEvent(
+            actor="alice",
+            action="close_task",
+            target_type="proposal",
+            target_id="T-1",
+            payload=json.dumps(
+                {
+                    "actor": "alice",
+                    "auth": {"role": "admin", "actor_trusted": True},
+                    "proposal": legacy_proposal,
+                    "policy": {"reason": "approved with human confirmation"},
+                }
+            ),
+            result="awaiting_approval",
+            idempotency_key="legacy-idempotency-key",
+        )
+    )
+    session.commit()
+
+    service = CommandService(db_session=session)
+    proposal = service.parse(actor="alice", command="close task T-1", project_id=None)
+
+    result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="legacy-idempotency-key",
+    )
+
+    assert result.success is True
+    assert result.result == "requires_approval"
+    assert result.audit_id
 
 
 def test_command_service_rejects_idempotent_replay_when_stored_payload_is_invalid(db_session):

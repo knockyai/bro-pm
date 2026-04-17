@@ -128,6 +128,7 @@ class CommandRequest(BaseModel):
     actor: str = Field(min_length=2, max_length=120)
     role: str = Field(pattern="^(owner|admin|operator|viewer)$")
     idempotency_key: str | None = None
+    dry_run: bool = False
 
 
 class CommandProposal(BaseModel):

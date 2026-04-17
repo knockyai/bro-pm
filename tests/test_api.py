@@ -336,6 +336,84 @@ def test_api_pause_command_marks_project_safe_paused(api_client: TestClient):
     assert listed[0]["safe_paused"] is True
 
 
+def test_api_pause_command_dry_run_does_not_mutate_project(api_client: TestClient):
+    project = _create_project(api_client)
+
+    command_payload = {
+        "command_text": f"pause project {project['id']}",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "dry_run": True,
+    }
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+    assert response.status_code == 200
+
+    command_result = response.json()
+    assert command_result["accepted"] is True
+    assert command_result["result"] == "simulated"
+    assert command_result["action"] == "pause_project"
+    assert command_result["target"] == project["id"]
+
+    response = api_client.get("/api/v1/projects")
+    assert response.status_code == 200
+    listed = response.json()
+    assert listed[0]["safe_paused"] is False
+
+    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    assert len(audit_events) == 1
+    assert audit_events[0]["action"] == "pause_project"
+    assert audit_events[0]["result"] == "simulated"
+
+
+def test_api_command_dry_run_replays_separate_from_live_execution(api_client: TestClient):
+    project = _create_project(api_client)
+    command_payload = {
+        "command_text": f"pause project {project['id']}",
+        "project_id": project["id"],
+        "actor": "alice",
+        "role": "admin",
+        "dry_run": True,
+        "idempotency_key": "pause-dry-run-key",
+    }
+
+    dry_run = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json=command_payload,
+    )
+
+    live_run = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": f"pause project {project['id']}",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+            "idempotency_key": "pause-dry-run-key",
+        },
+    )
+
+    assert dry_run.status_code == 200
+    assert live_run.status_code == 200
+
+    dry_result = dry_run.json()
+    live_result = live_run.json()
+    assert dry_result["result"] == "simulated"
+    assert live_result["result"] == "rejected"
+    assert live_result["accepted"] is False
+    assert live_result["audit_id"] == dry_result["audit_id"]
+    assert live_result["detail"] == "idempotency key already used for different request context"
+
+    project_list = api_client.get("/api/v1/projects").json()
+    assert project_list[0]["safe_paused"] is False
+
+
 def test_api_command_denial_and_approval_paths(api_client: TestClient):
     project = _create_project(api_client)
 
