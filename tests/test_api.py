@@ -94,6 +94,21 @@ def _report_auth_payload(
     return payload
 
 
+def _get_project_audit_events(
+    client: TestClient,
+    project_id: str,
+    *,
+    role: str = "operator",
+    trusted: bool = True,
+):
+    headers = {"x-actor-trusted": "true"} if trusted else None
+    return client.get(
+        f"/api/v1/projects/{project_id}/audit-events",
+        params={"role": role},
+        headers=headers,
+    )
+
+
 def test_api_goal_intake_creates_goal_and_decomposes_tasks(api_client: TestClient):
     project = _create_project(api_client)
     goal_payload = _goal_payload()
@@ -379,7 +394,7 @@ def test_api_pause_command_dry_run_does_not_mutate_project(api_client: TestClien
     listed = response.json()
     assert listed[0]["safe_paused"] is False
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert len(audit_events) == 1
     assert audit_events[0]["action"] == "pause_project"
     assert audit_events[0]["result"] == "simulated"
@@ -457,7 +472,7 @@ def test_api_create_task_validation_mode_runs_validate_only_and_does_not_mutate_
     assert tasks_response.status_code == 200
     assert tasks_response.json() == []
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert len(audit_events) == 1
     assert audit_events[0]["action"] == "create_task"
     assert audit_events[0]["result"] == "validated"
@@ -895,9 +910,7 @@ def test_api_project_audit_list_is_newest_first_when_available(api_client: TestC
     )
     assert resume_resp.status_code == 200
 
-    response = api_client.get(
-        f"/api/v1/projects/{project['id']}/audit-events",
-    )
+    response = _get_project_audit_events(api_client, project["id"])
     assert response.status_code == 200
 
     events = response.json()
@@ -924,9 +937,7 @@ def test_api_project_audit_list_is_newest_first_when_available(api_client: TestC
 
 
 def test_api_project_audit_list_missing_project_returns_404(api_client: TestClient):
-    response = api_client.get(
-        "/api/v1/projects/does-not-exist/audit-events",
-    )
+    response = _get_project_audit_events(api_client, "does-not-exist")
     assert response.status_code == 404
     assert response.json()["detail"] == "project not found"
 
@@ -934,9 +945,22 @@ def test_api_project_audit_list_missing_project_returns_404(api_client: TestClie
 def test_api_project_audit_list_for_existing_project_without_events_is_empty(api_client: TestClient):
     project = _create_project(api_client)
 
-    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    response = _get_project_audit_events(api_client, project["id"])
     assert response.status_code == 200
     assert response.json() == []
+
+def test_api_project_audit_list_rejects_untrusted_and_viewer_requests(api_client: TestClient):
+    project = _create_project(api_client)
+
+    untrusted = _get_project_audit_events(api_client, project["id"], trusted=False)
+    assert untrusted.status_code == 403
+    assert untrusted.json()["detail"] == "untrusted actor blocked"
+
+    viewer = _get_project_audit_events(api_client, project["id"], role="viewer")
+    assert viewer.status_code == 403
+    assert viewer.json()["detail"] == "requires operator role"
+
+
 
 
 def test_api_project_audit_list_handles_non_mapping_integration_payload(api_client: TestClient):
@@ -965,7 +989,7 @@ def test_api_project_audit_list_handles_non_mapping_integration_payload(api_clie
     finally:
         database_session.close()
 
-    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
     assert response.json()[0]["detail"] == "policy fallback detail"
@@ -1000,7 +1024,7 @@ def test_api_project_audit_list_preserves_long_integration_detail(api_client: Te
     finally:
         database_session.close()
 
-    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
     assert response.json()[0]["detail"] == long_detail
@@ -1035,7 +1059,7 @@ def test_api_project_audit_list_preserves_exact_detail_text(api_client: TestClie
     finally:
         database_session.close()
 
-    response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
     assert response.json()[0]["detail"] == exact_detail
@@ -1076,9 +1100,7 @@ def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient
     finally:
         database_session.close()
 
-    response = api_client.get(
-        f"/api/v1/projects/{project['id']}/audit-events",
-    )
+    response = _get_project_audit_events(api_client, project["id"])
     assert response.status_code == 200
 
     events = response.json()
@@ -1622,7 +1644,7 @@ def test_api_project_rollback_reverses_pause_and_persists_rollback_record(api_cl
     projects = api_client.get("/api/v1/projects").json()
     assert projects[0]["safe_paused"] is False
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert len(audit_events) == 2
     assert {event["action"] for event in audit_events} == {"rollback_action", "pause_project"}
     assert {event["id"] for event in audit_events} == {
@@ -1751,7 +1773,7 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
         "visibility": "internal",
     }
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert len(audit_events) == 2
     assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project"}
 
@@ -1818,7 +1840,7 @@ def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_
         },
     }
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert audit_events == [
         {
             "id": audit_events[0]["id"],
@@ -1999,7 +2021,7 @@ def test_api_project_report_execute_publish_replays_idempotent_success_without_s
     assert second_response.json() == first_response.json()
     assert call_count["count"] == 1
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
     assert len(publish_events) == 1
     assert publish_events[0]["result"] == "executed"
@@ -2034,7 +2056,7 @@ def test_api_project_report_execute_publish_replays_stored_failure_without_secon
     assert first_response.json() == second_response.json() == {"detail": "publish integration unavailable"}
     assert call_count["count"] == 1
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
     assert len(publish_events) == 1
     assert publish_events[0]["result"] == "failed"
@@ -2073,7 +2095,7 @@ def test_api_project_report_execute_publish_finalizes_unexpected_idempotent_fail
             headers={"x-actor-trusted": "true"},
             json=_report_auth_payload(execute_publish=True, idempotency_key=idempotency_key),
         )
-        audit_events = client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+        audit_events = _get_project_audit_events(client, project["id"]).json()
 
     assert first_response.status_code == 500
     assert second_response.status_code == 422
@@ -2117,7 +2139,7 @@ def test_api_project_report_execute_publish_replays_soft_failure_without_second_
     assert first_response.json()["publish"]["detail"] == "notion rejected publish payload"
     assert call_count["count"] == 1
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
     assert len(publish_events) == 1
     assert publish_events[0]["result"] == "failed"
@@ -2284,7 +2306,7 @@ def test_api_project_report_execute_publish_rejects_conflicting_idempotency_reus
     assert conflicting_response.json() == {"detail": "idempotency key already used for different request context"}
     assert call_count["count"] == 1
 
-    audit_events = api_client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
     assert len(publish_events) == 1
     assert publish_events[0]["actor"] == "alice"
@@ -2403,7 +2425,7 @@ def test_api_project_report_execute_publish_returns_422_on_integration_error(mon
             headers={"x-actor-trusted": "true"},
             json=_report_auth_payload(execute_publish=True),
         )
-        audit_events = client.get(f"/api/v1/projects/{project['id']}/audit-events").json()
+        audit_events = _get_project_audit_events(client, project["id"]).json()
 
     assert response.status_code == 422
     assert response.json()["detail"] == "publish integration unavailable"

@@ -162,7 +162,11 @@ def test_api_project_onboarding_failure_marks_project_paused_and_escalates(api_c
     assert project["safe_paused"] is True
     assert project["timezone"] == payload["timezone"]
 
-    audit_response = api_client.get(f"/api/v1/projects/{project['id']}/audit-events")
+    audit_response = api_client.get(
+        f"/api/v1/projects/{project['id']}/audit-events",
+        params={"role": "operator"},
+        headers={"x-actor-trusted": "true"},
+    )
     assert audit_response.status_code == 200
     audit_events = audit_response.json()
     assert [event["action"] for event in audit_events] == ["draft_boss_escalation", "onboard_project"]

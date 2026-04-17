@@ -641,11 +641,22 @@ def list_tasks(project_id: str, db: Session = Depends(get_db_session)) -> List[T
 @router.get("/{project_id}/audit-events", response_model=List[AuditResponse])
 def list_audit_events(
     project_id: str,
+    role: str = Query(..., pattern="^(owner|admin|operator|viewer)$"),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
     db: Session = Depends(get_db_session),
 ) -> List[AuditResponse]:
     project = db.query(models.Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
+
+    decision = PolicyEngine().evaluate(
+        actor_role=role,
+        actor_trusted=bool(actor_trusted),
+        action="audit_view",
+        safe_paused=bool(project.safe_paused),
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
 
     events = (
         db.query(models.AuditEvent)
