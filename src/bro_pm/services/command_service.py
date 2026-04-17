@@ -34,12 +34,19 @@ class RollbackExecution:
     detail: str
 
 
+class UnsafeIsolatedSqlitePersistenceError(RuntimeError):
+    """Raised when a side-session sqlite write would share the caller transaction."""
+
+
 class CommandService:
     """Convert parsed commands into durable audit-ready operations."""
 
     PENDING_INTEGRATION_STALE_AFTER = timedelta(minutes=5)
     PENDING_INTEGRATION_WAIT_ATTEMPTS = 100
     PENDING_INTEGRATION_WAIT_DELAY_SECONDS = 0.05
+    SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL = (
+        "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+    )
 
     def __init__(self, db_session: Session, hermes: HermesAdapter | None = None, policy: PolicyEngine | None = None):
         self.db = db_session
@@ -178,9 +185,7 @@ class CommandService:
                         if self._caller_session_holds_sqlite_write_transaction():
                             response_result = "rejected"
                             stored_result = "denied"
-                            detail = (
-                                "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
-                            )
+                            detail = self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL
                             success = False
                         else:
                             reservation_payload = {
@@ -633,8 +638,6 @@ class CommandService:
         bind = self.db.get_bind()
         if getattr(bind.dialect, "name", None) != "sqlite":
             return False
-        if getattr(bind.url, "database", None) in (None, ""):
-            return False
         connection = self.db.connection()
         dbapi_connection = getattr(connection, "connection", None)
         return bool(getattr(dbapi_connection, "in_transaction", False))
@@ -648,6 +651,9 @@ class CommandService:
         attempts: int = PENDING_INTEGRATION_WAIT_ATTEMPTS,
         delay_seconds: float = PENDING_INTEGRATION_WAIT_DELAY_SECONDS,
     ) -> None:
+        if self._sqlite_side_session_isolation_is_unsafe() and self._caller_session_holds_sqlite_write_transaction():
+            raise UnsafeIsolatedSqlitePersistenceError(self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL)
+
         for attempt in range(attempts):
             persistence_session = Session(bind=self.db.get_bind(), future=True)
             try:
@@ -672,6 +678,12 @@ class CommandService:
             return False
         return "database is locked" in str(exc).lower()
 
+    def _sqlite_side_session_isolation_is_unsafe(self) -> bool:
+        bind = self.db.get_bind()
+        if getattr(bind.dialect, "name", None) != "sqlite":
+            return False
+        return getattr(bind.url, "database", None) in {None, "", ":memory:"}
+
     def _load_existing_idempotent_record_snapshot(
         self,
         idempotency_key: str,
@@ -684,6 +696,16 @@ class CommandService:
             return existing
         finally:
             read_session.close()
+
+    def _load_existing_idempotent_record_in_caller_session(
+        self,
+        idempotency_key: str,
+    ) -> models.AuditEvent | None:
+        with self.db.no_autoflush:
+            existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
+        if existing is not None and not self.db.is_modified(existing):
+            self.db.refresh(existing)
+        return existing
 
     def _wait_for_existing_idempotent_record(
         self,
@@ -698,7 +720,10 @@ class CommandService:
 
         existing: models.AuditEvent | None = None
         for attempt in range(attempts):
-            existing = self._load_existing_idempotent_record_snapshot(idempotency_key)
+            if self._sqlite_side_session_isolation_is_unsafe():
+                existing = self._load_existing_idempotent_record_in_caller_session(idempotency_key)
+            else:
+                existing = self._load_existing_idempotent_record_snapshot(idempotency_key)
             if existing and (
                 not wait_for_stable_result
                 or existing.result != "pending_integration"
@@ -896,10 +921,27 @@ class CommandService:
             replay_context=replay_context,
             proposal=proposal,
         ):
-            existing, repaired_stale_payload = self._mark_stale_pending_integration_denied(
-                existing=existing,
-                replay_context=replay_context,
-            )
+            if self._caller_session_holds_sqlite_write_transaction():
+                return ProposalExecution(
+                    success=False,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="rejected",
+                    detail=self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL,
+                )
+            try:
+                existing, repaired_stale_payload = self._mark_stale_pending_integration_denied(
+                    existing=existing,
+                    replay_context=replay_context,
+                )
+            except UnsafeIsolatedSqlitePersistenceError as exc:
+                return ProposalExecution(
+                    success=False,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="rejected",
+                    detail=str(exc),
+                )
 
         try:
             existing_payload = json.loads(existing.payload)

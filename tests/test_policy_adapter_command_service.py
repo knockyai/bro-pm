@@ -30,6 +30,16 @@ def _make_isolated_db_session():
     return database, session
 
 
+def _make_shared_connection_db_session():
+    """Return fresh sqlite:// DB module/session tuple for shared-connection tests."""
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db("sqlite://")
+    session = database.SessionLocal()
+    return database, session
+
+
 def _create_project(session, *, name: str = "Default", slug: str = "default") -> models.Project:
     project = models.Project(name=name, slug=slug)
     session.add(project)
@@ -741,6 +751,78 @@ def test_command_service_create_task_assisted_execution_rejects_in_memory_sqlite
     assert execution.detail == "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
 
 
+def test_command_service_create_task_assisted_execution_rejects_shared_connection_sqlite_write_locked_caller_session(monkeypatch):
+    database, setup_session = _make_shared_connection_db_session()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted sqlite shared connection lock guard project",
+            slug=f"assisted-sqlite-shared-lock-guard-{uuid4().hex[:8]}",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    execute_counter = {"count": 0}
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: execute_counter.__setitem__("count", execute_counter["count"] + 1)
+        or IntegrationResult(ok=True, detail="unexpected sqlite:// create-path execution"),
+    )
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "already flushed caller change"
+        session.flush()
+
+        service = CommandService(db_session=session)
+        bind = session.get_bind()
+        connection = session.connection().connection
+        assert getattr(bind.url, "database", None) is None
+        assert connection.in_transaction is True
+        assert session.is_modified(project) is False
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=service.parse(
+                actor="alice",
+                command="create task shared connection durable pending reservation",
+                project_id=project_id,
+            ),
+            actor_trusted=True,
+            idempotency_key="assisted-sqlite-shared-lock-guard-key",
+            execute_integration=True,
+        )
+
+        assert connection.in_transaction is True
+        assert project.description == "already flushed caller change"
+        assert session.is_modified(project) is False
+        assert execution.result == "rejected"
+        assert execution.detail == "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+    finally:
+        session.rollback()
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        observed_project = observer_session.get(models.Project, project_id)
+        audit = observer_session.query(models.AuditEvent).filter_by(
+            idempotency_key="assisted-sqlite-shared-lock-guard-key"
+        ).one_or_none()
+    finally:
+        observer_session.close()
+
+    assert observed_project is not None
+    assert observed_project.description is None
+    assert audit is None
+    assert execute_counter == {"count": 0}
+
+
 def test_command_service_create_task_assisted_execution_persists_terminal_audit_state_even_if_caller_rolls_back(tmp_path):
     database, _ = _make_file_backed_db_module(tmp_path)
     setup_session = database.SessionLocal()
@@ -926,6 +1008,108 @@ def test_command_service_wait_for_existing_idempotent_record_preserves_unrelated
         assert update_counter == {"sleep": 1}
         assert project.description == "caller-owned pending change"
         assert session.is_modified(project)
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_command_service_wait_for_existing_idempotent_record_does_not_clobber_dirty_loaded_audit_event_on_in_memory_sqlite():
+    database, setup_session = _make_isolated_db_session()
+    idempotency_key = "wait-preserves-dirty-audit-event"
+
+    try:
+        project = _create_project(
+            setup_session,
+            name="Wait preserves dirty audit event project",
+            slug=f"wait-preserves-dirty-audit-{uuid4().hex[:8]}",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload=json.dumps({"x": 1}, ensure_ascii=False),
+                result="accepted",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+        )
+        setup_session.commit()
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        audit.payload = json.dumps({"x": 999}, ensure_ascii=False)
+        assert session.is_modified(audit) is True
+
+        service = CommandService(db_session=session)
+
+        existing = service._wait_for_existing_idempotent_record(
+            idempotency_key,
+            attempts=1,
+            delay_seconds=0.01,
+        )
+
+        assert existing is audit
+        assert existing.payload == json.dumps({"x": 999}, ensure_ascii=False)
+        assert session.is_modified(audit) is True
+    finally:
+        session.rollback()
+        session.close()
+
+
+
+def test_command_service_wait_for_existing_idempotent_record_keeps_in_memory_sqlite_caller_transaction_open():
+    database, setup_session = _make_isolated_db_session()
+    idempotency_key = "wait-preserves-in-memory-transaction"
+
+    try:
+        project = _create_project(
+            setup_session,
+            name="Wait preserves in-memory sqlite transaction project",
+            slug=f"wait-preserves-in-memory-{uuid4().hex[:8]}",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload=json.dumps({}, ensure_ascii=False),
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "caller-owned change"
+        session.flush()
+
+        service = CommandService(db_session=session)
+        connection = session.connection().connection
+        assert connection.in_transaction is True
+        assert session.is_modified(project) is False
+
+        existing = service._wait_for_existing_idempotent_record(idempotency_key)
+
+        assert existing is not None
+        assert existing.result == "pending_integration"
+        assert connection.in_transaction is True
+        assert project.description == "caller-owned change"
+        assert session.is_modified(project) is False
     finally:
         session.rollback()
         session.close()
@@ -1185,6 +1369,283 @@ def test_command_service_stale_pending_replay_repair_does_not_flush_unrelated_ca
     finally:
         session.rollback()
         session.close()
+
+
+
+def test_command_service_stale_pending_replay_rejects_file_backed_sqlite_write_locked_caller_session(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "stale-repair-file-backed-write-lock"
+    rejection_detail = "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale repair file-backed sqlite lock guard project",
+            slug="stale-repair-file-backed-lock-guard",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    execute_counter = {"count": 0}
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: execute_counter.__setitem__("count", execute_counter["count"] + 1)
+        or IntegrationResult(ok=True, detail="unexpected file-backed stale sqlite execution"),
+    )
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "caller-owned change"
+        session.flush()
+
+        service = CommandService(db_session=session)
+        connection = session.connection().connection
+        assert connection.in_transaction is True
+        assert session.is_modified(project) is False
+
+        monkeypatch.setattr(
+            service,
+            "_mark_stale_pending_integration_denied",
+            lambda *, existing, replay_context: (_ for _ in ()).throw(
+                AssertionError("stale pending repair must fail closed before isolated sqlite mutation on file-backed sqlite")
+            ),
+        )
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=service.parse(
+                actor="alice",
+                command="create task stale repair file backed lock guard",
+                project_id=project_id,
+            ),
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+
+        assert connection.in_transaction is True
+        assert project.description == "caller-owned change"
+        assert session.is_modified(project) is False
+        assert execution.success is False
+        assert execution.result == "rejected"
+        assert execution.detail == rejection_detail
+    finally:
+        session.rollback()
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        stored = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        observed_project = observer_session.get(models.Project, project_id)
+    finally:
+        observer_session.close()
+
+    assert execute_counter == {"count": 0}
+    assert stored.result == "pending_integration"
+    assert stored.payload == "{legacy-pending-json"
+    assert observed_project is not None
+    assert observed_project.description is None
+
+
+
+def test_command_service_stale_pending_replay_rejects_in_memory_sqlite_write_locked_caller_session():
+    database, setup_session = _make_isolated_db_session()
+    idempotency_key = "stale-repair-memory-write-lock"
+    rejection_detail = "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale repair in-memory sqlite lock guard project",
+            slug=f"stale-repair-memory-lock-{uuid4().hex[:8]}",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    execute_counter = {"count": 0}
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        notion,
+        "execute",
+        lambda *, action, payload: execute_counter.__setitem__("count", execute_counter["count"] + 1)
+        or IntegrationResult(ok=True, detail="unexpected stale in-memory sqlite execution"),
+    )
+    try:
+        session = database.SessionLocal()
+        try:
+            project = session.get(models.Project, project_id)
+            assert project is not None
+            project.description = "caller-owned change"
+            session.flush()
+
+            service = CommandService(db_session=session)
+            proposal = service.parse(
+                actor="alice",
+                command="create task stale repair memory lock guard",
+                project_id=project_id,
+            )
+
+            connection = session.connection().connection
+            assert connection.in_transaction is True
+            assert session.is_modified(project) is False
+
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key=idempotency_key,
+                execute_integration=True,
+            )
+
+            assert connection.in_transaction is True
+            assert project.description == "caller-owned change"
+            assert session.is_modified(project) is False
+            assert execution.success is False
+            assert execution.result == "rejected"
+            assert execution.detail == rejection_detail
+        finally:
+            session.rollback()
+            session.close()
+    finally:
+        monkeypatch.undo()
+
+    observer_session = database.SessionLocal()
+    try:
+        stored = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        observed_project = observer_session.get(models.Project, project_id)
+    finally:
+        observer_session.close()
+
+    assert execute_counter == {"count": 0}
+    assert stored.result == "pending_integration"
+    assert stored.payload == "{legacy-pending-json"
+    assert observed_project is not None
+    assert observed_project.description is None
+
+
+def test_command_service_stale_pending_replay_rejects_sqlite_url_write_locked_caller_session(monkeypatch):
+    database, setup_session = _make_shared_connection_db_session()
+    idempotency_key = "stale-repair-sqlite-url-write-lock"
+    rejection_detail = "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
+
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale repair sqlite url lock guard project",
+            slug=f"stale-repair-sqlite-url-lock-{uuid4().hex[:8]}",
+        )
+        setup_session.add(
+            models.AuditEvent(
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                target_type="proposal",
+                target_id=project.id,
+                payload="{legacy-pending-json",
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    execute_counter = {"count": 0}
+    monkeypatch.setattr(
+        INTEGRATIONS["notion"],
+        "execute",
+        lambda *, action, payload: execute_counter.__setitem__("count", execute_counter["count"] + 1)
+        or IntegrationResult(ok=True, detail="unexpected stale sqlite:// execution"),
+    )
+
+    session = database.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.description = "caller-owned change"
+        session.flush()
+
+        service = CommandService(db_session=session)
+        bind = session.get_bind()
+        connection = session.connection().connection
+        assert getattr(bind.url, "database", None) is None
+        assert connection.in_transaction is True
+        assert session.is_modified(project) is False
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=service.parse(
+                actor="alice",
+                command="create task stale repair sqlite url lock guard",
+                project_id=project_id,
+            ),
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+
+        assert connection.in_transaction is True
+        assert project.description == "caller-owned change"
+        assert session.is_modified(project) is False
+        assert execution.success is False
+        assert execution.result == "rejected"
+        assert execution.detail == rejection_detail
+    finally:
+        session.rollback()
+        session.close()
+
+    observer_session = database.SessionLocal()
+    try:
+        stored = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        observed_project = observer_session.get(models.Project, project_id)
+    finally:
+        observer_session.close()
+
+    assert execute_counter == {"count": 0}
+    assert stored.result == "pending_integration"
+    assert stored.payload == "{legacy-pending-json"
+    assert observed_project is not None
+    assert observed_project.description is None
 
 
 
