@@ -31,6 +31,7 @@ class Project(Base):
     tasks: Mapped[list["Task"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     goals: Mapped[list["Goal"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     memberships: Mapped[list["ProjectMembership"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    due_actions: Mapped[list["DueAction"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class ProjectMembership(Base):
@@ -134,3 +135,35 @@ class PolicyRule(Base):
     role_required: Mapped[str] = mapped_column(String(60), default="operator")
     allow_when_safe_paused: Mapped[bool] = mapped_column(Boolean, default=False)
     deny_when_untrusted_actor: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class DueAction(Base):
+    __tablename__ = "due_actions"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_due_actions_idempotency_key"),
+        Index("ix_due_actions_status_due_at", "status", "due_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    channel: Mapped[str] = mapped_column(String(80))
+    recipient: Mapped[str] = mapped_column(String(255))
+    kind: Mapped[str] = mapped_column(String(80))
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    actor: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delivery_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    external_delivery_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    project: Mapped[Project | None] = relationship(back_populates="due_actions")

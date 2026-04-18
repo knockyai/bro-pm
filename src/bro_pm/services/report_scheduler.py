@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .. import models
 from ..schemas import CommandProposal
 from .command_service import CommandService
+from .gateway_service import GatewayService
 from .reporting_service import ReportingService
 
 
@@ -243,6 +244,74 @@ def _execute_autonomous_proposal(
     return execution.success
 
 
+def _onboarding_metadata(project: models.Project) -> dict:
+    metadata = project.metadata_json or {}
+    onboarding = metadata.get("onboarding") or {}
+    return onboarding if isinstance(onboarding, dict) else {}
+
+
+def _preferred_gateway_channel(project: models.Project) -> str | None:
+    integrations = _onboarding_metadata(project).get("communication_integrations")
+    if not isinstance(integrations, list):
+        return None
+
+    normalized = [value.strip().lower() for value in integrations if isinstance(value, str) and value.strip()]
+    if "telegram" in normalized:
+        return "telegram"
+    return normalized[0] if normalized else None
+
+
+def _failure_escalation_recipient(project: models.Project) -> str | None:
+    onboarding = _onboarding_metadata(project)
+    for field_name in ("boss", "admin"):
+        value = onboarding.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(project.created_by, str) and project.created_by.strip():
+        return project.created_by.strip()
+    return None
+
+
+def _enqueue_failure_escalation_due_action(
+    session: Session,
+    *,
+    project: models.Project,
+    proposal: CommandProposal,
+    window: DecisionWindow,
+    now: datetime,
+) -> bool:
+    channel = _preferred_gateway_channel(project)
+    recipient = _failure_escalation_recipient(project)
+    if channel is None or recipient is None:
+        return False
+
+    idempotency_key = _decision_idempotency_key(project.id, trace_label="timer_failure_escalation", window=window)
+    existing = session.query(models.DueAction).filter_by(idempotency_key=idempotency_key).one_or_none()
+    if existing is not None:
+        return False
+
+    payload = {
+        "text": proposal.payload.get("escalation_message") or proposal.reason,
+        "risk_level": proposal.payload.get("risk_level", "high"),
+        "requires_approval": True,
+        "trace_label": "timer_failure_escalation",
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "proposal_action": proposal.action,
+    }
+    GatewayService(db_session=session).enqueue_due_action(
+        project_id=project.id,
+        channel=channel,
+        recipient=recipient,
+        kind="boss_escalation",
+        payload=payload,
+        due_at=now,
+        actor=AUTONOMOUS_ACTOR,
+        idempotency_key=idempotency_key,
+    )
+    return True
+
+
 def _build_failure_escalation_proposal(project: models.Project, *, failure_count: int) -> CommandProposal:
     return CommandProposal(
         action="draft_boss_escalation",
@@ -345,11 +414,12 @@ def _run_due_project_decision(project_id: str, *, session_factory: sessionmaker,
             now=now,
         ):
             proposal = _build_failure_escalation_proposal(project, failure_count=failure_count)
-            return _execute_autonomous_proposal(
+            return _enqueue_failure_escalation_due_action(
                 session,
-                project_id=project.id,
+                project=project,
                 proposal=proposal,
-                idempotency_key=_decision_idempotency_key(project.id, trace_label="timer_failure_escalation", window=window),
+                window=window,
+                now=now,
             )
 
         tasks = _project_tasks(session, project_id=project.id)

@@ -338,3 +338,49 @@ class ProjectReportResponse(BaseModel):
     action_ids: list[str] = Field(default_factory=list)
     links: ProjectReportLinks
     publish: ReportPublishResult
+
+
+class DueActionClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gateway: str = Field(min_length=2, max_length=120)
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class DueActionDeliveryUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(pattern="^(delivered|failed|acked)$")
+    claim_token: str = Field(min_length=8, max_length=255)
+    external_delivery_id: str | None = Field(default=None, max_length=255)
+    error_detail: str | None = Field(default=None, max_length=4000)
+
+
+class DueActionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str | None
+    channel: str
+    recipient: str
+    kind: str
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    due_at: datetime
+    status: str
+    actor: str | None = None
+    idempotency_key: str | None = None
+    claim_token: str | None = None
+    claimed_by: str | None = None
+    claimed_at: datetime | None = None
+    delivery_attempted_at: datetime | None = None
+    delivered_at: datetime | None = None
+    failed_at: datetime | None = None
+    acked_at: datetime | None = None
+    external_delivery_id: str | None = None
+    last_error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DueActionClaimResponse(BaseModel):
+    items: list[DueActionResponse] = Field(default_factory=list)

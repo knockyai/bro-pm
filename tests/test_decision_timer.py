@@ -175,17 +175,21 @@ def test_run_due_decisions_once_escalates_after_repeated_failures(decision_db):
     result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
 
     assert result == 1
-    autonomy_events = _events_for(
-        decision_db,
-        project_id,
-        actor=scheduler.AUTONOMOUS_ACTOR,
-        action="draft_boss_escalation",
-    )
-    assert len(autonomy_events) == 1
-    assert autonomy_events[0].result == "awaiting_approval"
-    payload = _payload(autonomy_events[0])
-    assert payload["proposal"]["payload"]["trace_label"] == "timer_failure_escalation"
-    assert "recent failures" in payload["proposal"]["payload"]["escalation_message"].lower()
+    session = decision_db.SessionLocal()
+    try:
+        due_actions = (
+            session.query(models.DueAction)
+            .filter_by(project_id=project_id, actor=scheduler.AUTONOMOUS_ACTOR, kind="boss_escalation")
+            .all()
+        )
+        assert len(due_actions) == 1
+        due_action = due_actions[0]
+        assert due_action.channel == "slack"
+        assert due_action.recipient == "alice"
+        assert due_action.status == "pending"
+        assert "recent failures" in due_action.payload_json["text"].lower()
+    finally:
+        session.close()
 
 
 def test_run_due_decisions_once_creates_followup_task_for_active_goal_without_open_tasks(decision_db, monkeypatch):

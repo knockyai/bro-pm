@@ -18,7 +18,7 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 - **Authoritative truth**: Postgres state (projects, goals, tasks, policy, audit, risk, rollbacks).
 
-- **Ephemeral reasoning**: Hermes returns structured suggestions only.
+- **Ephemeral reasoning + chat runtime**: Hermes gateway listens to Telegram/DMs, talks to people, and returns structured suggestions only.
 
 - **Execution safety**: all outbound actions execute through backend pipelines with policy checks.
 
@@ -32,7 +32,9 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 - Event ingestion: normalize inbound events from chats/trackers/docs.
 
-- Hermes orchestrator: generates structured proposals from sliced context.
+- Hermes gateway: chat/session runtime that listens to Telegram and calls backend control APIs.
+
+- Due-action outbox: durable queue of outbound actions/messages waiting for Hermes delivery and acknowledgement.
 
 - Execution engine: validates, executes, verifies, audits each action.
 
@@ -50,23 +52,25 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 ## 1.5 Runtime flow (MVP)
 
-1. Event/command enters API or webhook.
+1. Hermes gateway receives a chat event or cron/timer wake-up.
 
-2. Backend normalizes and persists inbound event.
+2. Backend normalizes and persists inbound event or due action state.
 
 3. Policy selector builds execution context.
 
-4. Hermes job is invoked with structured request.
+4. Hermes can call backend command APIs for structured suggestions or allowed execution.
 
-5. Response is schema-validated and mapped to one or more action proposals.
+5. Backend validates policy and safe-pause state.
 
-6. Engine validates policy and safe-pause state.
+6. Integrations execute actions using adapters.
 
-7. Integrations execute actions using adapters.
+7. Outbound actions that should be delivered through chat are stored as durable `DueAction` rows.
 
-8. Execution is verified and always audited.
+8. Hermes gateway claims due actions, delivers them to Telegram/DMs, and acknowledges delivery back to backend.
 
-9. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that reuses the existing command/policy/audit flow for narrow next-step actions.
+9. Execution/delivery is always audited.
+
+10. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that can either create internal tasks or enqueue boss-escalation due actions for Hermes delivery.
 
 ## 1.6 Deployment
 

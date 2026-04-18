@@ -9,6 +9,7 @@ from ..config import settings
 from ..database import SessionLocal, init_db
 from ..services.report_scheduler import start_polling_task, stop_polling_task
 from .v1.commands import router as command_router
+from .v1.gateway import router as gateway_router
 from .v1.projects import router as project_router
 
 
@@ -47,6 +48,7 @@ def create_app(
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.include_router(project_router, prefix="/api/v1")
     app.include_router(command_router, prefix="/api/v1")
+    app.include_router(gateway_router, prefix="/api/v1")
     return app
 
 

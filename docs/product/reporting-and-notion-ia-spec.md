@@ -22,6 +22,7 @@ MVP visibility primarily through Notion, with audit-first structure.
 
 - Project report
   - current MVP also supports timer-driven autonomous publishing for `daily` and `weekly` cadences via an in-process scheduler
+  - failure escalation from the 10-minute decision timer is queued as a durable `DueAction` for Hermes gateway delivery instead of pretending Bro-PM itself sends Telegram messages
 
 - Risk report
 
