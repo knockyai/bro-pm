@@ -16,7 +16,11 @@
 
 - Notion
 
+- Yandex Tracker
+
 ## 5.2 Integration adapter interface
+
+Current MVP adapter boundary already exists in code and supports board adapters such as `notion`, `jira`, `trello`, and `yandex_tracker`.
 
 - `ingest_events()`
 

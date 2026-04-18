@@ -183,13 +183,15 @@ Remote-path пока не реализован:
 - `notion`
 - `jira`
 - `trello`
+- `yandex_tracker`
 - `telegram`
 - `slack`
 
 Но это именно stub-слой текущего MVP:
 
 - `validate(...)` проверяет допустимость action и базовые поля;
-- `execute(...)` в общем случае просто возвращает synthetic success вроде `"notion executed: create_task"`.
+- `execute(...)` в общем случае просто возвращает synthetic success вроде `"notion executed: create_task"`;
+- `yandex_tracker` уже поддерживается как board integration для onboarding и assisted `create_task`, но пока на том же MVP/stub-уровне, а не как полноценный live Yandex API client.
 
 То есть onboarding smoke check и publish flow уже проходят через integration boundary, но по умолчанию не означают живой внешний API-вызов к реальному Notion/Jira/Trello.
 
@@ -202,7 +204,7 @@ Remote-path пока не реализован:
 - локальная мутация через `_apply_action(...)` покрывает только `pause_project` и `unpause_project`;
 - `close_task` — это approval/audit flow, а не полноценное закрытие локальной task-записи;
 - `validate_integration` и `execute_integration` сейчас поддерживают только `create_task`;
-- assisted `create_task` через `/api/v1/commands` идёт через интеграционный слой и audit, но сам по себе не создаёт локальную запись `Task` в таблице проекта.
+- assisted `create_task` через `/api/v1/commands` идёт через интеграционный слой и audit, не создаёт локальную запись `Task` в таблице проекта и теперь выбирает board adapter по `project.metadata.onboarding.board_integration` с legacy fallback на `notion`.
 
 Если нужен локальный task в БД, сейчас для этого надо использовать project endpoint `POST /api/v1/projects/{project_id}/tasks` или goal intake с вложенными задачами.
 

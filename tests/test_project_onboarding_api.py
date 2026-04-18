@@ -127,6 +127,30 @@ def test_api_project_onboarding_requires_at_least_one_communication_integration(
     assert "at least one communication integration" in response.text
 
 
+def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_client: TestClient):
+    payload = _onboarding_payload()
+    payload["board_integration"] = "yandex_tracker"
+
+    response = api_client.post("/api/v1/projects/onboard", json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "active"
+    assert body["smoke_check"]["status"] == "passed"
+    assert body["smoke_check"]["detail"] == "yandex_tracker executed: create_task"
+
+    db_module = importlib.import_module("bro_pm.database")
+    database_session = db_module.SessionLocal()
+    try:
+        project = database_session.get(models.Project, body["project"]["id"])
+        assert project is not None
+        metadata = project.metadata_json or {}
+        onboarding = metadata.get("onboarding") or {}
+        assert onboarding["board_integration"] == "yandex_tracker"
+    finally:
+        database_session.close()
+
+
 def test_api_project_onboarding_allows_same_actor_as_boss_and_admin(api_client: TestClient):
     payload = _onboarding_payload()
     payload["boss"] = "alice"

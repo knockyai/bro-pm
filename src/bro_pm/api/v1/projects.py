@@ -543,7 +543,11 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
         _onboarding_allowed_integration(name, {"slack", "telegram"}, "communication")
         for name in payload.communication_integrations
     ]
-    board_integration = _onboarding_allowed_integration(payload.board_integration, {"jira", "notion", "trello"}, "board")
+    board_integration = _onboarding_allowed_integration(
+        payload.board_integration,
+        {"jira", "notion", "trello", "yandex_tracker"},
+        "board",
+    )
 
     project = models.Project(
         name=payload.name,

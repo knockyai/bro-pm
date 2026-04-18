@@ -67,6 +67,19 @@ class TrelloIntegration:
 
 
 @dataclass
+class YandexTrackerIntegration:
+    name: str = "yandex_tracker"
+
+    def validate(self, *, action: str, payload: dict) -> None:
+        if action not in {"noop", "create_task", "close_task"}:
+            raise IntegrationError(f"unsupported action for yandex_tracker: {action}")
+
+    def execute(self, *, action: str, payload: dict) -> IntegrationResult:
+        self.validate(action=action, payload=payload)
+        return IntegrationResult(ok=True, detail=f"yandex_tracker executed: {action}")
+
+
+@dataclass
 class TelegramIntegration:
     name: str = "telegram"
 
@@ -97,6 +110,7 @@ INTEGRATIONS: dict[str, Integration] = {
     "notion": NotionIntegration(),
     "jira": JiraIntegration(),
     "trello": TrelloIntegration(),
+    "yandex_tracker": YandexTrackerIntegration(),
     "telegram": TelegramIntegration(),
     "slack": SlackIntegration(),
 }

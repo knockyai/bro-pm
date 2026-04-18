@@ -47,6 +47,7 @@ class CommandService:
     SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL = (
         "assisted create_task requires a clean caller transaction before durable reservation on sqlite"
     )
+    BOARD_INTEGRATIONS = {"notion", "jira", "trello", "yandex_tracker"}
 
     def __init__(self, db_session: Session, hermes: HermesAdapter | None = None, policy: PolicyEngine | None = None):
         self.db = db_session
@@ -58,6 +59,27 @@ class CommandService:
         if not proposal.project_id and project_id:
             proposal.project_id = project_id
         return proposal
+
+    def _resolve_project_board_integration_name(self, project_id: str | None) -> str:
+        if not project_id:
+            return "notion"
+        with self.db.no_autoflush:
+            project = self.db.get(models.Project, project_id)
+        if not project:
+            return "notion"
+        metadata = project.metadata_json or {}
+        onboarding = metadata.get("onboarding") or {}
+        board_integration = onboarding.get("board_integration")
+        if not isinstance(board_integration, str):
+            return "notion"
+        normalized = board_integration.strip().lower()
+        if not normalized:
+            return "notion"
+        if normalized not in self.BOARD_INTEGRATIONS:
+            return "notion"
+        if normalized not in INTEGRATIONS:
+            return "notion"
+        return normalized
 
     def execute(
         self,
@@ -81,6 +103,12 @@ class CommandService:
             "validate_integration": validate_integration,
             "execute_integration": execute_integration,
         }
+        integration_name = None
+        if validate_integration or execute_integration:
+            integration_name = self._resolve_project_board_integration_name(project_id)
+            integration = INTEGRATIONS[integration_name]
+        else:
+            integration = None
         if idempotency_key:
             with self.db.no_autoflush:
                 existing = self.db.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
@@ -150,7 +178,7 @@ class CommandService:
                     success = False
                 else:
                     try:
-                        INTEGRATIONS["notion"].validate(
+                        integration.validate(
                             action="create_task",
                             payload={
                                 **proposal.payload,
@@ -159,7 +187,7 @@ class CommandService:
                         )
                         response_result = "validated"
                         stored_result = "validated"
-                        detail = "policy accepted; notion validated create_task without execution"
+                        detail = f"policy accepted; {integration_name} validated create_task without execution"
                         success = True
                     except IntegrationError as exc:
                         response_result = "rejected"
@@ -200,10 +228,10 @@ class CommandService:
                                 "proposal": proposal.model_dump(),
                                 "policy": decision.__dict__,
                                 "integration": {
-                                    "name": "notion",
+                                    "name": integration_name,
                                     "action": proposal.action,
                                     "status": "pending",
-                                    "detail": "integration execution pending",
+                                    "detail": f"{integration_name} integration execution pending",
                                 },
                             }
                             reservation_id: str | None = None
@@ -244,7 +272,7 @@ class CommandService:
 
                     if success:
                         try:
-                            integration_result = INTEGRATIONS["notion"].execute(
+                            integration_result = integration.execute(
                                 action="create_task",
                                 payload={
                                     **proposal.payload,
@@ -254,7 +282,7 @@ class CommandService:
                             if integration_result.ok:
                                 response_result = "executed"
                                 stored_result = "accepted"
-                                detail = integration_result.detail or "notion executed: create_task"
+                                detail = integration_result.detail or f"{integration_name} executed: create_task"
                                 success = True
                             else:
                                 response_result = "rejected"
@@ -302,7 +330,7 @@ class CommandService:
         }
         if validate_integration or execute_integration:
             payload["integration"] = {
-                "name": "notion",
+                "name": integration_name,
                 "action": proposal.action,
                 "status": response_result,
                 "detail": detail,

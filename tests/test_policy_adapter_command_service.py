@@ -404,6 +404,180 @@ def test_command_service_create_task_read_only_integration_validation_calls_vali
     assert payload["integration"]["detail"]
 
 
+def test_command_service_create_task_validation_routes_to_project_yandex_tracker_integration(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(session, name="Yandex validation project", slug="yandex-validation")
+    project.metadata_json = {
+        "onboarding": {
+            "board_integration": "yandex_tracker",
+        }
+    }
+    session.commit()
+
+    service = CommandService(db_session=session)
+    yandex_tracker = INTEGRATIONS["yandex_tracker"]
+    notion = INTEGRATIONS["notion"]
+    integration_events = {
+        "yandex_validate_calls": 0,
+        "notion_validate_calls": 0,
+    }
+
+    def yandex_validate_stub(*, action: str, payload: dict) -> None:
+        integration_events["yandex_validate_calls"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "implement yandex validation"
+        assert payload["raw_command"] == "create task implement yandex validation"
+
+    def notion_validate_forbidden(*, action: str, payload: dict) -> None:
+        integration_events["notion_validate_calls"] += 1
+        raise AssertionError("notion validate must not run when project selects yandex_tracker")
+
+    monkeypatch.setattr(yandex_tracker, "validate", yandex_validate_stub)
+    monkeypatch.setattr(notion, "validate", notion_validate_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task implement yandex validation",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="yandex-readonly-create-task-key",
+        validate_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "validated"
+    assert execution.detail == "policy accepted; yandex_tracker validated create_task without execution"
+    assert integration_events["yandex_validate_calls"] == 1
+    assert integration_events["notion_validate_calls"] == 0
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["name"] == "yandex_tracker"
+    assert payload["integration"]["status"] == "validated"
+    assert payload["integration"]["detail"] == execution.detail
+
+
+def test_command_service_create_task_validation_falls_back_to_notion_for_legacy_project_without_onboarding_metadata(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(session, name="Legacy integration project", slug="legacy-integration")
+    session.commit()
+
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    yandex_tracker = INTEGRATIONS["yandex_tracker"]
+    integration_events = {
+        "notion_validate_calls": 0,
+        "yandex_validate_calls": 0,
+    }
+
+    def notion_validate_stub(*, action: str, payload: dict) -> None:
+        integration_events["notion_validate_calls"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "legacy validation fallback"
+
+    def yandex_validate_forbidden(*, action: str, payload: dict) -> None:
+        integration_events["yandex_validate_calls"] += 1
+        raise AssertionError("yandex validate must not run for legacy projects without onboarding metadata")
+
+    monkeypatch.setattr(notion, "validate", notion_validate_stub)
+    monkeypatch.setattr(yandex_tracker, "validate", yandex_validate_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task legacy validation fallback",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="legacy-readonly-create-task-key",
+        validate_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "validated"
+    assert execution.detail == "policy accepted; notion validated create_task without execution"
+    assert integration_events["notion_validate_calls"] == 1
+    assert integration_events["yandex_validate_calls"] == 0
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["name"] == "notion"
+    assert payload["integration"]["status"] == "validated"
+    assert payload["integration"]["detail"] == execution.detail
+
+
+def test_command_service_create_task_validation_falls_back_to_notion_when_board_integration_is_not_a_board_adapter(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(session, name="Malformed board integration project", slug="malformed-board-integration")
+    project.metadata_json = {
+        "onboarding": {
+            "board_integration": "slack",
+        }
+    }
+    session.flush()
+    session.commit()
+
+    service = CommandService(db_session=session)
+    notion = INTEGRATIONS["notion"]
+    slack = INTEGRATIONS["slack"]
+    integration_events = {
+        "notion_validate_calls": 0,
+        "slack_validate_calls": 0,
+    }
+
+    def notion_validate_stub(*, action: str, payload: dict) -> None:
+        integration_events["notion_validate_calls"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "board adapter guard"
+
+    def slack_validate_forbidden(*, action: str, payload: dict) -> None:
+        integration_events["slack_validate_calls"] += 1
+        raise AssertionError("slack validate must not run when board_integration metadata is malformed")
+
+    monkeypatch.setattr(notion, "validate", notion_validate_stub)
+    monkeypatch.setattr(slack, "validate", slack_validate_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task board adapter guard",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="non-board-adapter-fallback-key",
+        validate_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "validated"
+    assert execution.detail == "policy accepted; notion validated create_task without execution"
+    assert integration_events["notion_validate_calls"] == 1
+    assert integration_events["slack_validate_calls"] == 0
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["name"] == "notion"
+    assert payload["integration"]["status"] == "validated"
+    assert payload["integration"]["detail"] == execution.detail
+
+
 def test_command_service_create_task_assisted_execution_calls_integrations_execute_not_validate(db_session, monkeypatch):
     session = db_session
     project = _create_project(
@@ -467,6 +641,64 @@ def test_command_service_create_task_assisted_execution_calls_integrations_execu
     assert payload["integration"]["action"] == "create_task"
     assert payload["integration"]["status"] == "executed"
     assert payload["integration"]["detail"] == "notion executed assisted create_task"
+
+
+def test_command_service_create_task_execution_routes_to_project_yandex_tracker_integration(db_session, monkeypatch):
+    session = db_session
+    project = _create_project(session, name="Yandex execution project", slug="yandex-execution")
+    project.metadata_json = {
+        "onboarding": {
+            "board_integration": "yandex_tracker",
+        }
+    }
+    session.commit()
+
+    service = CommandService(db_session=session)
+    yandex_tracker = INTEGRATIONS["yandex_tracker"]
+    notion = INTEGRATIONS["notion"]
+    call_counter = {"yandex_execute": 0, "notion_execute": 0}
+
+    def yandex_execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["yandex_execute"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project.id
+        assert payload["title"] == "assisted yandex sync"
+        assert payload["raw_command"] == "create task assisted yandex sync"
+        return IntegrationResult(ok=True, detail="yandex_tracker executed assisted create_task")
+
+    def notion_execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["notion_execute"] += 1
+        raise AssertionError("notion execute must not run when project selects yandex_tracker")
+
+    monkeypatch.setattr(yandex_tracker, "execute", yandex_execute_stub)
+    monkeypatch.setattr(notion, "execute", notion_execute_forbidden)
+
+    proposal = service.parse(
+        actor="alice",
+        command="create task assisted yandex sync",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key="assisted-yandex-integration-key",
+        execute_integration=True,
+    )
+
+    assert execution.success is True
+    assert execution.result == "executed"
+    assert execution.detail == "yandex_tracker executed assisted create_task"
+    assert call_counter["yandex_execute"] == 1
+    assert call_counter["notion_execute"] == 0
+
+    audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+    payload = json.loads(audit.payload)
+    assert payload["integration"]["name"] == "yandex_tracker"
+    assert payload["integration"]["status"] == "executed"
+    assert payload["integration"]["detail"] == execution.detail
 
 
 def test_command_service_create_task_assisted_execution_commits_pending_reservation_before_integration_execute(tmp_path):
@@ -553,7 +785,7 @@ def test_command_service_create_task_assisted_execution_commits_pending_reservat
                 "name": "notion",
                 "action": "create_task",
                 "status": "pending",
-                "detail": "integration execution pending",
+                "detail": "notion integration execution pending",
             },
         },
     }
