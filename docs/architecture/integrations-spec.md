@@ -24,9 +24,13 @@ Current MVP adapter boundary already exists in code and supports board adapters 
 
 Current implementation note:
 
-- `yandex_tracker.create_task` is live/API-backed and sends a real HTTP request to Yandex Tracker.
-- Runtime config comes from Bro-PM env settings: API base, token, auth prefix/scheme, org header name, org id, and optional default queue.
-- Queue selection prefers `project.metadata.integrations.yandex_tracker.queue` and falls back to `BRO_PM_YANDEX_TRACKER_DEFAULT_QUEUE`.
+- `yandex_tracker.create_task` uses one adapter with two internal backend modes:
+  - `native` = direct HTTP request to Yandex Tracker API;
+  - `mcp` = stdio MCP tool call via the Python MCP SDK.
+- Runtime default backend comes from `BRO_PM_YANDEX_TRACKER_BACKEND` and stays backward-compatible with default `native`.
+- Project metadata may override the backend via `project.metadata.integrations.yandex_tracker.backend` without introducing a second integration name.
+- Queue selection is shared across both backend paths and prefers `payload.queue`, then `project.metadata.integrations.yandex_tracker.queue`, then `BRO_PM_YANDEX_TRACKER_DEFAULT_QUEUE`.
+- MCP runtime config uses Bro-PM env settings for command, args JSON, env JSON, cwd, tool name, and timeout.
 - Other adapters remain MVP/lightweight and are not yet fully live clients.
 
 Planned broader integration surface:

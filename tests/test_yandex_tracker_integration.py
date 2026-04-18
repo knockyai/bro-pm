@@ -28,11 +28,18 @@ class _FakeHTTPResponse:
 def _settings(**overrides) -> Settings:
     values = {
         "yandex_tracker_api_base": "https://tracker.example.test/v2",
+        "yandex_tracker_backend": "native",
         "yandex_tracker_token": "secret-token",
         "yandex_tracker_auth_prefix": "OAuth",
         "yandex_tracker_org_header_name": "X-Org-ID",
         "yandex_tracker_org_id": "org-77",
         "yandex_tracker_default_queue": "BROPM",
+        "yandex_tracker_mcp_command": "uvx",
+        "yandex_tracker_mcp_args_json": '["tracker-mcp"]',
+        "yandex_tracker_mcp_env_json": '{"YANDEX_TRACKER_TOKEN": "secret-token"}',
+        "yandex_tracker_mcp_cwd": "/tmp/yandex-tracker-mcp",
+        "yandex_tracker_mcp_tool_name": "issue_create",
+        "yandex_tracker_mcp_timeout_seconds": 45,
     }
     values.update(overrides)
     return Settings(**values)
@@ -125,5 +132,168 @@ def test_yandex_tracker_execute_wraps_http_failures_as_integration_error():
             payload={
                 "project_id": "project-1",
                 "title": "Sync release checklist",
+            },
+        )
+
+
+def test_yandex_tracker_execute_uses_native_backend_by_default():
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout: int = 0):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHTTPResponse({"id": "42", "key": "BROPM-42"})
+
+    def forbidden_mcp_runner(**kwargs):
+        raise AssertionError("mcp runner must not be used when backend defaults to native")
+
+    integration = YandexTrackerIntegration(
+        settings=_settings(),
+        urlopen=fake_urlopen,
+        mcp_tool_runner=forbidden_mcp_runner,
+    )
+
+    result = integration.execute(
+        action="create_task",
+        payload={
+            "project_id": "project-1",
+            "title": "Default native backend",
+        },
+    )
+
+    assert captured["url"] == "https://tracker.example.test/v2/issues/"
+    assert captured["timeout"] == 30
+    assert captured["body"] == {
+        "queue": "BROPM",
+        "summary": "Default native backend",
+    }
+    assert result.ok is True
+    assert result.detail == "yandex_tracker created task BROPM-42 (id: 42)"
+
+
+@pytest.mark.parametrize(
+    ("settings_overrides", "expected_message"),
+    [
+        ({"yandex_tracker_mcp_command": None, "yandex_tracker_backend": "mcp"}, "missing yandex_tracker MCP command"),
+        ({"yandex_tracker_mcp_tool_name": None, "yandex_tracker_backend": "mcp"}, "missing yandex_tracker MCP tool name"),
+    ],
+)
+def test_yandex_tracker_validate_requires_mcp_command_and_tool_name(settings_overrides, expected_message):
+    integration = YandexTrackerIntegration(settings=_settings(**settings_overrides))
+
+    with pytest.raises(IntegrationError, match=expected_message):
+        integration.validate(
+            action="create_task",
+            payload={
+                "project_id": "project-1",
+                "title": "Ship feature",
+            },
+        )
+
+
+def test_yandex_tracker_execute_project_metadata_can_override_backend_to_mcp_and_queue():
+    captured: dict[str, object] = {}
+
+    def forbidden_urlopen(request, timeout: int = 0):
+        raise AssertionError("native HTTP path must not run when project metadata selects MCP backend")
+
+    def fake_mcp_runner(**kwargs):
+        captured.update(kwargs)
+        return {
+            "isError": False,
+            "structuredContent": {"id": "77", "key": "OPS-77"},
+            "content": [{"type": "text", "text": "created issue OPS-77"}],
+        }
+
+    integration = YandexTrackerIntegration(
+        settings=_settings(),
+        urlopen=forbidden_urlopen,
+        mcp_tool_runner=fake_mcp_runner,
+    )
+
+    result = integration.execute(
+        action="create_task",
+        payload={
+            "project_id": "project-1",
+            "title": "MCP override task",
+            "description": "Use stdio MCP instead of HTTP.",
+            "project_metadata": {
+                "integrations": {
+                    "yandex_tracker": {
+                        "backend": "mcp",
+                        "queue": "OPS",
+                    }
+                }
+            },
+        },
+    )
+
+    assert captured == {
+        "command": "uvx",
+        "args": ["tracker-mcp"],
+        "env": {"YANDEX_TRACKER_TOKEN": "secret-token"},
+        "cwd": "/tmp/yandex-tracker-mcp",
+        "tool_name": "issue_create",
+        "tool_arguments": {
+            "queue": "OPS",
+            "summary": "MCP override task",
+            "description": "Use stdio MCP instead of HTTP.",
+        },
+        "timeout_seconds": 45,
+    }
+    assert result.ok is True
+    assert result.detail == "yandex_tracker created task OPS-77 (id: 77)"
+    assert result.metadata == {
+        "issue_key": "OPS-77",
+        "issue_id": "77",
+        "queue": "OPS",
+    }
+
+
+def test_yandex_tracker_execute_mcp_normalizes_success_from_structured_content():
+    integration = YandexTrackerIntegration(
+        settings=_settings(yandex_tracker_backend="mcp"),
+        mcp_tool_runner=lambda **kwargs: {
+            "isError": False,
+            "structuredContent": {"issueKey": "OPS-88", "issueId": "88"},
+            "content": [{"type": "text", "text": "created issue OPS-88"}],
+        },
+    )
+
+    result = integration.execute(
+        action="create_task",
+        payload={
+            "project_id": "project-1",
+            "title": "Normalize MCP success",
+            "queue": "OPS",
+        },
+    )
+
+    assert result.ok is True
+    assert result.detail == "yandex_tracker created task OPS-88 (id: 88)"
+    assert result.metadata == {
+        "issue_key": "OPS-88",
+        "issue_id": "88",
+        "queue": "OPS",
+    }
+
+
+def test_yandex_tracker_execute_mcp_maps_error_result_to_integration_error():
+    integration = YandexTrackerIntegration(
+        settings=_settings(yandex_tracker_backend="mcp"),
+        mcp_tool_runner=lambda **kwargs: {
+            "isError": True,
+            "content": [{"type": "text", "text": "quota exceeded"}],
+        },
+    )
+
+    with pytest.raises(IntegrationError, match="yandex_tracker create_task failed via MCP: quota exceeded"):
+        integration.execute(
+            action="create_task",
+            payload={
+                "project_id": "project-1",
+                "title": "Fail MCP execution",
+                "queue": "OPS",
             },
         )

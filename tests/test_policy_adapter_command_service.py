@@ -410,6 +410,7 @@ def test_command_service_create_task_validation_routes_to_project_yandex_tracker
     project.metadata_json = {
         "integrations": {
             "yandex_tracker": {
+                "backend": "mcp",
                 "queue": "OPS",
             }
         },
@@ -433,6 +434,7 @@ def test_command_service_create_task_validation_routes_to_project_yandex_tracker
         assert payload["project_id"] == project.id
         assert payload["title"] == "implement yandex validation"
         assert payload["raw_command"] == "create task implement yandex validation"
+        assert payload["project_metadata"]["integrations"]["yandex_tracker"]["backend"] == "mcp"
         assert payload["project_metadata"]["integrations"]["yandex_tracker"]["queue"] == "OPS"
 
     def notion_validate_forbidden(*, action: str, payload: dict) -> None:

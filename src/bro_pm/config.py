@@ -29,6 +29,7 @@ class Settings:
     yandex_tracker_api_base: str = field(
         default_factory=lambda: _env_default("BRO_PM_YANDEX_TRACKER_API_BASE", "https://api.tracker.yandex.net/v2")
     )
+    yandex_tracker_backend: str = field(default_factory=lambda: _env_default("BRO_PM_YANDEX_TRACKER_BACKEND", "native"))
     yandex_tracker_token: str | None = field(default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_TOKEN"))
     yandex_tracker_auth_prefix: str = field(
         default_factory=lambda: _env_default(
@@ -42,6 +43,20 @@ class Settings:
     yandex_tracker_org_id: str | None = field(default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_ORG_ID"))
     yandex_tracker_default_queue: str | None = field(
         default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_DEFAULT_QUEUE")
+    )
+    yandex_tracker_mcp_command: str | None = field(default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_MCP_COMMAND"))
+    yandex_tracker_mcp_args_json: str | None = field(
+        default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_MCP_ARGS_JSON")
+    )
+    yandex_tracker_mcp_env_json: str | None = field(
+        default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_MCP_ENV_JSON")
+    )
+    yandex_tracker_mcp_cwd: str | None = field(default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_MCP_CWD"))
+    yandex_tracker_mcp_tool_name: str | None = field(
+        default_factory=lambda: _env_optional("BRO_PM_YANDEX_TRACKER_MCP_TOOL_NAME")
+    )
+    yandex_tracker_mcp_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("BRO_PM_YANDEX_TRACKER_MCP_TIMEOUT_SECONDS", "45"))
     )
 
 

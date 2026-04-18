@@ -133,6 +133,7 @@ def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_cli
     payload["metadata"] = {
         "integrations": {
             "yandex_tracker": {
+                "backend": "mcp",
                 "queue": "OPS",
             }
         }
@@ -142,6 +143,7 @@ def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_cli
         assert action == "create_task"
         assert payload["title"] == "Synthetic onboarding smoke check"
         assert payload["actor"] == "alice"
+        assert payload["project_metadata"]["integrations"]["yandex_tracker"]["backend"] == "mcp"
         assert payload["project_metadata"]["integrations"]["yandex_tracker"]["queue"] == "OPS"
         return IntegrationResult(ok=True, detail="yandex_tracker created task ONBOARD-1 (id: 101)")
 
@@ -163,6 +165,7 @@ def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_cli
         metadata = project.metadata_json or {}
         onboarding = metadata.get("onboarding") or {}
         assert onboarding["board_integration"] == "yandex_tracker"
+        assert metadata["integrations"]["yandex_tracker"]["backend"] == "mcp"
         assert metadata["integrations"]["yandex_tracker"]["queue"] == "OPS"
     finally:
         database_session.close()
