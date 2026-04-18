@@ -72,7 +72,10 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 10. Execution/delivery is always audited.
 
-11. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that can either create internal tasks or enqueue boss-escalation due actions for Hermes delivery.
+11. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that can either create one internal next-step task or enqueue one boss-escalation due action for Hermes delivery per project/window.
+
+12. Project reports are built from backend-computed state only:
+   audit events remain the source of executed internal decisions, and durable `DueAction` rows are used to surface outbound boss-escalation lineage when the timer chose Hermes delivery instead of internal task creation.
 
 ## 1.6 Deployment
 

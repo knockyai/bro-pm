@@ -34,6 +34,14 @@ class DueActionNotFoundError(RuntimeError):
     pass
 
 
+class InboundReferenceNotFoundError(RuntimeError):
+    pass
+
+
+class InboundReferenceConflictError(RuntimeError):
+    pass
+
+
 class GatewayService:
     def __init__(self, *, db_session: Session) -> None:
         self.db_session = db_session
@@ -173,10 +181,20 @@ class GatewayService:
         disposition = "ignore"
         reason = "no allowed reaction for inbound event"
 
+        project = self.db_session.get(models.Project, project_id) if project_id else None
+
         due_action = None
         if due_action_id:
             due_action = self.db_session.get(models.DueAction, due_action_id)
-            if due_action and normalized_intent in {"ack", "acknowledge", "confirm", "confirmed"}:
+            if due_action is None:
+                raise InboundReferenceNotFoundError(f"due action {due_action_id} not found")
+            self._assert_due_action_matches_context(
+                due_action=due_action,
+                project_id=project_id,
+                platform=platform,
+                actor=actor,
+            )
+            if normalized_intent in {"ack", "acknowledge", "confirm", "confirmed"}:
                 due_action.status = "acked"
                 due_action.acked_at = _utc_now()
                 disposition = "ack_due_action"
@@ -185,9 +203,18 @@ class GatewayService:
         pending_audit = None
         if pending_audit_id and disposition == "ignore":
             pending_audit = self.db_session.get(models.AuditEvent, pending_audit_id)
-            if pending_audit and pending_audit.result == "awaiting_approval":
+            if pending_audit is None:
+                raise InboundReferenceNotFoundError(f"pending audit {pending_audit_id} not found")
+            self._assert_pending_audit_matches_context(
+                pending_audit=pending_audit,
+                project_id=project_id,
+            )
+            if pending_audit.result == "awaiting_approval":
                 approval_status = self._approval_status_for_intent(normalized_intent)
-                if approval_status is not None:
+                if approval_status is not None and project is not None and self._actor_has_project_reply_privilege(
+                    project=project,
+                    actor=actor,
+                ):
                     pending_audit.result = approval_status
                     payload = self._audit_payload(pending_audit.payload)
                     payload["approval"] = {
@@ -201,8 +228,7 @@ class GatewayService:
                     reason = "approval reply recorded for pending audit event"
 
         if disposition == "ignore":
-            project = self.db_session.get(models.Project, project_id) if project_id else None
-            if project and self._actor_has_project_reply_privilege(project=project, actor=actor, actor_role=actor_role):
+            if project and self._actor_has_project_reply_privilege(project=project, actor=actor):
                 disposition = "allow_reply"
                 reason = "trusted project actor may receive a reply"
 
@@ -231,13 +257,8 @@ class GatewayService:
         *,
         project: models.Project,
         actor: str,
-        actor_role: str | None,
     ) -> bool:
         normalized_actor = actor.strip().lower()
-        normalized_role = actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else ""
-        if normalized_role in {"boss", "owner", "admin"}:
-            return True
-
         metadata = project.metadata_json if isinstance(project.metadata_json, dict) else {}
         onboarding = metadata.get("onboarding") if isinstance(metadata.get("onboarding"), dict) else {}
         boss = onboarding.get("boss")
@@ -246,6 +267,14 @@ class GatewayService:
             return True
         if isinstance(admin, str) and admin.strip().lower() == normalized_actor:
             return True
+        team = onboarding.get("team")
+        if isinstance(team, list):
+            for team_entry in team:
+                if not isinstance(team_entry, dict):
+                    continue
+                owner = team_entry.get("owner")
+                if isinstance(owner, str) and owner.strip().lower() == normalized_actor:
+                    return True
 
         membership = (
             self.db_session.query(models.ProjectMembership)
@@ -257,7 +286,39 @@ class GatewayService:
         )
         if membership is None:
             return False
-        return membership.role in {"owner", "admin"}
+        return membership.role.strip().lower() in {"owner", "admin"}
+
+    def _assert_due_action_matches_context(
+        self,
+        *,
+        due_action: models.DueAction,
+        project_id: str | None,
+        platform: str,
+        actor: str,
+    ) -> None:
+        if due_action.project_id != project_id:
+            raise InboundReferenceConflictError(
+                f"due action {due_action.id} does not belong to project {project_id}"
+            )
+        if due_action.channel.strip().lower() != platform.strip().lower():
+            raise InboundReferenceConflictError(
+                f"due action {due_action.id} does not match inbound event context"
+            )
+        if due_action.recipient.strip().lower() != actor.strip().lower():
+            raise InboundReferenceConflictError(
+                f"due action {due_action.id} does not match inbound event context"
+            )
+
+    def _assert_pending_audit_matches_context(
+        self,
+        *,
+        pending_audit: models.AuditEvent,
+        project_id: str | None,
+    ) -> None:
+        if pending_audit.project_id != project_id:
+            raise InboundReferenceConflictError(
+                f"pending audit {pending_audit.id} does not belong to project {project_id}"
+            )
 
     def _approval_status_for_intent(self, normalized_intent: str | None) -> str | None:
         if not normalized_intent:

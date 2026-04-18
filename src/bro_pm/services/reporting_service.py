@@ -282,6 +282,12 @@ class ReportingService:
             .order_by(models.AuditEvent.created_at.desc(), models.AuditEvent.id.desc())
             .all()
         )
+        due_actions = (
+            self.db.query(models.DueAction)
+            .filter_by(project_id=project.id)
+            .order_by(models.DueAction.due_at.desc(), models.DueAction.created_at.desc(), models.DueAction.id.desc())
+            .all()
+        )
         report_audit_events = []
         for event in audit_events:
             payload = self._load_payload(event.payload)
@@ -312,26 +318,54 @@ class ReportingService:
 
         risks = []
         decisions = []
+        for due_action in due_actions:
+            risk = self._risk_from_due_action(due_action=due_action)
+            if risk is not None:
+                risks.append(risk)
+
         action_ids = []
         for event in report_audit_events:
             action_ids.append(event.id)
             payload = self._load_payload(event.payload)
-            proposal_payload = payload.get("proposal", {}).get("payload", {})
+            proposal = payload.get("proposal", {})
+            proposal_payload = proposal.get("payload", {})
+            proposal_reason = proposal.get("reason")
+            trace_label = proposal_payload.get("trace_label")
+            mode = proposal_payload.get("mode")
             policy_reason = payload.get("policy", {}).get("reason")
             integration_detail = payload.get("integration", {}).get("detail")
             event_detail = payload.get("detail")
+            lineage = self._audit_lineage(
+                event=event,
+                mode=mode,
+                trace_label=trace_label,
+                integration_detail=integration_detail,
+            )
 
             if event.action == "draft_boss_escalation":
                 risks.append(
                     ProjectReportRisk(
                         kind="boss_escalation",
+                        source="audit_event",
                         audit_id=event.id,
                         action=event.action,
                         status=event.result,
+                        trace_label=trace_label,
                         summary=proposal_payload.get("escalation_message") or policy_reason or event.action,
+                        lineage=lineage,
                     )
                 )
                 continue
+
+            risk = self._risk_from_trace_label(
+                event=event,
+                trace_label=trace_label,
+                proposal_payload=proposal_payload,
+                fallback_summary=policy_reason or integration_detail or event_detail or event.action,
+                lineage=lineage,
+            )
+            if risk is not None:
+                risks.append(risk)
 
             if event.result == "executed":
                 decisions.append(
@@ -340,6 +374,10 @@ class ReportingService:
                         action=event.action,
                         result=event.result,
                         summary=policy_reason or integration_detail or event_detail or event.action,
+                        reason=proposal_reason or policy_reason or event_detail or integration_detail,
+                        mode=mode,
+                        trace_label=trace_label,
+                        lineage=lineage,
                     )
                 )
 
@@ -363,6 +401,86 @@ class ReportingService:
             "action_ids": action_ids,
             "links": links.model_dump(),
         }
+
+    def _risk_from_trace_label(
+        self,
+        *,
+        event: models.AuditEvent,
+        trace_label: str | None,
+        proposal_payload: dict,
+        fallback_summary: str,
+        lineage: str | None,
+    ) -> ProjectReportRisk | None:
+        if event.result != "executed" or not isinstance(trace_label, str) or not trace_label.strip():
+            return None
+
+        risk_kind = None
+        normalized_trace_label = trace_label.strip()
+        if normalized_trace_label.startswith("timer_executor_overload:"):
+            risk_kind = "executor_overload"
+        elif normalized_trace_label.startswith("timer_idle_executor:"):
+            risk_kind = "idle_executor"
+        elif normalized_trace_label.startswith("timer_stalled_task:"):
+            risk_kind = "stalled_task"
+        elif normalized_trace_label == "timer_commitment_risk":
+            risk_kind = "commitment_risk"
+        elif normalized_trace_label == "timer_overdue_replan":
+            risk_kind = "overdue_tasks"
+
+        if risk_kind is None:
+            return None
+
+        return ProjectReportRisk(
+            kind=risk_kind,
+            source="audit_event",
+            audit_id=event.id,
+            action=event.action,
+            status=event.result,
+            trace_label=normalized_trace_label,
+            summary=proposal_payload.get("description") or proposal_payload.get("title") or fallback_summary,
+            lineage=lineage,
+        )
+
+    def _risk_from_due_action(self, *, due_action: models.DueAction) -> ProjectReportRisk | None:
+        payload = due_action.payload_json if isinstance(due_action.payload_json, dict) else {}
+        trace_label = payload.get("trace_label")
+        if trace_label == "timer_failure_escalation" or due_action.kind == "boss_escalation":
+            return ProjectReportRisk(
+                kind="boss_escalation",
+                source="due_action",
+                due_action_id=due_action.id,
+                action=due_action.kind,
+                status=due_action.status,
+                trace_label=trace_label if isinstance(trace_label, str) else None,
+                summary=str(payload.get("text") or due_action.kind),
+                lineage=self._due_action_lineage(due_action=due_action, trace_label=trace_label),
+            )
+        return None
+
+    @staticmethod
+    def _audit_lineage(
+        *,
+        event: models.AuditEvent,
+        mode: str | None,
+        trace_label: str | None,
+        integration_detail: str | None,
+    ) -> str:
+        parts = [f"mode={mode or 'unknown'}"]
+        if isinstance(trace_label, str) and trace_label.strip():
+            parts.append(f"trace={trace_label.strip()}")
+        parts.append(f"audit={event.action}:{event.result}")
+        if isinstance(integration_detail, str) and integration_detail.strip():
+            parts.append(f"integration={integration_detail.strip()}")
+        return " -> ".join(parts)
+
+    @staticmethod
+    def _due_action_lineage(*, due_action: models.DueAction, trace_label: str | None) -> str:
+        parts = []
+        if isinstance(trace_label, str) and trace_label.strip():
+            parts.append(f"trace={trace_label.strip()}")
+        parts.append(f"due_action={due_action.kind}:{due_action.status}")
+        parts.append(f"delivery={due_action.channel}:{due_action.recipient}")
+        return " -> ".join(parts)
 
     def _persist_publish_audit(
         self,

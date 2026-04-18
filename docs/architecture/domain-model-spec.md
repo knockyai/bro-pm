@@ -14,6 +14,8 @@
 
 - `Task`
 
+- `ExecutorCapacityProfile`
+
 - `TaskDependency`
 
 - `TaskAssignment`
@@ -63,6 +65,18 @@ States: `draft`, `active`, `achieved`, `failed`, `archived`.
 - Only one active goal per project by default.
 
 - Failed goals require risk/evidence and escalation entry.
+
+- MVP autonomy state may attach `commitment_due_at` to both `Project` and `Goal`.
+
+## 2.3.1 MVP autonomy state
+
+- `Project.commitment_due_at` stores the current committed project-level target date.
+
+- `Goal.commitment_due_at` stores the current committed goal-level target date.
+
+- `Task.last_progress_at` stores the latest durable progress heartbeat usable by timer heuristics.
+
+- `ExecutorCapacityProfile` stores normalized `team_name`, `actor`, `capacity_units`, `load_units`, and source metadata per project.
 
 ## 2.4 Policy lifecycle
 

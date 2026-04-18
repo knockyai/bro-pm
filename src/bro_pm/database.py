@@ -151,6 +151,9 @@ def _upgrade_legacy_schema() -> None:
         if "timezone" not in project_columns:
             with _engine.begin() as connection:
                 connection.execute(text("ALTER TABLE projects ADD COLUMN timezone VARCHAR(120)"))
+        if "commitment_due_at" not in project_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE projects ADD COLUMN commitment_due_at DATETIME"))
 
     if "tasks" in inspector.get_table_names():
         task_columns = {column["name"] for column in inspector.get_columns("tasks")}
@@ -159,8 +162,15 @@ def _upgrade_legacy_schema() -> None:
                 connection.execute(text("ALTER TABLE tasks ADD COLUMN goal_id VARCHAR"))
                 if _engine.dialect.name == "sqlite":
                     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_goal_id ON tasks (goal_id)"))
+        if "last_progress_at" not in task_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE tasks ADD COLUMN last_progress_at DATETIME"))
 
     if "goals" in inspector.get_table_names():
+        goal_columns = {column["name"] for column in inspector.get_columns("goals")}
+        if "commitment_due_at" not in goal_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE goals ADD COLUMN commitment_due_at DATETIME"))
         if _has_index(inspector, "goals", _ACTIVE_GOAL_INDEX_NAME):
             _assert_active_goal_index_shape()
         else:

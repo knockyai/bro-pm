@@ -15,6 +15,7 @@ class ProjectCreate(BaseModel):
     slug: str = Field(min_length=3, max_length=120)
     description: str | None = None
     timezone: str | None = None
+    commitment_due_at: datetime | None = None
     created_by: str | None = None
     visibility: str = "internal"
     safe_paused: bool = False
@@ -60,6 +61,7 @@ class ProjectResponse(BaseModel):
     slug: str
     description: str | None
     timezone: str | None = None
+    commitment_due_at: datetime | None = None
     safe_paused: bool
     created_by: str | None
     visibility: str
@@ -107,6 +109,17 @@ class ProjectOnboardingCreate(ProjectCreate):
             raise ValueError("value must not be empty")
         return normalized
 
+    @field_validator("team")
+    @classmethod
+    def validate_unique_capacity_profiles(cls, value: list[OnboardingTeamInput]) -> list[OnboardingTeamInput]:
+        seen: set[tuple[str, str]] = set()
+        for entry in value:
+            key = (entry.name.strip().lower(), entry.owner.strip().lower())
+            if key in seen:
+                raise ValueError("team entries must be unique by name and owner")
+            seen.add(key)
+        return value
+
 
 class OnboardingGateChecks(BaseModel):
     policy_attached: bool
@@ -141,6 +154,7 @@ class TaskCreate(BaseModel):
     priority: str = "medium"
     policy_flags: list[str] | None = None
     due_at: datetime | None = None
+    last_progress_at: datetime | None = None
 
 
 class TaskResponse(BaseModel):
@@ -156,6 +170,7 @@ class TaskResponse(BaseModel):
     priority: str
     policy_flags: list[str] | None = None
     due_at: datetime | None
+    last_progress_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -170,6 +185,7 @@ class GoalTaskCreate(BaseModel):
     priority: str = "medium"
     policy_flags: list[str] | None = None
     due_at: datetime | None = None
+    last_progress_at: datetime | None = None
 
 
 class GoalCreate(BaseModel):
@@ -178,6 +194,9 @@ class GoalCreate(BaseModel):
     title: str = Field(min_length=3, max_length=255)
     description: str | None = None
     status: str = "draft"
+    commitment_due_at: datetime | None = None
+    auto_decompose: bool = False
+    max_generated_tasks: int = Field(default=3, ge=1, le=3)
     tasks: list[GoalTaskCreate] = Field(default_factory=list)
 
     @field_validator("status", mode="before")
@@ -186,6 +205,17 @@ class GoalCreate(BaseModel):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+    @field_validator("tasks")
+    @classmethod
+    def validate_task_list(cls, value: list[GoalTaskCreate]) -> list[GoalTaskCreate]:
+        return value
+
+
+class TaskDecompositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_generated_tasks: int = Field(default=3, ge=1, le=3)
 
 
 class GoalResponse(BaseModel):
@@ -196,9 +226,24 @@ class GoalResponse(BaseModel):
     title: str
     description: str | None
     status: str
+    commitment_due_at: datetime | None
     created_at: datetime
     updated_at: datetime
     tasks: list[TaskResponse] = Field(default_factory=list)
+
+
+class ExecutorCapacityProfileResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    team_name: str
+    actor: str
+    capacity_units: int
+    load_units: int
+    source: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class CommandRequest(BaseModel):
@@ -296,10 +341,14 @@ class ProjectReportKpis(BaseModel):
 
 class ProjectReportRisk(BaseModel):
     kind: str
+    source: str | None = None
     audit_id: str | None = None
+    due_action_id: str | None = None
     action: str | None = None
     status: str | None = None
+    trace_label: str | None = None
     summary: str
+    lineage: str | None = None
 
 
 class ProjectReportDecision(BaseModel):
@@ -307,6 +356,10 @@ class ProjectReportDecision(BaseModel):
     action: str
     result: str
     summary: str
+    reason: str | None = None
+    mode: str | None = None
+    trace_label: str | None = None
+    lineage: str | None = None
 
 
 class ProjectReportLinks(BaseModel):

@@ -127,6 +127,27 @@ def test_api_project_onboarding_requires_at_least_one_communication_integration(
     assert "at least one communication integration" in response.text
 
 
+def test_api_project_onboarding_rejects_duplicate_capacity_profiles(api_client: TestClient):
+    payload = _onboarding_payload()
+    payload["team"] = [
+        {
+            "name": "operations",
+            "owner": "alice",
+            "capacity": 3,
+        },
+        {
+            "name": "operations",
+            "owner": "alice",
+            "capacity": 2,
+        },
+    ]
+
+    response = api_client.post("/api/v1/projects/onboard", json=payload)
+
+    assert response.status_code == 422
+    assert "team entries must be unique by name and owner" in response.text
+
+
 def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_client: TestClient, monkeypatch):
     payload = _onboarding_payload()
     payload["board_integration"] = "yandex_tracker"

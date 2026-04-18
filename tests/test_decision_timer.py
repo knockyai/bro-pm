@@ -59,6 +59,17 @@ def _create_project(decision_db, *, safe_paused: bool = False, reporting_cadence
         session.close()
 
 
+def _set_project_commitment_due_at(decision_db, project_id: str, *, due_at: datetime) -> None:
+    session = decision_db.SessionLocal()
+    try:
+        project = session.get(models.Project, project_id)
+        assert project is not None
+        project.commitment_due_at = due_at
+        session.commit()
+    finally:
+        session.close()
+
+
 def _create_goal(decision_db, project_id: str, *, status: str = "active") -> str:
     session = decision_db.SessionLocal()
     try:
@@ -81,6 +92,8 @@ def _create_task(
     *,
     status: str = "todo",
     due_at: datetime | None = None,
+    last_progress_at: datetime | None = None,
+    assignee: str | None = None,
     title: str | None = None,
 ) -> str:
     session = decision_db.SessionLocal()
@@ -92,10 +105,38 @@ def _create_task(
             status=status,
             priority="medium",
             due_at=due_at,
+            last_progress_at=last_progress_at,
+            assignee=assignee,
         )
         session.add(task)
         session.commit()
         return task.id
+    finally:
+        session.close()
+
+
+def _create_capacity_profile(
+    decision_db,
+    project_id: str,
+    *,
+    actor: str,
+    capacity_units: int,
+    load_units: int = 0,
+    team_name: str = "operations",
+) -> str:
+    session = decision_db.SessionLocal()
+    try:
+        profile = models.ExecutorCapacityProfile(
+            project_id=project_id,
+            actor=actor,
+            team_name=team_name,
+            capacity_units=capacity_units,
+            load_units=load_units,
+            source="test",
+        )
+        session.add(profile)
+        session.commit()
+        return profile.id
     finally:
         session.close()
 
@@ -327,3 +368,142 @@ def test_run_due_decisions_once_respects_recent_autonomy_cooldown(decision_db, m
     assert create_calls == []
     autonomy_events = _events_for(decision_db, project_id, actor=scheduler.AUTONOMOUS_ACTOR, action="create_task")
     assert len(autonomy_events) == 1
+
+
+def test_run_due_decisions_once_creates_overload_followup_for_capacity_excess(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    _create_capacity_profile(decision_db, project_id, actor="alice", capacity_units=1)
+    _create_task(decision_db, project_id, assignee="alice", status="in_progress", title="Implement slice")
+    _create_task(decision_db, project_id, assignee="alice", status="todo", title="Verify slice")
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    payload = create_calls[0]
+    assert payload["trace_label"] == "timer_executor_overload:alice"
+    assert "alice" in payload["description"].lower()
+    assert "capacity" in payload["description"].lower()
+
+
+def test_run_due_decisions_once_creates_idle_executor_followup_when_unassigned_work_exists(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    _create_capacity_profile(decision_db, project_id, actor="alice", capacity_units=2)
+    _create_capacity_profile(decision_db, project_id, actor="bob", capacity_units=2)
+    _create_task(decision_db, project_id, status="todo", title="Unassigned backlog item")
+    _create_task(decision_db, project_id, assignee="alice", status="in_progress", title="Alice task")
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    payload = create_calls[0]
+    assert payload["trace_label"] == "timer_idle_executor:bob"
+    assert "bob" in payload["description"].lower()
+    assert "unassigned" in payload["description"].lower()
+
+
+def test_run_due_decisions_once_creates_stalled_task_followup_from_progress_timestamp(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    task_id = _create_task(
+        decision_db,
+        project_id,
+        assignee="alice",
+        status="in_progress",
+        last_progress_at=now - timedelta(days=3),
+        title="Waiting on answer",
+    )
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    payload = create_calls[0]
+    assert payload["trace_label"] == f"timer_stalled_task:{task_id}"
+    assert "waiting on answer".lower() in payload["title"].lower()
+    assert "stalled" in payload["description"].lower()
+
+
+def test_run_due_decisions_once_creates_deadline_risk_followup_from_commitment_pressure(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    _set_project_commitment_due_at(decision_db, project_id, due_at=now + timedelta(days=1))
+    _create_capacity_profile(decision_db, project_id, actor="alice", capacity_units=1)
+    _create_task(decision_db, project_id, assignee="alice", status="in_progress", title="Active task")
+    _create_task(decision_db, project_id, status="todo", title="Backlog 1")
+    _create_task(decision_db, project_id, status="todo", title="Backlog 2")
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    payload = create_calls[0]
+    assert payload["trace_label"] == "timer_commitment_risk"
+    assert "commitment" in payload["description"].lower()
+    assert "deadline" in payload["description"].lower()
+
+
+def test_run_due_decisions_once_stops_after_first_successful_heuristic_action(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    _set_project_commitment_due_at(decision_db, project_id, due_at=now + timedelta(days=1))
+    _create_capacity_profile(decision_db, project_id, actor="alice", capacity_units=1)
+    stalled_task_id = _create_task(
+        decision_db,
+        project_id,
+        assignee="alice",
+        status="in_progress",
+        last_progress_at=now - timedelta(days=3),
+        title="Waiting on answer",
+    )
+    _create_task(decision_db, project_id, status="todo", title="Backlog 1")
+    _create_task(decision_db, project_id, status="todo", title="Backlog 2")
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    assert create_calls[0]["trace_label"] == f"timer_stalled_task:{stalled_task_id}"

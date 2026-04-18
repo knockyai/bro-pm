@@ -2000,10 +2000,14 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
     assert report["risks"] == [
         {
             "kind": "boss_escalation",
+            "source": "audit_event",
             "audit_id": escalation_result["audit_id"],
+            "due_action_id": None,
             "action": "draft_boss_escalation",
             "status": "awaiting_approval",
+            "trace_label": "draft_boss_escalation",
             "summary": "customers are blocked by API outage",
+            "lineage": "mode=unknown -> trace=draft_boss_escalation -> audit=draft_boss_escalation:awaiting_approval",
         }
     ]
     assert report["decisions"] == [
@@ -2012,6 +2016,10 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
             "action": "pause_project",
             "result": "executed",
             "summary": "policy accepted",
+            "reason": "parsed command",
+            "mode": "pause",
+            "trace_label": None,
+            "lineage": "mode=pause -> audit=pause_project:executed",
         }
     ]
     assert report["action_ids"] == [escalation_result["audit_id"], pause_result["audit_id"]]
@@ -2778,10 +2786,65 @@ def test_api_project_report_ignores_publish_audits_in_report_content(api_client:
             "action": "pause_project",
             "result": "executed",
             "summary": "policy accepted",
+            "reason": "parsed command",
+            "mode": "pause",
+            "trace_label": None,
+            "lineage": "mode=pause -> audit=pause_project:executed",
         }
     ]
     assert report["action_ids"] == [pause_result["audit_id"]]
 
+
+def test_api_project_report_surfaces_due_action_lineage_for_timer_failure_escalation(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    due_action_id = None
+    try:
+        due_action = models.DueAction(
+            id=f"due-action-{uuid4().hex[:8]}",
+            project_id=project["id"],
+            channel="telegram",
+            recipient="boss-user",
+            kind="boss_escalation",
+            payload_json={
+                "text": "Autonomous timer escalated repeated failures to the boss.",
+                "trace_label": "timer_failure_escalation",
+                "risk_level": "high",
+            },
+            due_at=datetime(2026, 1, 2, 0, 0, 0),
+            status="delivered",
+            actor="bro_pm_timer",
+            idempotency_key="timer-decision:failure",
+        )
+        session.add(due_action)
+        due_action_id = due_action.id
+        session.commit()
+    finally:
+        session.close()
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(),
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    assert report["risks"] == [
+        {
+            "kind": "boss_escalation",
+            "source": "due_action",
+            "audit_id": None,
+            "due_action_id": due_action_id,
+            "action": "boss_escalation",
+            "status": "delivered",
+            "trace_label": "timer_failure_escalation",
+            "summary": "Autonomous timer escalated repeated failures to the boss.",
+            "lineage": "trace=timer_failure_escalation -> due_action=boss_escalation:delivered -> delivery=telegram:boss-user",
+        }
+    ]
 
 
 def test_api_project_report_uses_project_visibility_in_notion_paths(api_client: TestClient):

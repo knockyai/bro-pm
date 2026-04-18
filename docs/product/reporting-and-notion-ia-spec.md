@@ -34,6 +34,22 @@ MVP visibility primarily through Notion, with audit-first structure.
 
 Each report contains summary, KPIs, risks, decisions, action IDs, and links.
 
+Current shipped `project_report` behavior:
+
+- `risks` may come from either `AuditEvent` or durable `DueAction` state, exposed via `source`.
+- Timer-derived entries preserve `trace_label` so the originating heuristic stays visible in the report.
+- `decisions` include `reason`, `mode`, and `lineage` when that context exists in stored audit payloads.
+- `risks` include `due_action_id` and `lineage` when the backend queued Hermes delivery instead of executing an internal task.
+
+Current autonomy/risk kinds surfaced by project report:
+
+- `executor_overload`
+- `idle_executor`
+- `stalled_task`
+- `commitment_risk`
+- `overdue_tasks`
+- `boss_escalation`
+
 ## 10.5 Retention
 
 Keep long-horizon summaries in Notion and raw operational logs in DB.

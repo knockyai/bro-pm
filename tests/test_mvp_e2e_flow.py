@@ -161,6 +161,10 @@ def test_api_mvp_e2e_onboarding_goal_decomposition_and_project_report(api_client
             "action": "onboard_project",
             "result": "executed",
             "summary": "notion executed: create_task",
+            "reason": "notion executed: create_task",
+            "mode": None,
+            "trace_label": None,
+            "lineage": "mode=unknown -> audit=onboard_project:executed",
         }
     ]
     assert report["publish"]["status"] == "contract_ready"

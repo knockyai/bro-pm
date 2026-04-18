@@ -25,6 +25,9 @@ Bring a project from zero state to active, constrained autonomy.
    - when Yandex backend is `mcp`, Bro-PM uses stdio MCP with configured command/tool settings instead of direct HTTP
 
 5. map team ownership and capacity
+   - onboarding now persists normalized `ExecutorCapacityProfile` rows for each `team[]` entry
+   - each profile stores `team_name`, `actor`, `capacity_units`, `load_units`, and `source="onboarding"`
+   - duplicate `team[]` entries by `(name, owner)` are rejected at validation time instead of leaking DB integrity failures
 
 6. run synthetic action smoke check
 

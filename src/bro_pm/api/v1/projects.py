@@ -17,11 +17,13 @@ from ...schemas import (
     ProjectOnboardingCreate,
     ProjectOnboardingResponse,
     ProjectMembershipResponse,
+    ExecutorCapacityProfileResponse,
     OnboardingGateChecks,
     OnboardingSmokeCheck,
     ProjectResponse,
     TaskCreate,
     TaskResponse,
+    TaskDecompositionRequest,
     GoalCreate,
     GoalResponse,
     AuditResponse,
@@ -34,6 +36,8 @@ from ...schemas import (
 
 from ...policy import PolicyDecision, PolicyEngine
 from ...services.command_service import CommandService
+from ...services.planner_service import PlannerService
+from ...services.planning_state import seed_capacity_profiles, sync_executor_load
 from ...services.reporting_service import ReportIdempotencyConflictError, ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -64,6 +68,7 @@ def _project_to_response(project: models.Project) -> ProjectResponse:
         slug=project.slug,
         description=project.description,
         timezone=project.timezone,
+        commitment_due_at=project.commitment_due_at,
         safe_paused=project.safe_paused,
         created_by=project.created_by,
         visibility=project.visibility,
@@ -448,6 +453,7 @@ def _task_to_response(task: models.Task) -> TaskResponse:
         created_at=task.created_at,
         updated_at=task.updated_at,
         due_at=task.due_at,
+        last_progress_at=task.last_progress_at,
     )
 
 
@@ -458,9 +464,24 @@ def _goal_to_response(goal: models.Goal) -> GoalResponse:
         title=goal.title,
         description=goal.description,
         status=goal.status,
+        commitment_due_at=goal.commitment_due_at,
         created_at=goal.created_at,
         updated_at=goal.updated_at,
         tasks=[_task_to_response(task) for task in goal.tasks],
+    )
+
+
+def _capacity_profile_to_response(profile: models.ExecutorCapacityProfile) -> ExecutorCapacityProfileResponse:
+    return ExecutorCapacityProfileResponse(
+        id=str(profile.id),
+        project_id=str(profile.project_id),
+        team_name=profile.team_name,
+        actor=profile.actor,
+        capacity_units=profile.capacity_units,
+        load_units=profile.load_units,
+        source=profile.source,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at,
     )
 
 
@@ -500,6 +521,7 @@ def create_project(
         slug=payload.slug,
         description=payload.description,
         timezone=payload.timezone,
+        commitment_due_at=payload.commitment_due_at,
         visibility=payload.visibility,
         safe_paused=payload.safe_paused,
         created_by=payload.created_by,
@@ -554,6 +576,7 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
         slug=payload.slug,
         description=payload.description,
         timezone=payload.timezone,
+        commitment_due_at=payload.commitment_due_at,
         visibility=payload.visibility,
         safe_paused=False,
         created_by=payload.created_by or payload.admin,
@@ -561,6 +584,13 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
     )
     db.add(project)
     db.flush()
+
+    seed_capacity_profiles(
+        db,
+        project_id=project.id,
+        team_entries=[team.model_dump() for team in payload.team],
+        source="onboarding",
+    )
 
     memberships = [models.ProjectMembership(project_id=project.id, actor=payload.boss, role="owner")]
     if payload.admin != payload.boss:
@@ -728,9 +758,11 @@ def create_task(
         priority=payload.priority,
         policy_flags=payload.policy_flags,
         due_at=payload.due_at,
+        last_progress_at=payload.last_progress_at,
     )
     db.add(task)
     db.flush()
+    sync_executor_load(db, project_id=project.id)
     _write_direct_mutation_audit_event(
         db,
         project_id=project.id,
@@ -766,6 +798,8 @@ def create_goal(
     project = db.query(models.Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
+    if payload.auto_decompose and payload.tasks:
+        raise HTTPException(status_code=422, detail="auto_decompose cannot be combined with explicit tasks")
 
     decision = _enforce_direct_mutation_policy(
         db,
@@ -795,13 +829,35 @@ def create_goal(
         title=payload.title,
         description=payload.description,
         status=payload.status,
+        commitment_due_at=payload.commitment_due_at,
     )
 
     try:
         db.add(goal)
         db.flush()
 
-        for child_task in payload.tasks:
+        child_tasks = payload.tasks
+        if payload.auto_decompose and not child_tasks:
+            child_tasks = [
+                models.Task(
+                    project_id=project_id,
+                    goal_id=goal.id,
+                    title=recommendation.title,
+                    description=recommendation.description,
+                    status=recommendation.status,
+                    assignee=recommendation.assignee,
+                    priority=recommendation.priority,
+                )
+                for recommendation in PlannerService(db).recommend_goal_tasks(
+                    goal_id=goal.id,
+                    max_tasks=payload.max_generated_tasks,
+                )
+            ]
+            for generated_task in child_tasks:
+                db.add(generated_task)
+        for child_task in child_tasks:
+            if isinstance(child_task, models.Task):
+                continue
             task = models.Task(
                 project_id=project_id,
                 goal_id=goal.id,
@@ -812,10 +868,12 @@ def create_goal(
                 priority=child_task.priority,
                 policy_flags=child_task.policy_flags,
                 due_at=child_task.due_at,
+                last_progress_at=child_task.last_progress_at,
             )
             db.add(task)
 
         db.flush()
+        sync_executor_load(db, project_id=project.id)
         _write_direct_mutation_audit_event(
             db,
             project_id=project.id,
@@ -846,6 +904,61 @@ def create_goal(
         raise
 
 
+@router.post("/{project_id}/tasks/{task_id}/decompose", response_model=List[TaskResponse], status_code=status.HTTP_201_CREATED)
+def decompose_task(
+    project_id: str,
+    task_id: str,
+    payload: TaskDecompositionRequest,
+    actor: str = Query(..., min_length=2, max_length=120),
+    role: str = Query(..., pattern=_MUTATION_ROLE_PATTERN),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> List[TaskResponse]:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    source_task = db.query(models.Task).filter_by(id=task_id, project_id=project_id).first()
+    if not source_task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    decision = _enforce_direct_mutation_policy(
+        db,
+        actor=actor,
+        role=role,
+        actor_trusted=bool(actor_trusted),
+        project=project,
+        action="decompose_task",
+        target_type="task",
+        target_id=task_id,
+    )
+
+    generated_tasks = PlannerService(db).create_task_follow_ups(
+        task_id=task_id,
+        max_tasks=payload.max_generated_tasks,
+    )
+    _write_direct_mutation_audit_event(
+        db,
+        project_id=project.id,
+        actor=actor,
+        action="decompose_task",
+        target_type="task",
+        target_id=task_id,
+        result="executed",
+        payload=_build_direct_mutation_audit_payload(
+            actor=actor,
+            role=role,
+            actor_trusted=bool(actor_trusted),
+            action="decompose_task",
+            project_id=project.id,
+            target_type="task",
+            target_id=task_id,
+            decision=decision,
+        ),
+    )
+    return [_task_to_response(task) for task in generated_tasks]
+
+
 @router.get("/{project_id}/tasks", response_model=List[TaskResponse])
 def list_tasks(project_id: str, db: Session = Depends(get_db_session)) -> List[TaskResponse]:
     project = db.query(models.Project).filter_by(id=project_id).first()
@@ -853,6 +966,24 @@ def list_tasks(project_id: str, db: Session = Depends(get_db_session)) -> List[T
         raise HTTPException(status_code=404, detail="project not found")
     tasks = db.query(models.Task).filter_by(project_id=project_id).order_by(models.Task.created_at.desc()).all()
     return [_task_to_response(task) for task in tasks]
+
+
+@router.get("/{project_id}/capacity-profiles", response_model=List[ExecutorCapacityProfileResponse])
+def list_capacity_profiles(
+    project_id: str,
+    db: Session = Depends(get_db_session),
+) -> List[ExecutorCapacityProfileResponse]:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    profiles = (
+        db.query(models.ExecutorCapacityProfile)
+        .filter_by(project_id=project_id)
+        .order_by(models.ExecutorCapacityProfile.team_name.asc(), models.ExecutorCapacityProfile.actor.asc())
+        .all()
+    )
+    return [_capacity_profile_to_response(profile) for profile in profiles]
 
 
 @router.get("/{project_id}/audit-events", response_model=List[AuditResponse])

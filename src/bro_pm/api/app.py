@@ -25,9 +25,13 @@ def create_app(
 ) -> FastAPI:
     """Create a minimally wired FastAPI app instance for API use and tests."""
 
+    if database_url is not None:
+        init_db(database_url)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        init_db(database_url)
+        if database_url is None:
+            init_db()
         scheduler_task: Task[None] | None = None
         if enable_scheduler is None:
             scheduler_enabled = settings.timer_actions_enabled and database_url is None

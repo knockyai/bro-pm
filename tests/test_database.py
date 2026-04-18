@@ -186,6 +186,26 @@ def test_init_db_adds_goal_id_to_legacy_tasks_schema(tmp_path):
         db_session.close()
 
 
+def test_init_db_upgrades_legacy_schema_for_autonomy_state(tmp_path):
+    legacy_db_url = f"sqlite:///{tmp_path / 'legacy_autonomy_state.db'}"
+
+    _create_legacy_schema(legacy_db_url)
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(legacy_db_url)
+
+    inspector = inspect(database._engine)
+    project_columns = {column["name"] for column in inspector.get_columns("projects")}
+    goal_columns = {column["name"] for column in inspector.get_columns("goals")}
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    tables = set(inspector.get_table_names())
+
+    assert "commitment_due_at" in project_columns
+    assert "commitment_due_at" in goal_columns
+    assert "last_progress_at" in task_columns
+    assert "executor_capacity_profiles" in tables
+
+
 def test_init_db_rejects_legacy_duplicates_before_creating_active_goal_index(tmp_path):
     """Legacy active-goal duplicates should fail with a clear migration preflight error."""
 
