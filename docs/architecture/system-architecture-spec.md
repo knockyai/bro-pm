@@ -16,7 +16,7 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 ## 1.2 Contextual boundaries
 
-- **Authoritative truth**: Postgres state (projects, goals, tasks, policy, audit, risk, rollbacks).
+- **Authoritative truth**: Postgres state (projects, goals, tasks, policy, audit, risk, rollbacks, due actions, inbound conversation events).
 
 - **Ephemeral reasoning + chat runtime**: Hermes gateway listens to Telegram/DMs, talks to people, and returns structured suggestions only.
 
@@ -66,11 +66,13 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 7. Outbound actions that should be delivered through chat are stored as durable `DueAction` rows.
 
-8. Hermes gateway claims due actions, delivers them to Telegram/DMs, and acknowledges delivery back to backend.
+8. Hermes gateway can also send normalized inbound events into backend storage as `ConversationEvent` rows and receive a structured disposition.
 
-9. Execution/delivery is always audited.
+9. Hermes gateway claims due actions, delivers them to Telegram/DMs, and acknowledges delivery back to backend.
 
-10. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that can either create internal tasks or enqueue boss-escalation due actions for Hermes delivery.
+10. Execution/delivery is always audited.
+
+11. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence, triggers `publish_report` through the existing reporting service path, and every 10 minutes runs an autonomous decision review that can either create internal tasks or enqueue boss-escalation due actions for Hermes delivery.
 
 ## 1.6 Deployment
 

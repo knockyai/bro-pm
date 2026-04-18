@@ -32,6 +32,10 @@ class Project(Base):
     goals: Mapped[list["Goal"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     memberships: Mapped[list["ProjectMembership"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     due_actions: Mapped[list["DueAction"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    conversation_events: Mapped[list["ConversationEvent"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
 
 
 class ProjectMembership(Base):
@@ -167,3 +171,25 @@ class DueAction(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     project: Mapped[Project | None] = relationship(back_populates="due_actions")
+
+
+class ConversationEvent(Base):
+    __tablename__ = "conversation_events"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    due_action_id: Mapped[str | None] = mapped_column(String, ForeignKey("due_actions.id"), nullable=True, index=True)
+    pending_audit_id: Mapped[str | None] = mapped_column(String, ForeignKey("audit_events.id"), nullable=True, index=True)
+    platform: Mapped[str] = mapped_column(String(80))
+    chat_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    actor_role: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    text: Mapped[str] = mapped_column(Text)
+    normalized_intent: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    disposition: Mapped[str] = mapped_column(String(80), default="ignore")
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    project: Mapped[Project | None] = relationship(back_populates="conversation_events")

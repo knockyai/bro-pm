@@ -384,3 +384,28 @@ class DueActionResponse(BaseModel):
 
 class DueActionClaimResponse(BaseModel):
     items: list[DueActionResponse] = Field(default_factory=list)
+
+
+class InboundEventIngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(min_length=2, max_length=80)
+    chat_id: str | None = Field(default=None, max_length=255)
+    thread_id: str | None = Field(default=None, max_length=255)
+    actor: str = Field(min_length=2, max_length=120)
+    actor_role: str | None = Field(default=None, max_length=80)
+    project_id: str | None = None
+    text: str = Field(min_length=1, max_length=4000)
+    normalized_intent: str | None = Field(default=None, max_length=120)
+    due_action_id: str | None = None
+    pending_audit_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class InboundEventDispositionResponse(BaseModel):
+    event_id: str
+    disposition: str
+    reason: str
+    due_action_id: str | None = None
+    pending_audit_id: str | None = None
+    project_id: str | None = None

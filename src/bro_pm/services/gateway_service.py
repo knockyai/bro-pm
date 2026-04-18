@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
@@ -153,3 +154,126 @@ class GatewayService:
         self.db_session.commit()
         self.db_session.refresh(due_action)
         return due_action
+
+    def ingest_inbound_event(
+        self,
+        *,
+        platform: str,
+        chat_id: str | None,
+        thread_id: str | None,
+        actor: str,
+        actor_role: str | None,
+        project_id: str | None,
+        text: str,
+        normalized_intent: str | None,
+        due_action_id: str | None,
+        pending_audit_id: str | None,
+        metadata: dict | None = None,
+    ) -> models.ConversationEvent:
+        disposition = "ignore"
+        reason = "no allowed reaction for inbound event"
+
+        due_action = None
+        if due_action_id:
+            due_action = self.db_session.get(models.DueAction, due_action_id)
+            if due_action and normalized_intent in {"ack", "acknowledge", "confirm", "confirmed"}:
+                due_action.status = "acked"
+                due_action.acked_at = _utc_now()
+                disposition = "ack_due_action"
+                reason = "due action acknowledgement recorded"
+
+        pending_audit = None
+        if pending_audit_id and disposition == "ignore":
+            pending_audit = self.db_session.get(models.AuditEvent, pending_audit_id)
+            if pending_audit and pending_audit.result == "awaiting_approval":
+                approval_status = self._approval_status_for_intent(normalized_intent)
+                if approval_status is not None:
+                    pending_audit.result = approval_status
+                    payload = self._audit_payload(pending_audit.payload)
+                    payload["approval"] = {
+                        "status": approval_status,
+                        "actor": actor.strip(),
+                        "actor_role": actor_role.strip() if isinstance(actor_role, str) and actor_role.strip() else None,
+                        "text": text.strip(),
+                    }
+                    pending_audit.payload = json.dumps(payload, ensure_ascii=False)
+                    disposition = "approval_reply_recorded"
+                    reason = "approval reply recorded for pending audit event"
+
+        if disposition == "ignore":
+            project = self.db_session.get(models.Project, project_id) if project_id else None
+            if project and self._actor_has_project_reply_privilege(project=project, actor=actor, actor_role=actor_role):
+                disposition = "allow_reply"
+                reason = "trusted project actor may receive a reply"
+
+        event = models.ConversationEvent(
+            project_id=project_id,
+            due_action_id=due_action.id if due_action is not None else due_action_id,
+            pending_audit_id=pending_audit.id if pending_audit is not None else pending_audit_id,
+            platform=platform.strip().lower(),
+            chat_id=chat_id.strip() if isinstance(chat_id, str) and chat_id.strip() else None,
+            thread_id=thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None,
+            actor=actor.strip(),
+            actor_role=actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else None,
+            text=text.strip(),
+            normalized_intent=normalized_intent.strip().lower() if isinstance(normalized_intent, str) and normalized_intent.strip() else None,
+            metadata_json=metadata or {},
+            disposition=disposition,
+            decision_reason=reason,
+        )
+        self.db_session.add(event)
+        self.db_session.commit()
+        self.db_session.refresh(event)
+        return event
+
+    def _actor_has_project_reply_privilege(
+        self,
+        *,
+        project: models.Project,
+        actor: str,
+        actor_role: str | None,
+    ) -> bool:
+        normalized_actor = actor.strip().lower()
+        normalized_role = actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else ""
+        if normalized_role in {"boss", "owner", "admin"}:
+            return True
+
+        metadata = project.metadata_json if isinstance(project.metadata_json, dict) else {}
+        onboarding = metadata.get("onboarding") if isinstance(metadata.get("onboarding"), dict) else {}
+        boss = onboarding.get("boss")
+        admin = onboarding.get("admin")
+        if isinstance(boss, str) and boss.strip().lower() == normalized_actor:
+            return True
+        if isinstance(admin, str) and admin.strip().lower() == normalized_actor:
+            return True
+
+        membership = (
+            self.db_session.query(models.ProjectMembership)
+            .filter(
+                models.ProjectMembership.project_id == project.id,
+                models.ProjectMembership.actor == actor.strip(),
+            )
+            .one_or_none()
+        )
+        if membership is None:
+            return False
+        return membership.role in {"owner", "admin"}
+
+    def _approval_status_for_intent(self, normalized_intent: str | None) -> str | None:
+        if not normalized_intent:
+            return None
+        normalized = normalized_intent.strip().lower()
+        if normalized in {"approve", "approved", "confirm"}:
+            return "approved"
+        if normalized in {"reject", "rejected", "deny", "denied"}:
+            return "rejected"
+        return None
+
+    def _audit_payload(self, raw_payload: str | None) -> dict:
+        try:
+            payload = json.loads(raw_payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        return {}

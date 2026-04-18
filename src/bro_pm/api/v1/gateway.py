@@ -45,3 +45,32 @@ def record_due_action_delivery(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     return schemas.DueActionResponse.model_validate(due_action)
+
+
+@router.post("/events:ingest", response_model=schemas.InboundEventDispositionResponse)
+def ingest_inbound_event(
+    payload: schemas.InboundEventIngestRequest,
+    db: Session = Depends(get_db_session),
+) -> schemas.InboundEventDispositionResponse:
+    service = GatewayService(db_session=db)
+    event = service.ingest_inbound_event(
+        platform=payload.platform,
+        chat_id=payload.chat_id,
+        thread_id=payload.thread_id,
+        actor=payload.actor,
+        actor_role=payload.actor_role,
+        project_id=payload.project_id,
+        text=payload.text,
+        normalized_intent=payload.normalized_intent,
+        due_action_id=payload.due_action_id,
+        pending_audit_id=payload.pending_audit_id,
+        metadata=payload.metadata,
+    )
+    return schemas.InboundEventDispositionResponse(
+        event_id=event.id,
+        disposition=event.disposition,
+        reason=event.decision_reason,
+        due_action_id=event.due_action_id,
+        pending_audit_id=event.pending_audit_id,
+        project_id=event.project_id,
+    )

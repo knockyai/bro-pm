@@ -152,12 +152,18 @@ Detail endpoint отдаёт sanitized payload, а top-level `detail` берёт
 
 Новый `/api/v1/gateway` слой нужен не для того, чтобы Bro-PM сам слушал Telegram, а наоборот — чтобы **Hermes gateway** мог забирать из backend готовые due actions и подтверждать доставку.
 
-Сейчас в MVP есть два базовых endpoint'а:
+Сейчас в MVP есть три базовых gateway endpoint'а:
 
 - `POST /api/v1/gateway/due-actions:claim` — Hermes claim'ит готовые к отправке due actions;
-- `POST /api/v1/gateway/due-actions/{due_action_id}/delivery` — Hermes подтверждает `delivered`, `failed` или `acked`.
+- `POST /api/v1/gateway/due-actions/{due_action_id}/delivery` — Hermes подтверждает `delivered`, `failed` или `acked`;
+- `POST /api/v1/gateway/events:ingest` — Hermes отправляет нормализованное inbound-событие в Bro-PM и получает disposition, что ему разрешено делать дальше.
 
-То есть Hermes остаётся chat/runtime-слоем, а Bro-PM — durable control plane для outbound коммуникации.
+Через `events:ingest` backend уже умеет минимум три полезных вещи:
+- зафиксировать входящее событие как `ConversationEvent`;
+- засчитать acknowledgement по уже отправленному `DueAction`;
+- записать минимальный approval reply для `AuditEvent` в состоянии `awaiting_approval`.
+
+То есть Hermes остаётся chat/runtime-слоем, а Bro-PM — durable control plane и для outbound-коммуникации, и для минимального inbound decision path.
 
 ### 11. Project report
 
