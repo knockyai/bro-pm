@@ -282,7 +282,14 @@ class ReportingService:
             .order_by(models.AuditEvent.created_at.desc(), models.AuditEvent.id.desc())
             .all()
         )
-        report_audit_events = [event for event in audit_events if event.action != "publish_report"]
+        report_audit_events = []
+        for event in audit_events:
+            payload = self._load_payload(event.payload)
+            if event.action == "publish_report":
+                continue
+            if payload.get("created_via") == "direct_mutation_api":
+                continue
+            report_audit_events.append(event)
 
         active_goals = [goal for goal in goals if goal.status.strip().lower() == "active"]
         completed_statuses = {"done", "completed", "closed"}

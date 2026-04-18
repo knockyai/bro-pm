@@ -75,6 +75,17 @@ def _goal_payload() -> dict:
     }
 
 
+def _mutation_auth_params(*, actor: str = "alice", role: str = "admin") -> dict:
+    return {
+        "actor": actor,
+        "role": role,
+    }
+
+
+def _mutation_auth_headers(*, trusted: bool = True) -> dict[str, str]:
+    return {"x-actor-trusted": "true"} if trusted else {}
+
+
 
 def _report_payload() -> dict:
     return {
@@ -93,7 +104,12 @@ def test_api_mvp_e2e_onboarding_goal_decomposition_and_project_report(api_client
     assert onboarding["status"] == "active"
     assert onboarding["smoke_check"]["detail"] == "notion executed: create_task"
 
-    goal_response = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+    goal_response = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=_goal_payload(),
+    )
 
     assert goal_response.status_code == 201
     goal = goal_response.json()

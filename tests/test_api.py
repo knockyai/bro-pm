@@ -45,7 +45,12 @@ def _create_project(client: TestClient, *, visibility: str = "internal") -> dict
         "safe_paused": False,
         "metadata": {"team": "ops"},
     }
-    response = client.post("/api/v1/projects", json=payload)
+    response = client.post(
+        "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=payload,
+    )
     assert response.status_code == 201
     data = response.json()
     assert data["name"] == payload["name"]
@@ -73,6 +78,17 @@ def _goal_payload() -> dict:
             },
         ],
     }
+
+
+def _mutation_auth_params(*, actor: str = "alice", role: str = "admin") -> dict:
+    return {
+        "actor": actor,
+        "role": role,
+    }
+
+
+def _mutation_auth_headers(*, trusted: bool = True) -> dict[str, str]:
+    return {"x-actor-trusted": "true"} if trusted else {}
 
 
 
@@ -137,7 +153,12 @@ def test_api_goal_intake_creates_goal_and_decomposes_tasks(api_client: TestClien
     project = _create_project(api_client)
     goal_payload = _goal_payload()
 
-    response = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=goal_payload)
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=goal_payload,
+    )
     assert response.status_code == 201
 
     created_goal = response.json()
@@ -165,7 +186,12 @@ def test_api_project_rejects_second_active_goal(api_client: TestClient):
         "status": "active",
         "tasks": [],
     }
-    first_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=first_goal)
+    first_resp = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=first_goal,
+    )
     assert first_resp.status_code == 201
 
     second_goal = {
@@ -174,7 +200,12 @@ def test_api_project_rejects_second_active_goal(api_client: TestClient):
         "status": "active",
         "tasks": [],
     }
-    second_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=second_goal)
+    second_resp = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=second_goal,
+    )
     assert second_resp.status_code == 409
     assert second_resp.json()["detail"] == "an active goal already exists for this project"
 
@@ -188,7 +219,12 @@ def test_api_goal_status_is_normalized_for_active_goal_semantics(api_client: Tes
         "status": " Active ",
         "tasks": [],
     }
-    first_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=first_goal)
+    first_resp = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=first_goal,
+    )
     assert first_resp.status_code == 201
     assert first_resp.json()["status"] == "active"
 
@@ -198,7 +234,12 @@ def test_api_goal_status_is_normalized_for_active_goal_semantics(api_client: Tes
         "status": "active",
         "tasks": [],
     }
-    second_resp = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=second_goal)
+    second_resp = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=second_goal,
+    )
     assert second_resp.status_code == 409
     assert second_resp.json()["detail"] == "an active goal already exists for this project"
 
@@ -230,7 +271,12 @@ def test_api_goal_intake_handles_inconsistent_multiple_active_goals(api_client: 
     finally:
         database_session.close()
 
-    response = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=_goal_payload(),
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"] == "an active goal already exists for this project"
@@ -259,7 +305,12 @@ def test_api_goal_intake_does_not_mask_unrelated_integrity_errors(tmp_path, monk
 
         monkeypatch.setattr(Session, "flush", explode_flush)
 
-        response = client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/goals",
+            params=_mutation_auth_params(),
+            headers=_mutation_auth_headers(),
+            json=_goal_payload(),
+        )
 
     assert response.status_code == 500
 
@@ -282,6 +333,8 @@ def test_api_create_and_list_project(api_client: TestClient):
 def test_api_create_project_rejects_path_like_slug(api_client: TestClient):
     response = api_client.post(
         "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
         json={
             "name": "Project Nova",
             "slug": "reports/project-nova",
@@ -298,6 +351,8 @@ def test_api_create_project_rejects_path_like_slug(api_client: TestClient):
 def test_api_create_project_rejects_path_like_visibility(api_client: TestClient):
     response = api_client.post(
         "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
         json={
             "name": "Project Nova",
             "slug": f"project-nova-{uuid4().hex[:8]}",
@@ -314,6 +369,8 @@ def test_api_create_project_rejects_path_like_visibility(api_client: TestClient)
 def test_api_create_project_normalizes_whitespace_only_visibility_to_internal(api_client: TestClient):
     response = api_client.post(
         "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
         json={
             "name": "Project Nova",
             "slug": f"project-nova-{uuid4().hex[:8]}",
@@ -349,7 +406,12 @@ def test_api_create_and_list_task_for_project(api_client: TestClient):
         "priority": "high",
         "policy_flags": ["needs-review"],
     }
-    response = api_client.post(f"/api/v1/projects/{project['id']}/tasks", json=task_payload)
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=task_payload,
+    )
     assert response.status_code == 201
     created_task = response.json()
     assert created_task["title"] == task_payload["title"]
@@ -361,6 +423,88 @@ def test_api_create_and_list_task_for_project(api_client: TestClient):
     assert len(tasks) == 1
     assert tasks[0]["id"] == created_task["id"]
     assert tasks[0]["project_id"] == project["id"]
+
+
+def test_api_direct_task_mutation_rejects_untrusted_actor(api_client: TestClient):
+    project = _create_project(api_client)
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        params=_mutation_auth_params(actor="eve"),
+        headers=_mutation_auth_headers(trusted=False),
+        json={
+            "title": "Draft release notes",
+            "description": "Prepare notes for next release",
+            "status": "todo",
+            "assignee": "alice",
+            "priority": "high",
+            "policy_flags": ["needs-review"],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "untrusted actor blocked"
+
+
+def test_api_direct_goal_mutation_respects_safe_pause_and_records_denial_audit(api_client: TestClient):
+    project = _create_project(api_client)
+
+    pause_response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": f"pause project {project['id']}",
+            "project_id": project["id"],
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+    assert pause_response.status_code == 200
+    assert pause_response.json()["result"] == "executed"
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=_goal_payload(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "project is safe-paused"
+
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
+    assert [event["action"] for event in audit_events[:3]] == [
+        "create_goal",
+        "pause_project",
+        "create_project",
+    ]
+    assert audit_events[0]["result"] == "denied"
+    assert audit_events[0]["detail"] == "project is safe-paused"
+
+
+def test_api_direct_project_mutation_writes_audit_event_on_success(api_client: TestClient):
+    response = api_client.post(
+        "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json={
+            "name": "Project Governance Audit",
+            "slug": f"project-governance-{uuid4().hex[:8]}",
+            "description": "project under test",
+            "visibility": "internal",
+            "safe_paused": False,
+            "metadata": {"team": "ops"},
+        },
+    )
+
+    assert response.status_code == 201
+    project = response.json()
+
+    audit_events = _get_project_audit_events(api_client, project["id"]).json()
+    assert len(audit_events) == 1
+    assert audit_events[0]["action"] == "create_project"
+    assert audit_events[0]["result"] == "executed"
+    assert audit_events[0]["detail"] == "policy accepted"
 
 
 def test_api_pause_command_marks_project_safe_paused(api_client: TestClient):
@@ -419,9 +563,10 @@ def test_api_pause_command_dry_run_does_not_mutate_project(api_client: TestClien
     assert listed[0]["safe_paused"] is False
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    assert len(audit_events) == 1
+    assert len(audit_events) == 2
     assert audit_events[0]["action"] == "pause_project"
     assert audit_events[0]["result"] == "simulated"
+    assert audit_events[1]["action"] == "create_project"
 
 
 def test_api_command_dry_run_replays_separate_from_live_execution(api_client: TestClient):
@@ -497,9 +642,10 @@ def test_api_create_task_validation_mode_runs_validate_only_and_does_not_mutate_
     assert tasks_response.json() == []
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    assert len(audit_events) == 1
+    assert len(audit_events) == 2
     assert audit_events[0]["action"] == "create_task"
     assert audit_events[0]["result"] == "validated"
+    assert audit_events[1]["action"] == "create_project"
 
 
 def test_api_create_task_validation_idempotency_isolation_between_validation_and_dry_run(api_client: TestClient):
@@ -976,7 +1122,7 @@ def test_api_project_audit_list_is_newest_first_when_available(api_client: TestC
 
     events = response.json()
     assert isinstance(events, list)
-    assert len(events) == 2
+    assert len(events) == 3
     assert {
         pause_resp.json()["audit_id"],
         resume_resp.json()["audit_id"],
@@ -993,8 +1139,9 @@ def test_api_project_audit_list_is_newest_first_when_available(api_client: TestC
     second_created = datetime.fromisoformat(events[1]["created_at"].replace("Z", "+00:00"))
     assert first_created >= second_created
 
-    assert {event["action"] for event in events} == {"pause_project", "unpause_project"}
+    assert {event["action"] for event in events} == {"pause_project", "unpause_project", "create_project"}
     assert all(event["actor"] == "alice" for event in events)
+    assert events[2]["action"] == "create_project"
 
 
 def test_api_project_audit_list_missing_project_returns_404(api_client: TestClient):
@@ -1008,7 +1155,19 @@ def test_api_project_audit_list_for_existing_project_without_events_is_empty(api
 
     response = _get_project_audit_events(api_client, project["id"])
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json() == [
+        {
+            "id": response.json()[0]["id"],
+            "project_id": project["id"],
+            "actor": "alice",
+            "action": "create_project",
+            "target_type": "project",
+            "target_id": project["id"],
+            "result": "executed",
+            "detail": "policy accepted",
+            "created_at": response.json()[0]["created_at"],
+        }
+    ]
 
 def test_api_project_audit_list_rejects_untrusted_and_viewer_requests(api_client: TestClient):
     project = _create_project(api_client)
@@ -1069,8 +1228,9 @@ def test_api_project_audit_list_handles_non_mapping_integration_payload(api_clie
     response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
-    assert response.json()[0]["detail"] == "policy fallback detail"
-    assert "payload" not in response.json()[0]
+    event = next(item for item in response.json() if item["id"] == "event-list-fallback")
+    assert event["detail"] == "policy fallback detail"
+    assert "payload" not in event
 
 
 def test_api_project_audit_list_preserves_long_integration_detail(api_client: TestClient):
@@ -1104,8 +1264,9 @@ def test_api_project_audit_list_preserves_long_integration_detail(api_client: Te
     response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
-    assert response.json()[0]["detail"] == long_detail
-    assert "payload" not in response.json()[0]
+    event = next(item for item in response.json() if item["id"] == "event-long-detail")
+    assert event["detail"] == long_detail
+    assert "payload" not in event
 
 
 def test_api_project_audit_list_preserves_exact_detail_text(api_client: TestClient):
@@ -1139,8 +1300,9 @@ def test_api_project_audit_list_preserves_exact_detail_text(api_client: TestClie
     response = _get_project_audit_events(api_client, project["id"])
 
     assert response.status_code == 200
-    assert response.json()[0]["detail"] == exact_detail
-    assert "payload" not in response.json()[0]
+    event = next(item for item in response.json() if item["id"] == "event-exact-detail")
+    assert event["detail"] == exact_detail
+    assert "payload" not in event
 
 
 def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient):
@@ -1181,9 +1343,10 @@ def test_api_project_audit_list_is_deterministic_for_ties(api_client: TestClient
     assert response.status_code == 200
 
     events = response.json()
-    assert len(events) == 2
-    assert events[0]["id"] == "event-omega"
-    assert events[1]["id"] == "event-alpha"
+    assert len(events) == 3
+    assert events[0]["action"] == "create_project"
+    assert events[1]["id"] == "event-omega"
+    assert events[2]["id"] == "event-alpha"
 
 
 def test_api_project_audit_event_detail_returns_summary_and_sanitized_payload(api_client: TestClient):
@@ -1289,6 +1452,8 @@ def test_api_project_audit_event_detail_missing_or_foreign_event_returns_404(api
     project = _create_project(api_client)
     response = api_client.post(
         "/api/v1/projects",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
         json={
             "name": f"Project Nova {uuid4().hex[:8]}",
             "slug": f"project-nova-other-{uuid4().hex[:8]}",
@@ -1733,12 +1898,13 @@ def test_api_project_rollback_reverses_pause_and_persists_rollback_record(api_cl
     assert projects[0]["safe_paused"] is False
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    assert len(audit_events) == 2
-    assert {event["action"] for event in audit_events} == {"rollback_action", "pause_project"}
-    assert {event["id"] for event in audit_events} == {
+    assert len(audit_events) == 3
+    assert {event["action"] for event in audit_events} == {"rollback_action", "pause_project", "create_project"}
+    assert {event["id"] for event in audit_events[:2]} == {
         rollback_result["audit_id"],
         pause_result["audit_id"],
     }
+    assert audit_events[2]["action"] == "create_project"
 
     db_module = importlib.import_module("bro_pm.database")
     database_session = db_module.SessionLocal()
@@ -1770,7 +1936,12 @@ def test_api_project_rollback_missing_project_returns_404(api_client: TestClient
 
 def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contract(api_client: TestClient, monkeypatch):
     project = _create_project(api_client)
-    goal = api_client.post(f"/api/v1/projects/{project['id']}/goals", json=_goal_payload())
+    goal = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=_goal_payload(),
+    )
     assert goal.status_code == 201
 
     pause_resp = api_client.post(
@@ -1862,8 +2033,8 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
     }
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    assert len(audit_events) == 2
-    assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project"}
+    assert len(audit_events) == 4
+    assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project", "create_goal", "create_project"}
 
 
 def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_client: TestClient, monkeypatch):
@@ -1929,19 +2100,18 @@ def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_
     }
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    assert audit_events == [
-        {
-            "id": audit_events[0]["id"],
-            "project_id": project["id"],
-            "actor": "alice",
-            "action": "publish_report",
-            "target_type": "report",
-            "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-            "result": "executed",
-            "detail": "notion executed: publish_report",
-            "created_at": audit_events[0]["created_at"],
-        }
-    ]
+    assert [event["action"] for event in audit_events[:2]] == ["publish_report", "create_project"]
+    assert audit_events[0] == {
+        "id": audit_events[0]["id"],
+        "project_id": project["id"],
+        "actor": "alice",
+        "action": "publish_report",
+        "target_type": "report",
+        "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "result": "executed",
+        "detail": "notion executed: publish_report",
+        "created_at": audit_events[0]["created_at"],
+    }
 
 
 def test_api_project_report_execute_publish_commits_pending_reservation_before_notion_execute(
@@ -2517,19 +2687,18 @@ def test_api_project_report_execute_publish_returns_422_on_integration_error(mon
 
     assert response.status_code == 422
     assert response.json()["detail"] == "publish integration unavailable"
-    assert audit_events == [
-        {
-            "id": audit_events[0]["id"],
-            "project_id": project["id"],
-            "actor": "alice",
-            "action": "publish_report",
-            "target_type": "report",
-            "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-            "result": "failed",
-            "detail": "publish integration unavailable",
-            "created_at": audit_events[0]["created_at"],
-        }
-    ]
+    assert [event["action"] for event in audit_events[:2]] == ["publish_report", "create_project"]
+    assert audit_events[0] == {
+        "id": audit_events[0]["id"],
+        "project_id": project["id"],
+        "actor": "alice",
+        "action": "publish_report",
+        "target_type": "report",
+        "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "result": "failed",
+        "detail": "publish integration unavailable",
+        "created_at": audit_events[0]["created_at"],
+    }
 
 
 def test_api_project_report_requires_trusted_actor(api_client: TestClient):
@@ -2732,4 +2901,3 @@ def test_api_project_report_missing_project_returns_404(api_client: TestClient):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "project not found"
-

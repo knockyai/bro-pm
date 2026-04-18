@@ -32,11 +32,13 @@ from ...schemas import (
     RollbackResponse,
 )
 
-from ...policy import PolicyEngine
+from ...policy import PolicyDecision, PolicyEngine
 from ...services.command_service import CommandService
 from ...services.reporting_service import ReportIdempotencyConflictError, ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+_MUTATION_ROLE_PATTERN = "^(owner|admin|operator|viewer)$"
 
 
 def _is_active_goal_conflict(exc: IntegrityError, *, status: str) -> bool:
@@ -316,6 +318,107 @@ def _safe_audit_event_payload(raw_payload: str | None) -> dict[str, Any]:
 
     return safe_payload
 
+
+def _build_direct_mutation_audit_payload(
+    *,
+    actor: str,
+    role: str,
+    actor_trusted: bool,
+    action: str,
+    project_id: str | None,
+    target_type: str,
+    target_id: str | None,
+    decision: PolicyDecision,
+) -> dict[str, Any]:
+    return {
+        "actor": actor,
+        "auth": {
+            "role": role,
+            "actor_trusted": actor_trusted,
+        },
+        "proposal": {
+            "action": action,
+            "project_id": project_id,
+            "reason": "direct mutation request",
+            "target_type": target_type,
+            "target_id": target_id,
+            "payload": {
+                "mode": "direct_api",
+            },
+        },
+        "policy": decision.__dict__,
+        "created_via": "direct_mutation_api",
+    }
+
+
+def _write_direct_mutation_audit_event(
+    db: Session,
+    *,
+    project_id: str | None,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: str | None,
+    result: str,
+    payload: dict[str, Any],
+) -> models.AuditEvent:
+    event = models.AuditEvent(
+        project_id=project_id,
+        actor=actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        payload=json.dumps(payload, ensure_ascii=False),
+        result=result,
+        created_at=datetime.utcnow(),
+    )
+    db.add(event)
+    db.flush()
+    return event
+
+
+def _enforce_direct_mutation_policy(
+    db: Session,
+    *,
+    actor: str,
+    role: str,
+    actor_trusted: bool,
+    project: models.Project | None,
+    action: str,
+    target_type: str,
+    target_id: str | None = None,
+) -> PolicyDecision:
+    decision = PolicyEngine().evaluate(
+        actor_role=role,
+        actor_trusted=actor_trusted,
+        action=action,
+        safe_paused=bool(project.safe_paused) if project is not None else False,
+    )
+    if decision.allowed:
+        return decision
+
+    _write_direct_mutation_audit_event(
+        db,
+        project_id=project.id if project is not None else None,
+        actor=actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        result="denied",
+        payload=_build_direct_mutation_audit_payload(
+            actor=actor,
+            role=role,
+            actor_trusted=actor_trusted,
+            action=action,
+            project_id=project.id if project is not None else None,
+            target_type=target_type,
+            target_id=target_id,
+            decision=decision,
+        ),
+    )
+    db.commit()
+    raise HTTPException(status_code=403, detail=decision.reason)
+
 def _audit_event_to_detail_response(event: models.AuditEvent) -> AuditEventDetailResponse:
     return AuditEventDetailResponse(
         id=str(event.id),
@@ -368,13 +471,29 @@ def list_projects(db: Session = Depends(get_db_session)) -> List[ProjectResponse
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-def create_project(payload: ProjectCreate, db: Session = Depends(get_db_session)) -> ProjectResponse:
+def create_project(
+    payload: ProjectCreate,
+    actor: str = Query(..., min_length=2, max_length=120),
+    role: str = Query(..., pattern=_MUTATION_ROLE_PATTERN),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> ProjectResponse:
     if not payload.slug:
         raise HTTPException(status_code=400, detail="slug required")
 
     existing = db.query(models.Project).filter_by(slug=payload.slug).first()
     if existing:
         raise HTTPException(status_code=409, detail="slug already exists")
+
+    decision = _enforce_direct_mutation_policy(
+        db,
+        actor=actor,
+        role=role,
+        actor_trusted=bool(actor_trusted),
+        project=None,
+        action="create_project",
+        target_type="project",
+    )
 
     project = models.Project(
         name=payload.name,
@@ -388,6 +507,25 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db_session)
     )
     db.add(project)
     db.flush()
+    _write_direct_mutation_audit_event(
+        db,
+        project_id=project.id,
+        actor=actor,
+        action="create_project",
+        target_type="project",
+        target_id=project.id,
+        result="executed",
+        payload=_build_direct_mutation_audit_payload(
+            actor=actor,
+            role=role,
+            actor_trusted=bool(actor_trusted),
+            action="create_project",
+            project_id=project.id,
+            target_type="project",
+            target_id=project.id,
+            decision=decision,
+        ),
+    )
     db.refresh(project)
     return _project_to_response(project)
 
@@ -553,10 +691,28 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
 
 
 @router.post("/{project_id}/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-def create_task(project_id: str, payload: TaskCreate, db: Session = Depends(get_db_session)) -> TaskResponse:
+def create_task(
+    project_id: str,
+    payload: TaskCreate,
+    actor: str = Query(..., min_length=2, max_length=120),
+    role: str = Query(..., pattern=_MUTATION_ROLE_PATTERN),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> TaskResponse:
     project = db.query(models.Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
+
+    decision = _enforce_direct_mutation_policy(
+        db,
+        actor=actor,
+        role=role,
+        actor_trusted=bool(actor_trusted),
+        project=project,
+        action="create_task",
+        target_type="task",
+        target_id=project_id,
+    )
 
     task = models.Task(
         project_id=project_id,
@@ -570,15 +726,52 @@ def create_task(project_id: str, payload: TaskCreate, db: Session = Depends(get_
     )
     db.add(task)
     db.flush()
+    _write_direct_mutation_audit_event(
+        db,
+        project_id=project.id,
+        actor=actor,
+        action="create_task",
+        target_type="task",
+        target_id=task.id,
+        result="executed",
+        payload=_build_direct_mutation_audit_payload(
+            actor=actor,
+            role=role,
+            actor_trusted=bool(actor_trusted),
+            action="create_task",
+            project_id=project.id,
+            target_type="task",
+            target_id=task.id,
+            decision=decision,
+        ),
+    )
     db.refresh(task)
     return _task_to_response(task)
 
 
 @router.post("/{project_id}/goals", response_model=GoalResponse, status_code=status.HTTP_201_CREATED)
-def create_goal(project_id: str, payload: GoalCreate, db: Session = Depends(get_db_session)) -> GoalResponse:
+def create_goal(
+    project_id: str,
+    payload: GoalCreate,
+    actor: str = Query(..., min_length=2, max_length=120),
+    role: str = Query(..., pattern=_MUTATION_ROLE_PATTERN),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> GoalResponse:
     project = db.query(models.Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
+
+    decision = _enforce_direct_mutation_policy(
+        db,
+        actor=actor,
+        role=role,
+        actor_trusted=bool(actor_trusted),
+        project=project,
+        action="create_goal",
+        target_type="goal",
+        target_id=project_id,
+    )
 
     if payload.status == "active":
         active_goal = (
@@ -618,6 +811,25 @@ def create_goal(project_id: str, payload: GoalCreate, db: Session = Depends(get_
             db.add(task)
 
         db.flush()
+        _write_direct_mutation_audit_event(
+            db,
+            project_id=project.id,
+            actor=actor,
+            action="create_goal",
+            target_type="goal",
+            target_id=goal.id,
+            result="executed",
+            payload=_build_direct_mutation_audit_payload(
+                actor=actor,
+                role=role,
+                actor_trusted=bool(actor_trusted),
+                action="create_goal",
+                project_id=project.id,
+                target_type="goal",
+                target_id=goal.id,
+                decision=decision,
+            ),
+        )
         db.refresh(goal)
         return _goal_to_response(goal)
     except IntegrityError as exc:
