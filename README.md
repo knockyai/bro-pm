@@ -160,13 +160,18 @@ Detail endpoint отдаёт sanitized payload, а top-level `detail` берёт
 
 Если `execute_publish=true`, сервис проходит через publish path и пишет audit для `publish_report`, включая idempotent replay-логику.
 
-Дополнительно в текущем MVP появился реальный timer-driven publish path:
+Дополнительно в текущем MVP появился реальный timer-actions path:
 
 - onboarding-поле `reporting_cadence` теперь не просто metadata;
 - in-process scheduler умеет публиковать scheduled project reports для cadence `daily` и `weekly`;
-- `manual` и неподдерживаемые cadence scheduler осознанно пропускает;
-- dedupe сделан через cadence-window idempotency key в `audit_events.idempotency_key`, поэтому повторный tick в том же окне не делает второй publish;
-- safe-paused проекты scheduler не трогает.
+- каждые 10 минут тот же timer-actions runtime делает autonomous decision review по проектам;
+- decision review может:
+  - подготовить `draft_boss_escalation` после повторяющихся недавних сбоев;
+  - создать follow-up `create_task`, если есть active goal, но нет открытой работы;
+  - создать replan `create_task`, если накопилось достаточно overdue open tasks;
+- `manual` и неподдерживаемые reporting cadence scheduler осознанно пропускает;
+- safe-paused проекты timer actions не трогают;
+- dedupe сделан через idempotency keys по окнам времени, а повтор одного и того же decision-эвристического срабатывания дополнительно режется cooldown-проверкой по recent audit history.
 
 ## Что здесь пока упрощено или только намечено
 
@@ -630,7 +635,7 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/projects/<PROJECT_ID>/reports/proj
 
 То есть publish contract уже собран, но внешний publish по умолчанию ещё не исполнялся.
 
-Если нужен реальный autonomous publish по cadence, включи scheduler:
+Если нужен реальный timer-actions runtime, оставь live app scheduler включённым:
 
 ```bash
 export BRO_PM_TIMER_ACTIONS_ENABLED=true
@@ -638,7 +643,9 @@ export BRO_PM_TIMER_ACTIONS_POLL_INTERVAL_SECONDS=60
 python -m uvicorn bro_pm.api.app:app --reload
 ```
 
-Тогда live API process будет периодически запускать scheduled report publishing для проектов с `reporting_cadence` = `daily` или `weekly`.
+Тогда live API process будет:
+- периодически запускать scheduled report publishing для проектов с `reporting_cadence = daily|weekly`;
+- раз в 10-минутное decision window делать autonomous decision review и, если срабатывает эвристика, проводить дальнейшее действие через существующий `CommandService` / policy / audit flow.
 
 ### 5. Поставить проект на safe-pause через command API
 
@@ -702,7 +709,9 @@ python -m pytest -q tests/test_project_onboarding_api.py tests/test_mvp_e2e_flow
 
 - уже полезный backend-каркас с policy, audit, safe-pause, report и rollback-скелетом;
 - уже запускаемый локально на FastAPI + SQLite;
-- уже с узким реальным timer-actions MVP для scheduled report publishing;
+- уже с узким реальным timer-actions MVP:
+  - scheduled report publishing;
+  - 10-minute autonomous decision review для следующего действия;
 - уже покрытый API- и e2e-тестами;
 - но пока ещё с детерминированным Hermes adapter'ом по умолчанию;
 - с live Yandex Tracker `create_task`, но с остальными integration adapters по-прежнему mostly stub-like;
