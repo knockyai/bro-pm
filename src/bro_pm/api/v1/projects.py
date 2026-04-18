@@ -37,7 +37,8 @@ from ...schemas import (
 from ...policy import PolicyDecision, PolicyEngine
 from ...services.command_service import CommandService
 from ...services.planner_service import PlannerService
-from ...services.planning_state import seed_capacity_profiles, sync_executor_load
+from ...services.onboarding_service import OnboardingExecutionInput, execute_project_onboarding
+from ...services.planning_state import sync_executor_load
 from ...services.reporting_service import ReportIdempotencyConflictError, ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -554,13 +555,6 @@ def create_project(
 
 @router.post("/onboard", response_model=ProjectOnboardingResponse, status_code=status.HTTP_201_CREATED)
 def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_db_session)) -> ProjectOnboardingResponse:
-    if not payload.slug:
-        raise HTTPException(status_code=400, detail="slug required")
-
-    existing = db.query(models.Project).filter_by(slug=payload.slug).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="slug already exists")
-
     communication_integrations = [
         _onboarding_allowed_integration(name, {"slack", "telegram"}, "communication")
         for name in payload.communication_integrations
@@ -571,158 +565,26 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
         "board",
     )
 
-    project = models.Project(
-        name=payload.name,
-        slug=payload.slug,
-        description=payload.description,
-        timezone=payload.timezone,
-        commitment_due_at=payload.commitment_due_at,
-        visibility=payload.visibility,
-        safe_paused=False,
-        created_by=payload.created_by or payload.admin,
-        metadata_json=payload.metadata or {},
-    )
-    db.add(project)
-    db.flush()
-
-    seed_capacity_profiles(
+    result = execute_project_onboarding(
         db,
-        project_id=project.id,
-        team_entries=[team.model_dump() for team in payload.team],
-        source="onboarding",
+        payload=OnboardingExecutionInput(
+            name=payload.name,
+            slug=payload.slug,
+            description=payload.description,
+            timezone=payload.timezone,
+            commitment_due_at=payload.commitment_due_at,
+            created_by=payload.created_by,
+            visibility=payload.visibility,
+            boss=payload.boss,
+            admin=payload.admin,
+            reporting_cadence=payload.reporting_cadence,
+            communication_integrations=communication_integrations,
+            board_integration=board_integration,
+            team=[team.model_dump() for team in payload.team],
+            metadata=payload.metadata or {},
+        ),
     )
-
-    memberships = [models.ProjectMembership(project_id=project.id, actor=payload.boss, role="owner")]
-    if payload.admin != payload.boss:
-        memberships.append(models.ProjectMembership(project_id=project.id, actor=payload.admin, role="admin"))
-    db.add_all(memberships)
-
-    smoke_detail = ""
-    try:
-        smoke_result = INTEGRATIONS[board_integration].execute(
-            action="create_task",
-            payload={
-                "project_id": project.id,
-                "title": "Synthetic onboarding smoke check",
-                "actor": payload.admin,
-                "project_metadata": project.metadata_json or {},
-            },
-        )
-        gate_checks = {
-            "policy_attached": True,
-            "communication_ready": bool(communication_integrations),
-            "board_sync_healthy": bool(smoke_result.ok),
-            "safe_pause_default_off": not project.safe_paused,
-        }
-        smoke_detail = smoke_result.detail or f"{board_integration} executed: create_task"
-        onboarding_metadata = {
-            "status": "active",
-            "policy": "default_mvp",
-            "reporting_cadence": payload.reporting_cadence,
-            "communication_integrations": communication_integrations,
-            "board_integration": board_integration,
-            "team": [team.model_dump() for team in payload.team],
-            "gate_checks": gate_checks,
-            "smoke_check": {
-                "status": "passed" if smoke_result.ok else "failed",
-                "detail": smoke_detail,
-            },
-        }
-        project.metadata_json = {
-            **(project.metadata_json or {}),
-            "onboarding": onboarding_metadata,
-        }
-        db.add(
-            models.AuditEvent(
-                project_id=project.id,
-                actor=payload.admin,
-                action="onboard_project",
-                target_type="project",
-                target_id=project.id,
-                payload=json.dumps(
-                    {
-                        "detail": smoke_detail,
-                        "gate_checks": gate_checks,
-                        "onboarding": onboarding_metadata,
-                    },
-                    ensure_ascii=False,
-                ),
-                result="executed" if smoke_result.ok else "failed",
-            )
-        )
-        db.flush()
-        db.refresh(project)
-        return _build_onboarding_response(project)
-    except IntegrationError as exc:
-        detail = str(exc)
-        project.safe_paused = True
-        failure_gate_checks = {
-            "policy_attached": True,
-            "communication_ready": bool(communication_integrations),
-            "board_sync_healthy": False,
-            "safe_pause_default_off": False,
-        }
-        failure_event_created_at = datetime.utcnow()
-        escalation_created_at = failure_event_created_at + timedelta(microseconds=1)
-        project.metadata_json = {
-            **(project.metadata_json or {}),
-            "onboarding": {
-                "status": "failed",
-                "policy": "default_mvp",
-                "reporting_cadence": payload.reporting_cadence,
-                "communication_integrations": communication_integrations,
-                "board_integration": board_integration,
-                "team": [team.model_dump() for team in payload.team],
-                "gate_checks": failure_gate_checks,
-                "smoke_check": {
-                    "status": "failed",
-                    "detail": detail,
-                },
-            },
-        }
-        db.add(
-            models.AuditEvent(
-                project_id=project.id,
-                actor=payload.admin,
-                action="onboard_project",
-                target_type="project",
-                target_id=project.id,
-                payload=json.dumps(
-                    {
-                        "detail": detail,
-                        "gate_checks": failure_gate_checks,
-                        "onboarding": (project.metadata_json or {}).get("onboarding", {}),
-                    },
-                    ensure_ascii=False,
-                ),
-                result="failed",
-                created_at=failure_event_created_at,
-            )
-        )
-        db.add(
-            models.AuditEvent(
-                project_id=project.id,
-                actor=payload.admin,
-                action="draft_boss_escalation",
-                target_type="project",
-                target_id=project.id,
-                payload=json.dumps(
-                    {
-                        "detail": detail,
-                        "proposal": {
-                            "payload": {
-                                "escalation_message": f"Onboarding failed for {project.slug}: {detail}",
-                            }
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                result="requires_approval",
-                created_at=escalation_created_at,
-            )
-        )
-        db.commit()
-        raise HTTPException(status_code=422, detail=detail) from exc
+    return _build_onboarding_response(result.project)
 
 
 @router.post("/{project_id}/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)

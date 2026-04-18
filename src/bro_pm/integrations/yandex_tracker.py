@@ -12,6 +12,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from ..config import Settings, settings as runtime_settings
+from ..services.tracker_credentials import load_tracker_credentials
 from . import IntegrationError, IntegrationResult
 
 McpToolRunner = Callable[..., dict[str, Any]]
@@ -136,14 +137,30 @@ class YandexTrackerIntegration:
         )
 
     def _validated_native_context(self, payload: dict) -> dict[str, str | None]:
-        api_base = self._required_setting(self.settings.yandex_tracker_api_base, "missing yandex_tracker api base")
-        token = self._required_setting(self.settings.yandex_tracker_token, "missing yandex_tracker token")
-        auth_prefix = self._required_setting(self.settings.yandex_tracker_auth_prefix, "missing yandex_tracker auth prefix")
+        api_base = self._required_setting(
+            self._credential_value(payload, config_key="api_base", fallback=self.settings.yandex_tracker_api_base),
+            "missing yandex_tracker api base",
+        )
+        token = self._required_setting(
+            self._credential_value(payload, secret_key="token", fallback=self.settings.yandex_tracker_token),
+            "missing yandex_tracker token",
+        )
+        auth_prefix = self._required_setting(
+            self._credential_value(payload, config_key="auth_prefix", fallback=self.settings.yandex_tracker_auth_prefix),
+            "missing yandex_tracker auth prefix",
+        )
         org_header_name = self._required_setting(
-            self.settings.yandex_tracker_org_header_name,
+            self._credential_value(
+                payload,
+                config_key="org_header_name",
+                fallback=self.settings.yandex_tracker_org_header_name,
+            ),
             "missing yandex_tracker org header name",
         )
-        org_id = self._required_setting(self.settings.yandex_tracker_org_id, "missing yandex_tracker org id")
+        org_id = self._required_setting(
+            self._credential_value(payload, config_key="org_id", fallback=self.settings.yandex_tracker_org_id),
+            "missing yandex_tracker org id",
+        )
         common = self._validated_common_context(payload)
         return {
             "api_base": api_base,
@@ -211,7 +228,44 @@ class YandexTrackerIntegration:
                     metadata_queue = self._normalized_text(yandex_metadata.get("queue"))
                     if metadata_queue:
                         return metadata_queue
+        credential_queue = self._credential_value(payload, config_key="queue")
+        if credential_queue:
+            return credential_queue
         return self._normalized_text(self.settings.yandex_tracker_default_queue)
+
+    def _credential_value(
+        self,
+        payload: dict,
+        *,
+        config_key: str | None = None,
+        secret_key: str | None = None,
+        fallback: Any = None,
+    ) -> str | None:
+        direct_credentials = payload.get("tracker_credentials")
+        if isinstance(direct_credentials, dict):
+            if config_key:
+                config = direct_credentials.get("config")
+                if isinstance(config, dict):
+                    value = self._normalized_text(config.get(config_key))
+                    if value:
+                        return value
+            if secret_key:
+                secrets = direct_credentials.get("secrets")
+                if isinstance(secrets, dict):
+                    value = self._normalized_text(secrets.get(secret_key))
+                    if value:
+                        return value
+
+        project_id = self._normalized_text(payload.get("project_id"))
+        if project_id:
+            stored = load_tracker_credentials(project_id=project_id, provider="yandex_tracker")
+            if stored is not None:
+                if config_key:
+                    value = self._normalized_text(stored.config.get(config_key))
+                    if value:
+                        return value
+
+        return self._normalized_text(fallback)
 
     @staticmethod
     def _normalized_text(value: Any) -> str | None:

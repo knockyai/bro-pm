@@ -148,6 +148,21 @@ def test_api_project_onboarding_rejects_duplicate_capacity_profiles(api_client: 
     assert "team entries must be unique by name and owner" in response.text
 
 
+def test_api_project_onboarding_rejects_duplicate_project_name(api_client: TestClient):
+    payload = _onboarding_payload()
+    first_response = api_client.post("/api/v1/projects/onboard", json=payload)
+    assert first_response.status_code == 201
+
+    duplicate_name_payload = _onboarding_payload()
+    duplicate_name_payload["name"] = payload["name"]
+    duplicate_name_payload["slug"] = f"{payload['slug']}-second"
+
+    response = api_client.post("/api/v1/projects/onboard", json=duplicate_name_payload)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "project name already exists"
+
+
 def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_client: TestClient, monkeypatch):
     payload = _onboarding_payload()
     payload["board_integration"] = "yandex_tracker"

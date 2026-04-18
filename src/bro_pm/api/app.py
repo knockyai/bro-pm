@@ -11,6 +11,7 @@ from ..services.report_scheduler import start_polling_task, stop_polling_task
 from .v1.commands import router as command_router
 from .v1.gateway import router as gateway_router
 from .v1.projects import router as project_router
+from .ui import router as ui_router
 
 
 def _start_report_scheduler_task(*, poll_interval_seconds: float, session_factory) -> Task[None]:
@@ -50,6 +51,7 @@ def create_app(
         await stop_polling_task(scheduler_task)
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.include_router(ui_router, prefix="/onboarding")
     app.include_router(project_router, prefix="/api/v1")
     app.include_router(command_router, prefix="/api/v1")
     app.include_router(gateway_router, prefix="/api/v1")

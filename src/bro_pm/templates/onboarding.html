@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bro-PM Onboarding</title>
+    <style>
+      :root {
+        --bg: #f4efe7;
+        --panel: rgba(255, 252, 247, 0.94);
+        --panel-border: rgba(24, 32, 42, 0.12);
+        --text: #1f2933;
+        --muted: #5f6c7a;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --danger: #b91c1c;
+        --success: #166534;
+        --shadow: 0 24px 60px rgba(37, 50, 63, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(15, 118, 110, 0.18), transparent 28%),
+          radial-gradient(circle at bottom right, rgba(180, 83, 9, 0.18), transparent 28%),
+          linear-gradient(180deg, #f8f5ef 0%, var(--bg) 100%);
+      }
+
+      .page {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 32px 20px 56px;
+      }
+
+      .hero,
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+      }
+
+      .hero {
+        padding: 28px;
+        margin-bottom: 22px;
+      }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--accent-strong);
+      }
+
+      h1, h2 {
+        margin: 0;
+        font-family: "IBM Plex Serif", Georgia, serif;
+      }
+
+      h1 {
+        font-size: clamp(2rem, 4vw, 3.2rem);
+        line-height: 1;
+        margin-bottom: 14px;
+      }
+
+      .hero p,
+      .hint,
+      .section-copy {
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        gap: 20px;
+      }
+
+      .panel {
+        padding: 24px;
+      }
+
+      .panel h2 {
+        font-size: 1.35rem;
+        margin-bottom: 8px;
+      }
+
+      .section-copy {
+        margin: 0 0 18px;
+      }
+
+      .field-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 0.92rem;
+        font-weight: 600;
+      }
+
+      input,
+      textarea,
+      select,
+      button {
+        font: inherit;
+      }
+
+      input,
+      textarea,
+      select {
+        width: 100%;
+        border: 1px solid rgba(24, 32, 42, 0.14);
+        border-radius: 14px;
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, 0.88);
+        color: var(--text);
+      }
+
+      textarea {
+        min-height: 120px;
+        resize: vertical;
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      .employee-list {
+        display: grid;
+        gap: 12px;
+      }
+
+      .employee-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: end;
+        padding: 14px;
+        border: 1px solid rgba(24, 32, 42, 0.1);
+        border-radius: 16px;
+        background: rgba(248, 250, 252, 0.72);
+      }
+
+      .button-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }
+
+      .button,
+      button[type="submit"] {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        cursor: pointer;
+      }
+
+      button[type="submit"] {
+        background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+        color: white;
+        font-weight: 700;
+      }
+
+      .button {
+        background: rgba(15, 118, 110, 0.08);
+        color: var(--accent-strong);
+      }
+
+      .danger-button {
+        background: rgba(185, 28, 28, 0.08);
+        color: var(--danger);
+      }
+
+      .callout {
+        border-radius: 18px;
+        padding: 16px 18px;
+        margin-bottom: 18px;
+      }
+
+      .callout.error {
+        background: rgba(185, 28, 28, 0.08);
+        border: 1px solid rgba(185, 28, 28, 0.18);
+      }
+
+      .callout.success {
+        background: rgba(22, 101, 52, 0.09);
+        border: 1px solid rgba(22, 101, 52, 0.18);
+      }
+
+      .callout ul {
+        margin: 10px 0 0;
+        padding-left: 20px;
+      }
+
+      .provider-panel[hidden] {
+        display: none;
+      }
+
+      .review {
+        display: grid;
+        gap: 8px;
+        color: var(--muted);
+      }
+
+      .hint {
+        margin: 0;
+        font-size: 0.88rem;
+      }
+
+      .checkbox {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 600;
+      }
+
+      .checkbox input {
+        width: auto;
+      }
+
+      @media (max-width: 720px) {
+        .employee-row {
+          grid-template-columns: 1fr;
+        }
+
+        .page {
+          padding-inline: 14px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">Bro-PM Launch UI</p>
+        <h1>Onboard a project without touching config files.</h1>
+        <p>
+          This page creates the project, seeds ownership, stores tracker credentials outside project metadata,
+          runs the tracker smoke check, and derives team capacity from employee rows at
+          <strong>{{ default_employee_capacity_units }} hours per employee per month</strong>.
+        </p>
+      </section>
+
+      {% if errors %}
+      <section class="callout error">
+        <strong>Submission failed.</strong>
+        <ul>
+          {% for error in errors %}
+          <li>{{ error }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endif %}
+
+      {% if success_summary %}
+      <section class="callout success">
+        <strong>Project launched.</strong>
+        <div class="review">
+          <span><strong>{{ success_summary.project_name }}</strong> ({{ success_summary.project_slug }})</span>
+          <span>Project ID: {{ success_summary.project_id }}</span>
+          <span>Board integration: {{ success_summary.board_integration }}</span>
+          <span>Reporting cadence: {{ success_summary.reporting_cadence }}</span>
+          {% if success_summary.initial_goal_title %}
+          <span>Initial goal: {{ success_summary.initial_goal_title }}</span>
+          {% endif %}
+        </div>
+      </section>
+      {% endif %}
+
+      <form method="post" class="grid">
+        <section class="panel stack">
+          <div>
+            <h2>Project Basics</h2>
+            <p class="section-copy">Collect the minimum project definition needed to launch reporting and tracker flow.</p>
+          </div>
+          <div class="field-grid">
+            <label>
+              Project name
+              <input type="text" name="name" required value="{{ form.name }}" />
+            </label>
+            <label>
+              Slug
+              <input type="text" name="slug" required value="{{ form.slug }}" />
+            </label>
+            <label>
+              Timezone
+              <input type="text" name="timezone" required value="{{ form.timezone }}" />
+            </label>
+            <label>
+              Commitment / target date
+              <input type="datetime-local" name="commitment_due_at" value="{{ form.commitment_due_at }}" />
+            </label>
+          </div>
+          <label>
+            Description
+            <textarea name="description" placeholder="What this project is supposed to deliver.">{{ form.description }}</textarea>
+          </label>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Launch Ownership</h2>
+            <p class="section-copy">Boss becomes the project owner. Admin becomes the operational admin.</p>
+          </div>
+          <div class="field-grid">
+            <label>
+              Boss / owner
+              <input type="text" name="boss" required value="{{ form.boss }}" />
+            </label>
+            <label>
+              Admin / operator
+              <input type="text" name="admin" required value="{{ form.admin }}" />
+            </label>
+          </div>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Tracker Setup</h2>
+            <p class="section-copy">Messenger choice is intentionally hidden. The backend applies the temporary internal communication default.</p>
+          </div>
+          <div class="field-grid">
+            <label>
+              Board integration
+              <select name="board_integration" id="board-integration" data-provider-select>
+                {% for integration in board_integrations %}
+                <option value="{{ integration }}" {% if form.board_integration == integration %}selected{% endif %}>{{ integration }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>
+              Reporting cadence
+              <select name="reporting_cadence">
+                {% for cadence in reporting_cadences %}
+                <option value="{{ cadence }}" {% if form.reporting_cadence == cadence %}selected{% endif %}>{{ cadence }}</option>
+                {% endfor %}
+              </select>
+            </label>
+          </div>
+
+          <div class="stack">
+            <div class="provider-panel" data-provider-panel="yandex_tracker">
+              <div class="field-grid">
+                <label>
+                  Yandex organization ID
+                  <input type="text" name="yandex_tracker_org_id" value="{{ form.tracker.yandex_tracker.org_id }}" />
+                </label>
+                <label>
+                  Queue key
+                  <input type="text" name="yandex_tracker_queue" value="{{ form.tracker.yandex_tracker.queue }}" />
+                </label>
+                <label>
+                  OAuth token
+                  <input type="password" name="yandex_tracker_token" autocomplete="new-password" />
+                </label>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Employees</h2>
+            <p class="section-copy">Each employee row maps one owner to one team/function and contributes {{ default_employee_capacity_units }} monthly capacity units.</p>
+          </div>
+          <div class="employee-list" id="employee-list">
+            {% for employee in form.employees %}
+            <div class="employee-row" data-employee-row>
+              <label>
+                Employee
+                <input type="text" name="employee_name" value="{{ employee.name }}" />
+              </label>
+              <label>
+                Team / function
+                <input type="text" name="employee_function" value="{{ employee.function }}" />
+              </label>
+              <button type="button" class="button danger-button" data-remove-employee>Remove</button>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="button-row">
+            <button type="button" class="button" id="add-employee">Add employee</button>
+            <p class="hint">Manual capacity input is intentionally disabled in this MVP.</p>
+          </div>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Initial Goal</h2>
+            <p class="section-copy">Optional, but useful if the project should be live immediately after onboarding.</p>
+          </div>
+          <div class="field-grid">
+            <label>
+              Goal title
+              <input type="text" name="goal_title" value="{{ form.goal.title }}" />
+            </label>
+            <label>
+              Goal commitment date
+              <input type="datetime-local" name="goal_commitment_due_at" value="{{ form.goal.commitment_due_at }}" />
+            </label>
+            <label>
+              Max generated tasks
+              <select name="goal_max_generated_tasks">
+                {% for value in ("1", "2", "3") %}
+                <option value="{{ value }}" {% if form.goal.max_generated_tasks == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+              </select>
+            </label>
+          </div>
+          <label>
+            Goal description
+            <textarea name="goal_description" placeholder="Optional launch objective.">{{ form.goal.description }}</textarea>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="goal_auto_decompose" {% if form.goal.auto_decompose %}checked{% endif %} />
+            Auto-decompose the goal into initial tasks
+          </label>
+        </section>
+
+        <section class="panel stack">
+          <div>
+            <h2>Review & Launch</h2>
+            <p class="section-copy">Submit creates the project, memberships, tracker credential record, onboarding metadata, and smoke check.</p>
+          </div>
+          <div class="review">
+            <span>Hidden communication bridge: `{{ " / ".join(["telegram"]) }}`</span>
+            <span>Capacity derivation: `headcount x {{ default_employee_capacity_units }}` monthly units</span>
+          </div>
+          <div class="button-row">
+            <button type="submit">Launch project</button>
+          </div>
+        </section>
+      </form>
+    </main>
+
+    <template id="employee-row-template">
+      <div class="employee-row" data-employee-row>
+        <label>
+          Employee
+          <input type="text" name="employee_name" />
+        </label>
+        <label>
+          Team / function
+          <input type="text" name="employee_function" />
+        </label>
+        <button type="button" class="button danger-button" data-remove-employee>Remove</button>
+      </div>
+    </template>
+
+    <script>
+      const providerSelect = document.querySelector("[data-provider-select]");
+      const providerPanels = document.querySelectorAll("[data-provider-panel]");
+      const employeeList = document.getElementById("employee-list");
+      const employeeTemplate = document.getElementById("employee-row-template");
+      const addEmployeeButton = document.getElementById("add-employee");
+
+      function syncProviderPanels() {
+        const selected = providerSelect.value;
+        providerPanels.forEach((panel) => {
+          panel.hidden = panel.dataset.providerPanel !== selected;
+        });
+      }
+
+      function wireRemoveButtons(scope) {
+        scope.querySelectorAll("[data-remove-employee]").forEach((button) => {
+          button.onclick = () => {
+            const rows = employeeList.querySelectorAll("[data-employee-row]");
+            if (rows.length === 1) {
+              rows[0].querySelectorAll("input").forEach((input) => { input.value = ""; });
+              return;
+            }
+            button.closest("[data-employee-row]").remove();
+          };
+        });
+      }
+
+      addEmployeeButton.onclick = () => {
+        const clone = employeeTemplate.content.firstElementChild.cloneNode(true);
+        employeeList.appendChild(clone);
+        wireRemoveButtons(clone);
+      };
+
+      providerSelect.addEventListener("change", syncProviderPanels);
+      syncProviderPanels();
+      wireRemoveButtons(document);
+    </script>
+  </body>
+</html>

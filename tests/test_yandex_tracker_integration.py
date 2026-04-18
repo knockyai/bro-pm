@@ -3,10 +3,13 @@ from __future__ import annotations
 import io
 import json
 from urllib.error import HTTPError
+from uuid import uuid4
 
 import pytest
 
+from bro_pm import models
 from bro_pm.config import Settings
+from bro_pm.database import init_db
 from bro_pm.integrations import IntegrationError, YandexTrackerIntegration
 
 
@@ -134,6 +137,124 @@ def test_yandex_tracker_execute_wraps_http_failures_as_integration_error():
                 "title": "Sync release checklist",
             },
         )
+
+
+def test_yandex_tracker_execute_loads_non_secret_config_from_store_and_uses_runtime_token(tmp_path):
+    db_path = tmp_path / "yandex_tracker_credentials.db"
+    db_url = f"sqlite:///{db_path}"
+    init_db(db_url)
+    from bro_pm.database import SessionLocal
+
+    session = SessionLocal()
+    project_id = ""
+    try:
+        project = models.Project(
+            name=f"Tracker Project {uuid4().hex[:8]}",
+            slug=f"tracker-project-{uuid4().hex[:8]}",
+            safe_paused=False,
+            visibility="internal",
+        )
+        session.add(project)
+        session.flush()
+        project_id = project.id
+        session.add(
+            models.TrackerCredential(
+                project_id=project_id,
+                provider="yandex_tracker",
+                config_json={"org_id": "org-from-db", "queue": "OPS"},
+                secret_json={"token": "token-from-db"},
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout: int = 0):
+        captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHTTPResponse({"id": "42", "key": "OPS-42"})
+
+    integration = YandexTrackerIntegration(
+        settings=_settings(yandex_tracker_token="runtime-token", yandex_tracker_org_id=None, yandex_tracker_default_queue=None),
+        urlopen=fake_urlopen,
+    )
+
+    result = integration.execute(
+        action="create_task",
+        payload={
+            "project_id": project_id,
+            "title": "Stored credential task",
+        },
+    )
+
+    assert captured["headers"]["authorization"] == "OAuth runtime-token"
+    assert captured["headers"]["x-org-id"] == "org-from-db"
+    assert captured["body"] == {
+        "queue": "OPS",
+        "summary": "Stored credential task",
+    }
+    assert result.detail == "yandex_tracker created task OPS-42 (id: 42)"
+
+
+def test_yandex_tracker_execute_uses_runtime_token_when_stored_secret_is_masked(tmp_path):
+    db_path = tmp_path / "yandex_tracker_masked_credentials.db"
+    db_url = f"sqlite:///{db_path}"
+    init_db(db_url)
+    from bro_pm.database import SessionLocal
+
+    session = SessionLocal()
+    project_id = ""
+    try:
+        project = models.Project(
+            name=f"Tracker Project {uuid4().hex[:8]}",
+            slug=f"tracker-project-masked-{uuid4().hex[:8]}",
+            safe_paused=False,
+            visibility="internal",
+        )
+        session.add(project)
+        session.flush()
+        project_id = project.id
+        session.add(
+            models.TrackerCredential(
+                project_id=project_id,
+                provider="yandex_tracker",
+                config_json={"org_id": "org-from-db", "queue": "OPS"},
+                secret_json={"token": "[redacted]"},
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout: int = 0):
+        captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHTTPResponse({"id": "42", "key": "OPS-42"})
+
+    integration = YandexTrackerIntegration(
+        settings=_settings(yandex_tracker_token="runtime-token", yandex_tracker_org_id=None, yandex_tracker_default_queue=None),
+        urlopen=fake_urlopen,
+    )
+
+    result = integration.execute(
+        action="create_task",
+        payload={
+            "project_id": project_id,
+            "title": "Stored masked credential task",
+        },
+    )
+
+    assert captured["headers"]["authorization"] == "OAuth runtime-token"
+    assert captured["headers"]["x-org-id"] == "org-from-db"
+    assert captured["body"] == {
+        "queue": "OPS",
+        "summary": "Stored masked credential task",
+    }
+    assert result.detail == "yandex_tracker created task OPS-42 (id: 42)"
 
 
 def test_yandex_tracker_execute_uses_native_backend_by_default():

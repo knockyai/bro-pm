@@ -36,6 +36,10 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    tracker_credentials: Mapped[list["TrackerCredential"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
     due_actions: Mapped[list["DueAction"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     conversation_events: Mapped[list["ConversationEvent"]] = relationship(
         back_populates="project",
@@ -121,6 +125,23 @@ class ExecutorCapacityProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     project: Mapped[Project] = relationship(back_populates="executor_capacity_profiles")
+
+
+class TrackerCredential(Base):
+    __tablename__ = "tracker_credentials"
+    __table_args__ = (
+        UniqueConstraint("project_id", "provider", name="uq_tracker_credentials_project_provider"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(String, ForeignKey("projects.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(80), index=True)
+    config_json: Mapped[dict] = mapped_column("config", JSON, default=dict)
+    secret_json: Mapped[dict] = mapped_column("secrets", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    project: Mapped[Project] = relationship(back_populates="tracker_credentials")
 
 
 class AuditEvent(Base):
