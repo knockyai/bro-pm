@@ -22,6 +22,15 @@
 
 Current MVP adapter boundary already exists in code and supports board adapters such as `notion`, `jira`, `trello`, and `yandex_tracker`.
 
+Current implementation note:
+
+- `yandex_tracker.create_task` is live/API-backed and sends a real HTTP request to Yandex Tracker.
+- Runtime config comes from Bro-PM env settings: API base, token, auth prefix/scheme, org header name, org id, and optional default queue.
+- Queue selection prefers `project.metadata.integrations.yandex_tracker.queue` and falls back to `BRO_PM_YANDEX_TRACKER_DEFAULT_QUEUE`.
+- Other adapters remain MVP/lightweight and are not yet fully live clients.
+
+Planned broader integration surface:
+
 - `ingest_events()`
 
 - `fetch_state()`

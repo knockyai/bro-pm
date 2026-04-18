@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bro_pm import models
-from bro_pm.integrations import INTEGRATIONS, IntegrationError
+from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
 
 
 @pytest.fixture
@@ -127,9 +127,25 @@ def test_api_project_onboarding_requires_at_least_one_communication_integration(
     assert "at least one communication integration" in response.text
 
 
-def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_client: TestClient):
+def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_client: TestClient, monkeypatch):
     payload = _onboarding_payload()
     payload["board_integration"] = "yandex_tracker"
+    payload["metadata"] = {
+        "integrations": {
+            "yandex_tracker": {
+                "queue": "OPS",
+            }
+        }
+    }
+
+    def yandex_execute_stub(*, action: str, payload: dict):
+        assert action == "create_task"
+        assert payload["title"] == "Synthetic onboarding smoke check"
+        assert payload["actor"] == "alice"
+        assert payload["project_metadata"]["integrations"]["yandex_tracker"]["queue"] == "OPS"
+        return IntegrationResult(ok=True, detail="yandex_tracker created task ONBOARD-1 (id: 101)")
+
+    monkeypatch.setattr(INTEGRATIONS["yandex_tracker"], "execute", yandex_execute_stub)
 
     response = api_client.post("/api/v1/projects/onboard", json=payload)
 
@@ -137,7 +153,7 @@ def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_cli
     body = response.json()
     assert body["status"] == "active"
     assert body["smoke_check"]["status"] == "passed"
-    assert body["smoke_check"]["detail"] == "yandex_tracker executed: create_task"
+    assert body["smoke_check"]["detail"] == "yandex_tracker created task ONBOARD-1 (id: 101)"
 
     db_module = importlib.import_module("bro_pm.database")
     database_session = db_module.SessionLocal()
@@ -147,6 +163,7 @@ def test_api_project_onboarding_accepts_yandex_tracker_board_integration(api_cli
         metadata = project.metadata_json or {}
         onboarding = metadata.get("onboarding") or {}
         assert onboarding["board_integration"] == "yandex_tracker"
+        assert metadata["integrations"]["yandex_tracker"]["queue"] == "OPS"
     finally:
         database_session.close()
 

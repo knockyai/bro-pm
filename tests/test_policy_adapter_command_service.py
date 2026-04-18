@@ -408,6 +408,11 @@ def test_command_service_create_task_validation_routes_to_project_yandex_tracker
     session = db_session
     project = _create_project(session, name="Yandex validation project", slug="yandex-validation")
     project.metadata_json = {
+        "integrations": {
+            "yandex_tracker": {
+                "queue": "OPS",
+            }
+        },
         "onboarding": {
             "board_integration": "yandex_tracker",
         }
@@ -428,6 +433,7 @@ def test_command_service_create_task_validation_routes_to_project_yandex_tracker
         assert payload["project_id"] == project.id
         assert payload["title"] == "implement yandex validation"
         assert payload["raw_command"] == "create task implement yandex validation"
+        assert payload["project_metadata"]["integrations"]["yandex_tracker"]["queue"] == "OPS"
 
     def notion_validate_forbidden(*, action: str, payload: dict) -> None:
         integration_events["notion_validate_calls"] += 1
@@ -647,6 +653,11 @@ def test_command_service_create_task_execution_routes_to_project_yandex_tracker_
     session = db_session
     project = _create_project(session, name="Yandex execution project", slug="yandex-execution")
     project.metadata_json = {
+        "integrations": {
+            "yandex_tracker": {
+                "queue": "OPS",
+            }
+        },
         "onboarding": {
             "board_integration": "yandex_tracker",
         }
@@ -664,6 +675,7 @@ def test_command_service_create_task_execution_routes_to_project_yandex_tracker_
         assert payload["project_id"] == project.id
         assert payload["title"] == "assisted yandex sync"
         assert payload["raw_command"] == "create task assisted yandex sync"
+        assert payload["project_metadata"]["integrations"]["yandex_tracker"]["queue"] == "OPS"
         return IntegrationResult(ok=True, detail="yandex_tracker executed assisted create_task")
 
     def notion_execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:

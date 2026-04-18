@@ -575,6 +575,7 @@ def onboard_project(payload: ProjectOnboardingCreate, db: Session = Depends(get_
                 "project_id": project.id,
                 "title": "Synthetic onboarding smoke check",
                 "actor": payload.admin,
+                "project_metadata": project.metadata_json or {},
             },
         )
         gate_checks = {

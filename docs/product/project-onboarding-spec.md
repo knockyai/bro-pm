@@ -19,6 +19,8 @@ Bring a project from zero state to active, constrained autonomy.
 4. connect integrations
    - MVP board integrations now include `notion`, `jira`, `trello`, and `yandex_tracker`
    - onboarding smoke check must use the selected board adapter
+   - if the selected board adapter is `yandex_tracker`, onboarding runs a live `create_task` call using Bro-PM runtime env config
+   - Yandex queue resolution prefers `metadata.integrations.yandex_tracker.queue` and falls back to `BRO_PM_YANDEX_TRACKER_DEFAULT_QUEUE`
 
 5. map team ownership and capacity
 

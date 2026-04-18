@@ -60,11 +60,31 @@ class CommandService:
             proposal.project_id = project_id
         return proposal
 
+    def _get_project(self, project_id: str | None) -> models.Project | None:
+        if not project_id:
+            return None
+        with self.db.no_autoflush:
+            return self.db.get(models.Project, project_id)
+
+    def _project_metadata(self, project_id: str | None) -> dict:
+        project = self._get_project(project_id)
+        metadata = project.metadata_json if project else {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _integration_payload(self, *, project_id: str | None, proposal_payload: dict) -> dict:
+        payload = {
+            **proposal_payload,
+            "project_id": project_id,
+        }
+        project_metadata = self._project_metadata(project_id)
+        if project_metadata:
+            payload["project_metadata"] = project_metadata
+        return payload
+
     def _resolve_project_board_integration_name(self, project_id: str | None) -> str:
         if not project_id:
             return "notion"
-        with self.db.no_autoflush:
-            project = self.db.get(models.Project, project_id)
+        project = self._get_project(project_id)
         if not project:
             return "notion"
         metadata = project.metadata_json or {}
@@ -180,10 +200,7 @@ class CommandService:
                     try:
                         integration.validate(
                             action="create_task",
-                            payload={
-                                **proposal.payload,
-                                "project_id": project_id,
-                            },
+                            payload=self._integration_payload(project_id=project_id, proposal_payload=proposal.payload),
                         )
                         response_result = "validated"
                         stored_result = "validated"
@@ -274,10 +291,7 @@ class CommandService:
                         try:
                             integration_result = integration.execute(
                                 action="create_task",
-                                payload={
-                                    **proposal.payload,
-                                    "project_id": project_id,
-                                },
+                                payload=self._integration_payload(project_id=project_id, proposal_payload=proposal.payload),
                             )
                             if integration_result.ok:
                                 response_result = "executed"
