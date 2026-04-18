@@ -15,6 +15,13 @@ def _env_default(name: str, default: str) -> str:
     return value if value is not None else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = _env_optional(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime configuration for the MVP backend."""
@@ -57,6 +64,10 @@ class Settings:
     )
     yandex_tracker_mcp_timeout_seconds: int = field(
         default_factory=lambda: int(os.getenv("BRO_PM_YANDEX_TRACKER_MCP_TIMEOUT_SECONDS", "45"))
+    )
+    timer_actions_enabled: bool = field(default_factory=lambda: _env_bool("BRO_PM_TIMER_ACTIONS_ENABLED", True))
+    timer_actions_poll_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("BRO_PM_TIMER_ACTIONS_POLL_INTERVAL_SECONDS", "60"))
     )
 
 

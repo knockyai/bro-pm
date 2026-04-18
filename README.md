@@ -160,6 +160,14 @@ Detail endpoint отдаёт sanitized payload, а top-level `detail` берёт
 
 Если `execute_publish=true`, сервис проходит через publish path и пишет audit для `publish_report`, включая idempotent replay-логику.
 
+Дополнительно в текущем MVP появился реальный timer-driven publish path:
+
+- onboarding-поле `reporting_cadence` теперь не просто metadata;
+- in-process scheduler умеет публиковать scheduled project reports для cadence `daily` и `weekly`;
+- `manual` и неподдерживаемые cadence scheduler осознанно пропускает;
+- dedupe сделан через cadence-window idempotency key в `audit_events.idempotency_key`, поэтому повторный tick в том же окне не делает второй publish;
+- safe-paused проекты scheduler не трогает.
+
 ## Что здесь пока упрощено или только намечено
 
 Это важный раздел, без маркетинга.
@@ -505,6 +513,15 @@ dev/test:
 - для policy-проверяемого пути нужен header `x-actor-trusted: true`;
 - возвращает project report и publish block.
 
+`BRO_PM_TIMER_ACTIONS_ENABLED`
+- default: `true` for the default live app object;
+- automatic scheduler startup is still suppressed for explicit `create_app(database_url=...)` test-style app construction unless `enable_scheduler=True` is passed;
+- includes the in-process scheduler for timer actions in live runtime.
+
+`BRO_PM_TIMER_ACTIONS_POLL_INTERVAL_SECONDS`
+- default: `60`;
+- задаёт polling interval для timer scheduler.
+
 `POST /api/v1/projects/{project_id}/rollback`
 - принимает `actor`, `role`, `audit_event_id`, `reason`;
 - для успешного privileged rollback нужен header `x-actor-trusted: true`;
@@ -613,6 +630,16 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/projects/<PROJECT_ID>/reports/proj
 
 То есть publish contract уже собран, но внешний publish по умолчанию ещё не исполнялся.
 
+Если нужен реальный autonomous publish по cadence, включи scheduler:
+
+```bash
+export BRO_PM_TIMER_ACTIONS_ENABLED=true
+export BRO_PM_TIMER_ACTIONS_POLL_INTERVAL_SECONDS=60
+python -m uvicorn bro_pm.api.app:app --reload
+```
+
+Тогда live API process будет периодически запускать scheduled report publishing для проектов с `reporting_cadence` = `daily` или `weekly`.
+
 ### 5. Поставить проект на safe-pause через command API
 
 ```bash
@@ -675,6 +702,7 @@ python -m pytest -q tests/test_project_onboarding_api.py tests/test_mvp_e2e_flow
 
 - уже полезный backend-каркас с policy, audit, safe-pause, report и rollback-скелетом;
 - уже запускаемый локально на FastAPI + SQLite;
+- уже с узким реальным timer-actions MVP для scheduled report publishing;
 - уже покрытый API- и e2e-тестами;
 - но пока ещё с детерминированным Hermes adapter'ом по умолчанию;
 - с live Yandex Tracker `create_task`, но с остальными integration adapters по-прежнему mostly stub-like;

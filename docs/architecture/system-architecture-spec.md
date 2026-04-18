@@ -66,6 +66,8 @@ MVP enforces this split so that state and security do not depend on prompts.
 
 8. Execution is verified and always audited.
 
+9. For the currently implemented timer-actions MVP, the default live app may also run a small in-process scheduler loop that periodically scans project reporting cadence and triggers `publish_report` through the existing reporting service path.
+
 ## 1.6 Deployment
 
 - One backend service + worker sidecar initially.

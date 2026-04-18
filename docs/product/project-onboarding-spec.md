@@ -28,7 +28,12 @@ Bring a project from zero state to active, constrained autonomy.
 
 6. run synthetic action smoke check
 
-7. confirm first goal intake
+7. initialize autonomous reporting cadence
+   - `reporting_cadence` now has a live MVP effect for `daily` and `weekly`
+   - the default live app can run an in-process scheduler that periodically publishes project reports through the existing `publish_report` execution path
+   - `manual` and unsupported cadence values are intentionally skipped by the scheduler
+
+8. confirm first goal intake
 
 ## 8.3 Gate checks
 

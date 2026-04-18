@@ -21,6 +21,7 @@ MVP visibility primarily through Notion, with audit-first structure.
 - Sprint report
 
 - Project report
+  - current MVP also supports timer-driven autonomous publishing for `daily` and `weekly` cadences via an in-process scheduler
 
 - Risk report
 
