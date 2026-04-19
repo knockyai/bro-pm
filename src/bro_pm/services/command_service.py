@@ -13,6 +13,7 @@ from ..adapters.hermes_runtime import HermesAdapter
 from ..integrations import INTEGRATIONS, IntegrationError
 from ..policy import PolicyDecision, PolicyEngine
 from ..schemas import CommandProposal
+from .execution_outbox_service import ExecutionOutboxConflictError, ExecutionOutboxService
 
 
 @dataclass
@@ -101,6 +102,126 @@ class CommandService:
         if normalized not in INTEGRATIONS:
             return "notion"
         return normalized
+
+    def _build_integration_reservation_payload(
+        self,
+        *,
+        actor: str,
+        role: str,
+        actor_trusted: bool,
+        proposal: CommandProposal,
+        decision: PolicyDecision,
+        dry_run: bool,
+        validate_integration: bool,
+        execute_integration: bool,
+        integration_name: str,
+        integration_detail: str,
+        integration_payload: dict,
+    ) -> dict:
+        return {
+            "actor": actor,
+            "auth": {
+                "role": role,
+                "actor_trusted": actor_trusted,
+                "dry_run": dry_run,
+                "validate_integration": validate_integration,
+                "execute_integration": execute_integration,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": decision.__dict__,
+            "integration": {
+                "name": integration_name,
+                "action": proposal.action,
+                "status": "pending",
+                "detail": integration_detail,
+            },
+            "integration_payload": integration_payload,
+        }
+
+    def _reserve_integration_execution_isolated(
+        self,
+        *,
+        project_id: str | None,
+        actor: str,
+        proposal: CommandProposal,
+        idempotency_key: str,
+        reservation_payload: dict,
+        integration_name: str,
+    ) -> str:
+        reservation_session = Session(bind=self.db.get_bind(), future=True)
+        try:
+            reserved_record = models.AuditEvent(
+                project_id=project_id,
+                actor=actor,
+                action=proposal.action,
+                target_type="proposal",
+                target_id=proposal.project_id,
+                payload=json.dumps(reservation_payload, ensure_ascii=False),
+                result="pending_integration",
+                idempotency_key=idempotency_key,
+                created_at=datetime.utcnow(),
+            )
+            reservation_session.add(reserved_record)
+            reservation_session.flush()
+            reservation_session.add(
+                models.ActionExecution(
+                    audit_event_id=reserved_record.id,
+                    project_id=project_id,
+                    actor=actor,
+                    action=proposal.action,
+                    status="requested",
+                    requested_at=datetime.utcnow(),
+                )
+            )
+            reservation_session.add(
+                models.ExecutionOutbox(
+                    audit_event_id=reserved_record.id,
+                    project_id=project_id,
+                    execution_kind="integration_execute",
+                    integration_name=integration_name,
+                    integration_action=proposal.action,
+                    payload_json=reservation_payload,
+                    status="queued",
+                    available_at=datetime.utcnow(),
+                )
+            )
+            reservation_session.commit()
+            return reserved_record.id
+        except Exception:
+            reservation_session.rollback()
+            raise
+        finally:
+            reservation_session.close()
+
+    def _process_execution_outbox_isolated(
+        self,
+        *,
+        audit_event_id: str,
+        worker_id: str,
+    ) -> models.AuditEvent:
+        if self._caller_session_holds_sqlite_write_transaction():
+            raise UnsafeIsolatedSqlitePersistenceError(self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL)
+
+        processing_session = Session(bind=self.db.get_bind(), future=True)
+        try:
+            worker = ExecutionOutboxService(db_session=processing_session)
+            worker.process_for_audit_event(audit_event_id=audit_event_id, worker_id=worker_id)
+            audit_event = processing_session.get(models.AuditEvent, audit_event_id)
+            if audit_event is None:
+                raise RuntimeError(f"audit event missing: {audit_event_id}")
+            processing_session.expunge(audit_event)
+            return audit_event
+        finally:
+            processing_session.close()
+
+    def _outbox_exists_for_audit(self, audit_event_id: str) -> bool:
+        with self.db.no_autoflush:
+            return (
+                self.db.query(models.ExecutionOutbox)
+                .filter_by(audit_event_id=audit_event_id)
+                .one_or_none()
+                is not None
+            )
 
     def _record_action_execution(
         self,
@@ -554,6 +675,7 @@ class CommandService:
         detail = decision.reason
         stored_result = "denied"
         reserved_integration_record: models.AuditEvent | None = None
+        reserved_integration_processed = False
         unexpected_execute_exc: Exception | None = None
 
         if decision.allowed:
@@ -600,43 +722,33 @@ class CommandService:
                             detail = self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL
                             success = False
                         else:
-                            reservation_payload = {
-                                "actor": actor,
-                                "auth": {
-                                    "role": role,
-                                    "actor_trusted": actor_trusted,
-                                    "dry_run": dry_run,
-                                    "validate_integration": validate_integration,
-                                    "execute_integration": execute_integration,
-                                },
-                                "proposal": proposal.model_dump(),
-                                "policy": decision.__dict__,
-                                "integration": {
-                                    "name": integration_name,
-                                    "action": proposal.action,
-                                    "status": "pending",
-                                    "detail": f"{integration_name} integration execution pending",
-                                },
-                            }
+                            reservation_payload = self._build_integration_reservation_payload(
+                                actor=actor,
+                                role=role,
+                                actor_trusted=actor_trusted,
+                                proposal=proposal,
+                                decision=decision,
+                                dry_run=dry_run,
+                                validate_integration=validate_integration,
+                                execute_integration=execute_integration,
+                                integration_name=integration_name,
+                                integration_detail=f"{integration_name} integration execution pending",
+                                integration_payload=self._integration_payload(
+                                    project_id=project_id,
+                                    proposal_payload=proposal.payload,
+                                ),
+                            )
                             reservation_id: str | None = None
-                            reservation_session = Session(bind=self.db.get_bind(), future=True)
                             try:
-                                reserved_integration_record = models.AuditEvent(
+                                reservation_id = self._reserve_integration_execution_isolated(
                                     project_id=project_id,
                                     actor=actor,
-                                    action=proposal.action,
-                                    target_type="proposal",
-                                    target_id=proposal.project_id,
-                                    payload=json.dumps(reservation_payload, ensure_ascii=False),
-                                    result="pending_integration",
+                                    proposal=proposal,
                                     idempotency_key=idempotency_key,
-                                    created_at=datetime.utcnow(),
+                                    reservation_payload=reservation_payload,
+                                    integration_name=integration_name,
                                 )
-                                reservation_session.add(reserved_integration_record)
-                                reservation_session.commit()
-                                reservation_id = reserved_integration_record.id
                             except IntegrityError:
-                                reservation_session.rollback()
                                 existing = self._wait_for_existing_idempotent_record(
                                     idempotency_key,
                                     wait_for_stable_result=True,
@@ -648,28 +760,64 @@ class CommandService:
                                         proposal=proposal,
                                     )
                                 raise
-                            finally:
-                                reservation_session.close()
 
                             with self.db.no_autoflush:
                                 reserved_integration_record = self.db.query(models.AuditEvent).filter_by(id=reservation_id).one()
 
                     if success:
                         try:
-                            integration_result = integration.execute(
-                                action="create_task",
-                                payload=self._integration_payload(project_id=project_id, proposal_payload=proposal.payload),
-                            )
-                            if integration_result.ok:
-                                response_result = "executed"
-                                stored_result = "accepted"
-                                detail = integration_result.detail or f"{integration_name} executed: create_task"
-                                success = True
+                            if reserved_integration_record is not None:
+                                processed_record = self._process_execution_outbox_isolated(
+                                    audit_event_id=reserved_integration_record.id,
+                                    worker_id="command-service-inline",
+                                )
+                                reserved_integration_record.payload = processed_record.payload
+                                reserved_integration_record.result = processed_record.result
+                                processed_payload = json.loads(processed_record.payload)
+                                processed_integration = self._mapping_payload_member(processed_payload, "integration")
+                                detail = processed_integration.get("detail", detail)
+                                reserved_integration_processed = True
+                                if processed_record.result == "executed":
+                                    response_result = "executed"
+                                    stored_result = "executed"
+                                    success = True
+                                else:
+                                    response_result = "rejected"
+                                    stored_result = "denied"
+                                    success = False
                             else:
-                                response_result = "rejected"
-                                stored_result = "denied"
-                                detail = integration_result.detail or "integration execution reported failure"
-                                success = False
+                                integration_result = integration.execute(
+                                    action="create_task",
+                                    payload=self._integration_payload(project_id=project_id, proposal_payload=proposal.payload),
+                                )
+                                if integration_result.ok:
+                                    response_result = "executed"
+                                    stored_result = "accepted"
+                                    detail = integration_result.detail or f"{integration_name} executed: create_task"
+                                    success = True
+                                else:
+                                    response_result = "rejected"
+                                    stored_result = "denied"
+                                    detail = integration_result.detail or "integration execution reported failure"
+                                    success = False
+                        except ExecutionOutboxConflictError:
+                            existing = self._wait_for_existing_idempotent_record(
+                                idempotency_key,
+                                wait_for_stable_result=True,
+                            )
+                            if existing is not None:
+                                return self._replay_existing_execution(
+                                    existing=existing,
+                                    replay_context=replay_context,
+                                    proposal=proposal,
+                                )
+                            return ProposalExecution(
+                                success=True,
+                                proposal=proposal,
+                                audit_id=reserved_integration_record.id if reserved_integration_record is not None else "",
+                                result="accepted",
+                                detail="idempotent request still pending integration execution",
+                            )
                         except IntegrationError as exc:
                             response_result = "rejected"
                             stored_result = "denied"
@@ -718,16 +866,17 @@ class CommandService:
             }
 
         if reserved_integration_record is not None:
-            final_reserved_result = stored_result
-            if success and response_result == "executed" and not dry_run:
-                final_reserved_result = "executed"
-            self._persist_audit_event_result_isolated(
-                audit_event_id=reserved_integration_record.id,
-                payload=payload,
-                result=final_reserved_result,
-            )
-            reserved_integration_record.payload = json.dumps(payload, ensure_ascii=False)
-            reserved_integration_record.result = final_reserved_result
+            if not reserved_integration_processed:
+                final_reserved_result = stored_result
+                if success and response_result == "executed" and not dry_run:
+                    final_reserved_result = "executed"
+                self._persist_audit_event_result_isolated(
+                    audit_event_id=reserved_integration_record.id,
+                    payload=payload,
+                    result=final_reserved_result,
+                )
+                reserved_integration_record.payload = json.dumps(payload, ensure_ascii=False)
+                reserved_integration_record.result = final_reserved_result
             record = reserved_integration_record
         else:
             record = models.AuditEvent(
@@ -769,24 +918,28 @@ class CommandService:
         elif stored_result in {"validated", "simulated", "denied"}:
             execution_status = stored_result
 
-        self._record_action_execution(
-            audit_event_id=record.id,
-            actor=actor,
-            project_id=project_id,
-            action=proposal.action,
-            status=execution_status,
-            requested_at=execution_requested_at,
-            awaiting_approval_at=execution_awaiting_approval_at,
-            executed_at=execution_executed_at,
-            verified_at=execution_verified_at,
+        should_manage_execution_record = not (
+            reserved_integration_record is not None and execute_integration and not dry_run
         )
-        if stored_result == "awaiting_approval":
-            self._ensure_approval_request(
-                audit_event=record,
+        if should_manage_execution_record:
+            self._record_action_execution(
+                audit_event_id=record.id,
                 actor=actor,
-                proposal=proposal,
+                project_id=project_id,
+                action=proposal.action,
+                status=execution_status,
                 requested_at=execution_requested_at,
+                awaiting_approval_at=execution_awaiting_approval_at,
+                executed_at=execution_executed_at,
+                verified_at=execution_verified_at,
             )
+            if stored_result == "awaiting_approval":
+                self._ensure_approval_request(
+                    audit_event=record,
+                    actor=actor,
+                    proposal=proposal,
+                    requested_at=execution_requested_at,
+                )
 
         if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
@@ -1102,7 +1255,7 @@ class CommandService:
         attempts: int = PENDING_INTEGRATION_WAIT_ATTEMPTS,
         delay_seconds: float = PENDING_INTEGRATION_WAIT_DELAY_SECONDS,
     ) -> None:
-        if self._sqlite_side_session_isolation_is_unsafe() and self._caller_session_holds_sqlite_write_transaction():
+        if self._caller_session_holds_sqlite_write_transaction():
             raise UnsafeIsolatedSqlitePersistenceError(self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL)
 
         for attempt in range(attempts):
@@ -1113,6 +1266,34 @@ class CommandService:
                     raise RuntimeError(f"audit event missing: {audit_event_id}")
                 audit_event.payload = json.dumps(payload, ensure_ascii=False)
                 audit_event.result = result
+                persistence_session.commit()
+                return
+            except OperationalError as exc:
+                persistence_session.rollback()
+                if not self._is_retryable_sqlite_lock_error(exc) or attempt >= attempts - 1:
+                    raise
+                time.sleep(delay_seconds)
+            finally:
+                persistence_session.close()
+
+    def _persist_action_execution_status_isolated(
+        self,
+        *,
+        audit_event_id: str,
+        status: str,
+        attempts: int = PENDING_INTEGRATION_WAIT_ATTEMPTS,
+        delay_seconds: float = PENDING_INTEGRATION_WAIT_DELAY_SECONDS,
+    ) -> None:
+        if self._caller_session_holds_sqlite_write_transaction():
+            raise UnsafeIsolatedSqlitePersistenceError(self.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL)
+
+        for attempt in range(attempts):
+            persistence_session = Session(bind=self.db.get_bind(), future=True)
+            try:
+                execution = persistence_session.query(models.ActionExecution).filter_by(audit_event_id=audit_event_id).one_or_none()
+                if execution is None:
+                    return
+                execution.status = status
                 persistence_session.commit()
                 return
             except OperationalError as exc:
@@ -1355,8 +1536,15 @@ class CommandService:
             payload=payload,
             result="denied",
         )
+        self._persist_action_execution_status_isolated(
+            audit_event_id=existing.id,
+            status="denied",
+        )
         existing.payload = json.dumps(payload, ensure_ascii=False)
         existing.result = "denied"
+        execution_record = self.db.query(models.ActionExecution).filter_by(audit_event_id=existing.id).one_or_none()
+        if execution_record is not None:
+            execution_record.status = "denied"
         return existing, repair_payload
 
     def _replay_existing_execution(
@@ -1366,12 +1554,79 @@ class CommandService:
         replay_context: dict,
         proposal: CommandProposal,
     ) -> ProposalExecution:
+        try:
+            replay_gate_payload = json.loads(existing.payload) if existing.payload else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            replay_gate_payload = {}
+        if not isinstance(replay_gate_payload, dict):
+            replay_gate_payload = {}
+        replay_gate_auth = self._mapping_payload_member(replay_gate_payload, "auth")
+        replay_gate_context = {
+            "actor": existing.actor,
+            "role": replay_gate_auth.get("role"),
+            "actor_trusted": replay_gate_auth.get("actor_trusted"),
+            "proposal": replay_gate_payload.get("proposal", {}),
+            "dry_run": replay_gate_auth.get("dry_run", False),
+            "validate_integration": replay_gate_auth.get("validate_integration", False),
+            "execute_integration": replay_gate_auth.get("execute_integration", False),
+        }
+        can_process_stale_outbox = (
+            self._stored_payload_has_complete_replay_context(replay_gate_payload)
+            and replay_gate_context == replay_context
+        )
         repaired_stale_payload = False
         if self._can_repair_stale_pending_integration_replay(
             existing=existing,
             replay_context=replay_context,
             proposal=proposal,
         ):
+            if self._outbox_exists_for_audit(existing.id) and can_process_stale_outbox:
+                try:
+                    processed_record = self._process_execution_outbox_isolated(
+                        audit_event_id=existing.id,
+                        worker_id="command-service-replay",
+                    )
+                except UnsafeIsolatedSqlitePersistenceError as exc:
+                    return ProposalExecution(
+                        success=False,
+                        proposal=proposal,
+                        audit_id=existing.id,
+                        result="rejected",
+                        detail=str(exc),
+                    )
+                except ExecutionOutboxConflictError:
+                    latest_existing = existing
+                    if existing.idempotency_key:
+                        if self._sqlite_side_session_isolation_is_unsafe():
+                            latest_existing = self._load_existing_idempotent_record_in_caller_session(existing.idempotency_key)
+                        else:
+                            latest_existing = self._load_existing_idempotent_record_snapshot(existing.idempotency_key)
+                    if latest_existing is not None:
+                        existing = latest_existing
+                        if existing.result != "pending_integration":
+                            return self._replay_existing_execution(
+                                existing=existing,
+                                replay_context=replay_context,
+                                proposal=proposal,
+                            )
+                    try:
+                        conflict_payload = json.loads(existing.payload) if existing.payload else {}
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        conflict_payload = {}
+                    conflict_integration = self._mapping_payload_member(conflict_payload, "integration")
+                    return ProposalExecution(
+                        success=True,
+                        proposal=proposal,
+                        audit_id=existing.id,
+                        result="accepted",
+                        detail=conflict_integration.get("detail") or "idempotent request still pending integration execution",
+                    )
+                else:
+                    return self._replay_existing_execution(
+                        existing=processed_record,
+                        replay_context=replay_context,
+                        proposal=proposal,
+                    )
             if self._caller_session_holds_sqlite_write_transaction():
                 return ProposalExecution(
                     success=False,
@@ -1562,11 +1817,11 @@ class CommandService:
             )
         if existing.result == "pending_integration":
             return ProposalExecution(
-                success=False,
+                success=True,
                 proposal=proposal,
                 audit_id=existing.id,
-                result="rejected",
-                detail="idempotent request still pending integration execution",
+                result="accepted",
+                detail=integration_detail or "idempotent request still pending integration execution",
             )
         return ProposalExecution(
             success=True,

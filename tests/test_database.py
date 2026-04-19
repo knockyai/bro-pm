@@ -136,6 +136,7 @@ def test_database_module_import_and_init_db_with_memory_url(monkeypatch):
     assert "tasks" in tables
     assert "audit_events" in tables
     assert "action_executions" in tables
+    assert "execution_outbox" in tables
 
 
 def test_init_db_adds_goal_id_to_legacy_tasks_schema(tmp_path):

@@ -17,6 +17,7 @@ from bro_pm.adapters.hermes_runtime import HermesAdapter
 from bro_pm.schemas import CommandProposal
 from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
 from bro_pm.services.command_service import CommandService
+from bro_pm.services.execution_outbox_service import ExecutionOutboxConflictError
 from bro_pm import models
 
 
@@ -809,8 +810,25 @@ def test_command_service_create_task_assisted_execution_commits_pending_reservat
                 "status": "pending",
                 "detail": "notion integration execution pending",
             },
+            "integration_payload": {
+                "project_id": project_id,
+                "title": "durable pending reservation",
+                "raw_command": "create task durable pending reservation",
+            },
         },
     }
+
+    observer_session = database.SessionLocal()
+    try:
+        outbox_item = observer_session.query(models.ExecutionOutbox).filter_by(audit_event_id=execution.audit_id).one()
+    finally:
+        observer_session.close()
+
+    assert outbox_item.integration_name == "notion"
+    assert outbox_item.integration_action == "create_task"
+    assert outbox_item.status == "completed"
+    assert outbox_item.claimed_at is not None
+    assert outbox_item.completed_at is not None
 
 
 def test_command_service_create_task_assisted_execution_pending_reservation_does_not_commit_unrelated_session_changes(tmp_path):
@@ -2081,6 +2099,112 @@ def test_command_service_create_task_assisted_execution_recovers_stale_pending_i
     assert stored_payload["integration"]["detail"] == stale_detail
 
 
+def test_command_service_stale_unreadable_payload_with_outbox_does_not_execute_legacy_work(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    idempotency_key = "stale-unreadable-with-outbox"
+    stale_detail = "stale pending integration request requires manual reconciliation before retry"
+
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted stale unreadable with outbox",
+            slug="assisted-stale-unreadable-outbox",
+        )
+        legacy_payload = {
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "legacy pending integration execution",
+            },
+            "integration_payload": {
+                "project_id": project.id,
+                "title": "legacy task title",
+                "raw_command": "create task legacy task title",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload="{legacy-pending-json",
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        setup_session.add(audit)
+        setup_session.flush()
+        setup_session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project.id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=legacy_payload,
+                status="queued",
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        notion = INTEGRATIONS["notion"]
+        call_counter = {"execute": 0}
+
+        def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+            call_counter["execute"] += 1
+            return IntegrationResult(ok=True, detail="unexpected execution of legacy outbox work")
+
+        monkeypatch.setattr(notion, "execute", execute_stub)
+
+        proposal = service.parse(
+            actor="alice",
+            command="create task new request title",
+            project_id=project_id,
+        )
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+
+        stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        stored_payload = json.loads(stored.payload)
+    finally:
+        session.close()
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == stale_detail
+    assert call_counter["execute"] == 0
+    assert stored.result == "denied"
+    assert stored_payload["integration"]["status"] == "failed"
+    assert stored_payload["integration"]["detail"] == stale_detail
+
+
 
 def test_command_service_create_task_assisted_execution_recovers_stale_pending_idempotency_reservation_with_empty_payload(
     db_session, monkeypatch
@@ -3283,6 +3407,18 @@ def test_command_service_create_task_assisted_execution_recovers_stale_pending_i
             created_at=datetime.utcnow() - timedelta(minutes=10),
         )
     )
+    session.flush()
+    stale_audit = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    session.add(
+        models.ActionExecution(
+            audit_event_id=stale_audit.id,
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            status="requested",
+            requested_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+    )
     session.commit()
 
     first = service.execute(
@@ -3312,8 +3448,10 @@ def test_command_service_create_task_assisted_execution_recovers_stale_pending_i
     assert call_counter["execute"] == 0
 
     stored = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+    stored_execution = session.query(models.ActionExecution).filter_by(audit_event_id=stored.id).one()
     stored_payload = json.loads(stored.payload)
     assert stored.result == "denied"
+    assert stored_execution.status == "denied"
     assert stored_payload["actor"] == "alice"
     assert stored_payload["auth"] == {
         "role": "admin",
@@ -3327,6 +3465,357 @@ def test_command_service_create_task_assisted_execution_recovers_stale_pending_i
     assert stored_payload["integration"]["action"] == "create_task"
     assert stored_payload["integration"]["status"] == "failed"
     assert stored_payload["integration"]["detail"] == stale_detail
+
+
+def test_command_service_create_task_assisted_execution_replays_stale_pending_outbox_by_completing_worker_path(
+    tmp_path, monkeypatch
+):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted stale outbox replay project",
+            slug="assisted-stale-outbox-replay",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    notion = INTEGRATIONS["notion"]
+    idempotency_key = "assisted-stale-outbox-replay"
+    call_counter = {"execute": 0}
+
+    def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+        call_counter["execute"] += 1
+        assert action == "create_task"
+        assert payload["project_id"] == project_id
+        return IntegrationResult(ok=True, detail="notion executed from stale outbox replay")
+
+    monkeypatch.setattr(notion, "execute", execute_stub)
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task stale outbox replay",
+            project_id=project_id,
+        )
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project_id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project_id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="queued",
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+        session.commit()
+
+        assert execution.success is True
+        assert execution.result == "executed"
+        assert execution.detail == "notion executed from stale outbox replay"
+        assert call_counter["execute"] == 1
+
+        stored_audit = session.query(models.AuditEvent).filter_by(id=execution.audit_id).one()
+        stored_payload = json.loads(stored_audit.payload)
+        stored_execution = session.query(models.ActionExecution).filter_by(audit_event_id=execution.audit_id).one()
+        stored_outbox = session.query(models.ExecutionOutbox).filter_by(audit_event_id=execution.audit_id).one()
+    finally:
+        session.close()
+
+    assert stored_audit.result == "executed"
+    assert stored_payload["integration"]["status"] == "executed"
+    assert stored_payload["integration"]["detail"] == "notion executed from stale outbox replay"
+    assert stored_execution.status == "verified"
+    assert stored_execution.executed_at is not None
+    assert stored_execution.verified_at is not None
+    assert stored_outbox.status == "completed"
+    assert stored_outbox.completed_at is not None
+
+
+def test_command_service_stale_outbox_replay_returns_rejected_when_sqlite_side_session_is_unsafe(monkeypatch):
+    _, session = _make_isolated_db_session()
+    try:
+        project = _create_project(
+            session,
+            name="Assisted stale outbox sqlite unsafe project",
+            slug="assisted-stale-outbox-sqlite-unsafe",
+        )
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task sqlite stale outbox replay",
+            project_id=project.id,
+        )
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project.id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key="sqlite-unsafe-stale-outbox-replay",
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project.id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project.id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="queued",
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.flush()
+
+        project.description = "hold caller sqlite write transaction open"
+        session.flush()
+
+        notion = INTEGRATIONS["notion"]
+        call_counter = {"execute": 0}
+        original_execute = notion.execute
+
+        def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+            call_counter["execute"] += 1
+            return IntegrationResult(ok=True, detail="unexpected live execution")
+
+        monkeypatch.setattr(notion, "execute", execute_stub)
+        try:
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="sqlite-unsafe-stale-outbox-replay",
+                execute_integration=True,
+            )
+        finally:
+            monkeypatch.setattr(notion, "execute", original_execute)
+    finally:
+        session.close()
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == service.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL
+    assert call_counter["execute"] == 0
+
+
+def test_command_service_file_backed_stale_outbox_replay_rejects_when_caller_holds_sqlite_write_transaction(
+    tmp_path, monkeypatch
+):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="File-backed stale outbox sqlite unsafe project",
+            slug="file-backed-stale-outbox-sqlite-unsafe",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        proposal = service.parse(
+            actor="alice",
+            command="create task file-backed sqlite stale outbox replay",
+            project_id=project_id,
+        )
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project_id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project_id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key="file-backed-sqlite-unsafe-stale-outbox-replay",
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="queued",
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+        project = session.get(models.Project, project_id)
+        project.description = "hold caller sqlite write transaction open for stale replay"
+        session.flush()
+
+        notion = INTEGRATIONS["notion"]
+        call_counter = {"execute": 0}
+        original_execute = notion.execute
+
+        def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+            call_counter["execute"] += 1
+            return IntegrationResult(ok=True, detail="unexpected live execution")
+
+        monkeypatch.setattr(notion, "execute", execute_stub)
+        try:
+            execution = service.execute(
+                actor="alice",
+                role="admin",
+                proposal=proposal,
+                actor_trusted=True,
+                idempotency_key="file-backed-sqlite-unsafe-stale-outbox-replay",
+                execute_integration=True,
+            )
+        finally:
+            monkeypatch.setattr(notion, "execute", original_execute)
+    finally:
+        session.close()
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == service.SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL
+    assert call_counter["execute"] == 0
 
 
 def test_command_service_create_task_assisted_execution_waits_for_fresh_pending_idempotency_reservation(
@@ -3445,6 +3934,544 @@ def test_command_service_create_task_assisted_execution_waits_for_fresh_pending_
     assert execution.result == "executed"
     assert execution.detail == "notion executed after wait"
     assert call_counter == {"execute": 0, "wait": 1}
+
+
+def test_command_service_assisted_execution_replays_after_inline_outbox_claim_conflict(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted inline claim conflict project",
+            slug="assisted-inline-claim-conflict",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        notion = INTEGRATIONS["notion"]
+        idempotency_key = "assisted-inline-claim-conflict"
+        call_counter = {"execute": 0, "wait": 0, "conflict": 0}
+
+        def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+            call_counter["execute"] += 1
+            return IntegrationResult(ok=True, detail="unexpected inline execution")
+
+        monkeypatch.setattr(notion, "execute", execute_stub)
+
+        proposal = service.parse(
+            actor="alice",
+            command="create task inline claim conflict",
+            project_id=project_id,
+        )
+
+        def conflict_stub(*, audit_event_id: str, worker_id: str):
+            call_counter["conflict"] += 1
+            raise ExecutionOutboxConflictError("execution already claimed by another worker")
+
+        def wait_stub(idempotency_key_arg: str | None, *, attempts: int = 50, delay_seconds: float = 0.01, wait_for_stable_result: bool = False):
+            call_counter["wait"] += 1
+            assert idempotency_key_arg == idempotency_key
+            assert wait_for_stable_result is True
+            existing = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+            existing.result = "executed"
+            existing.payload = json.dumps(
+                {
+                    "actor": "alice",
+                    "auth": {
+                        "role": "admin",
+                        "actor_trusted": True,
+                        "dry_run": False,
+                        "validate_integration": False,
+                        "execute_integration": True,
+                    },
+                    "proposal": proposal.model_dump(),
+                    "policy": {
+                        "allowed": True,
+                        "reason": "policy accepted",
+                        "requires_approval": False,
+                        "safe_pause_blocked": False,
+                    },
+                    "integration": {
+                        "name": "notion",
+                        "action": "create_task",
+                        "status": "executed",
+                        "detail": "notion executed by external worker after claim conflict",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            session.flush()
+            return existing
+
+        monkeypatch.setattr(service, "_process_execution_outbox_isolated", conflict_stub)
+        monkeypatch.setattr(service, "_wait_for_existing_idempotent_record", wait_stub)
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+    finally:
+        session.close()
+
+    assert execution.success is True
+    assert execution.result == "executed"
+    assert execution.detail == "notion executed by external worker after claim conflict"
+    assert call_counter == {"execute": 0, "wait": 1, "conflict": 1}
+
+
+def test_command_service_duplicate_pending_integration_request_replays_as_accepted(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Pending replay accepted project",
+            slug="pending-replay-accepted",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        idempotency_key = "pending-replay-accepted"
+        notion = INTEGRATIONS["notion"]
+
+        def execute_forbidden(*, action: str, payload: dict) -> IntegrationResult:
+            raise AssertionError("integration execute must not rerun while durable outbox work is still pending")
+
+        monkeypatch.setattr(notion, "execute", execute_forbidden)
+
+        proposal = service.parse(
+            actor="alice",
+            command="create task pending replay accepted",
+            project_id=project_id,
+        )
+
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+            "integration_payload": {
+                "project_id": project_id,
+                "title": "pending replay accepted",
+                "raw_command": "create task pending replay accepted",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project_id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project_id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow(),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="claimed",
+                claim_token="pending-replay-claim-token",
+                claimed_by="worker-b",
+                claimed_at=datetime.utcnow(),
+                available_at=datetime.utcnow(),
+            )
+        )
+        session.commit()
+
+        existing = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+
+        def wait_stub(idempotency_key_arg: str | None, *, attempts: int = 50, delay_seconds: float = 0.01, wait_for_stable_result: bool = False):
+            assert idempotency_key_arg == idempotency_key
+            assert wait_for_stable_result is True
+            return existing
+
+        monkeypatch.setattr(service, "_wait_for_existing_idempotent_record", wait_stub)
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+    finally:
+        session.close()
+
+    assert execution.success is True
+    assert execution.result == "accepted"
+    assert execution.detail == "notion integration execution pending"
+
+
+def test_command_service_stale_pending_replay_conflict_reloads_terminal_audit_state(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale replay terminal reload project",
+            slug="stale-replay-terminal-reload",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        idempotency_key = "stale-replay-terminal-reload"
+        proposal = service.parse(
+            actor="alice",
+            command="create task stale replay terminal reload",
+            project_id=project_id,
+        )
+
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+            "integration_payload": {
+                "project_id": project_id,
+                "title": "stale replay terminal reload",
+                "raw_command": "create task stale replay terminal reload",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project_id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project_id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="claimed",
+                claim_token="terminal-reload-claim-token",
+                claimed_by="worker-b",
+                claimed_at=datetime.utcnow(),
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+        def conflict_then_terminal(*, audit_event_id: str, worker_id: str):
+            updater = database.SessionLocal()
+            try:
+                latest = updater.get(models.AuditEvent, audit_event_id)
+                latest.payload = json.dumps(
+                    {
+                        **payload,
+                        "integration": {
+                            "name": "notion",
+                            "action": "create_task",
+                            "status": "rejected",
+                            "detail": "remote worker already failed it",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                latest.result = "denied"
+                updater.query(models.ActionExecution).filter_by(audit_event_id=audit_event_id).update(
+                    {models.ActionExecution.status: "denied"},
+                    synchronize_session=False,
+                )
+                updater.query(models.ExecutionOutbox).filter_by(audit_event_id=audit_event_id).update(
+                    {
+                        models.ExecutionOutbox.status: "failed",
+                        models.ExecutionOutbox.last_error: "remote worker already failed it",
+                        models.ExecutionOutbox.failed_at: datetime.utcnow(),
+                        models.ExecutionOutbox.claim_token: None,
+                    },
+                    synchronize_session=False,
+                )
+                updater.commit()
+            finally:
+                updater.close()
+            raise ExecutionOutboxConflictError("execution outbox item is already claimed by another worker")
+
+        monkeypatch.setattr(service, "_process_execution_outbox_isolated", conflict_then_terminal)
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+    finally:
+        session.close()
+
+    assert execution.success is False
+    assert execution.result == "rejected"
+    assert execution.detail == "remote worker already failed it"
+
+
+def test_command_service_stale_pending_replay_with_fresh_external_claim_returns_accepted(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Stale pending external claim project",
+            slug="stale-pending-external-claim",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        idempotency_key = "stale-pending-external-claim"
+        proposal = service.parse(
+            actor="alice",
+            command="create task stale pending external claim",
+            project_id=project_id,
+        )
+
+        payload = {
+            "actor": "alice",
+            "auth": {
+                "role": "admin",
+                "actor_trusted": True,
+                "dry_run": False,
+                "validate_integration": False,
+                "execute_integration": True,
+            },
+            "proposal": proposal.model_dump(),
+            "policy": {
+                "allowed": True,
+                "reason": "policy accepted",
+                "requires_approval": False,
+                "safe_pause_blocked": False,
+            },
+            "integration": {
+                "name": "notion",
+                "action": "create_task",
+                "status": "pending",
+                "detail": "notion integration execution pending",
+            },
+            "integration_payload": {
+                "project_id": project_id,
+                "title": "stale pending external claim",
+                "raw_command": "create task stale pending external claim",
+            },
+        }
+        audit = models.AuditEvent(
+            project_id=project_id,
+            actor="alice",
+            action="create_task",
+            target_type="proposal",
+            target_id=project_id,
+            payload=json.dumps(payload, ensure_ascii=False),
+            result="pending_integration",
+            idempotency_key=idempotency_key,
+            created_at=datetime.utcnow() - timedelta(minutes=10),
+        )
+        session.add(audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                actor="alice",
+                action="create_task",
+                status="requested",
+                requested_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            models.ExecutionOutbox(
+                audit_event_id=audit.id,
+                project_id=project_id,
+                execution_kind="integration_execute",
+                integration_name="notion",
+                integration_action="create_task",
+                payload_json=payload,
+                status="claimed",
+                claim_token="fresh-external-claim-token",
+                claimed_by="worker-b",
+                claimed_at=datetime.utcnow(),
+                available_at=datetime.utcnow() - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+    finally:
+        session.close()
+
+    assert execution.success is True
+    assert execution.result == "accepted"
+    assert execution.detail == "notion integration execution pending"
+
+
+def test_command_service_assisted_execution_claim_conflict_returns_accepted_while_worker_pending(tmp_path, monkeypatch):
+    database, _ = _make_file_backed_db_module(tmp_path)
+    setup_session = database.SessionLocal()
+    try:
+        project = _create_project(
+            setup_session,
+            name="Assisted claim conflict pending project",
+            slug="assisted-claim-conflict-pending",
+        )
+        setup_session.commit()
+        project_id = project.id
+    finally:
+        setup_session.close()
+
+    session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=session)
+        notion = INTEGRATIONS["notion"]
+        idempotency_key = "assisted-claim-conflict-pending"
+        call_counter = {"execute": 0, "wait": 0, "conflict": 0}
+
+        def execute_stub(*, action: str, payload: dict) -> IntegrationResult:
+            call_counter["execute"] += 1
+            return IntegrationResult(ok=True, detail="unexpected inline execution")
+
+        monkeypatch.setattr(notion, "execute", execute_stub)
+
+        proposal = service.parse(
+            actor="alice",
+            command="create task inline claim conflict pending",
+            project_id=project_id,
+        )
+
+        def conflict_stub(*, audit_event_id: str, worker_id: str):
+            call_counter["conflict"] += 1
+            raise ExecutionOutboxConflictError("execution already claimed by another worker")
+
+        def wait_stub(idempotency_key_arg: str | None, *, attempts: int = 50, delay_seconds: float = 0.01, wait_for_stable_result: bool = False):
+            call_counter["wait"] += 1
+            assert idempotency_key_arg == idempotency_key
+            assert wait_for_stable_result is True
+            existing = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+            outbox = session.query(models.ExecutionOutbox).filter_by(audit_event_id=existing.id).one()
+            outbox.status = "claimed"
+            outbox.claimed_by = "worker-b"
+            outbox.claim_token = "worker-b-claim-token"
+            outbox.claimed_at = datetime.utcnow()
+            session.flush()
+            return existing
+
+        monkeypatch.setattr(service, "_process_execution_outbox_isolated", conflict_stub)
+        monkeypatch.setattr(service, "_wait_for_existing_idempotent_record", wait_stub)
+
+        execution = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key=idempotency_key,
+            execute_integration=True,
+        )
+    finally:
+        session.close()
+
+    assert execution.success is True
+    assert execution.result == "accepted"
+    assert execution.detail == "notion integration execution pending"
+    assert call_counter == {"execute": 0, "wait": 1, "conflict": 1}
 
 
 

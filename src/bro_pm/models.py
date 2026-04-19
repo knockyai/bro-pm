@@ -171,6 +171,11 @@ class AuditEvent(Base):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    execution_outbox: Mapped["ExecutionOutbox | None"] = relationship(
+        back_populates="audit_event",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class ActionExecution(Base):
@@ -194,6 +199,36 @@ class ActionExecution(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     audit_event: Mapped[AuditEvent] = relationship(back_populates="action_execution")
+    project: Mapped[Project | None] = relationship()
+
+
+class ExecutionOutbox(Base):
+    __tablename__ = "execution_outbox"
+    __table_args__ = (
+        UniqueConstraint("audit_event_id", name="uq_execution_outbox_audit_event_id"),
+        Index("ix_execution_outbox_status_available_at", "status", "available_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    audit_event_id: Mapped[str] = mapped_column(String, ForeignKey("audit_events.id"), index=True)
+    project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    execution_kind: Mapped[str] = mapped_column(String(80), default="integration_execute")
+    integration_name: Mapped[str] = mapped_column(String(80))
+    integration_action: Mapped[str] = mapped_column(String(120))
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="queued")
+    available_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    audit_event: Mapped[AuditEvent] = relationship(back_populates="execution_outbox")
     project: Mapped[Project | None] = relationship()
 
 
