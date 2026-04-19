@@ -451,6 +451,82 @@ def test_run_due_decisions_once_creates_stalled_task_followup_from_progress_time
     assert "stalled" in payload["description"].lower()
 
 
+def test_run_due_decisions_once_uses_active_stalled_task_heuristic_and_stamps_metadata(decision_db, monkeypatch):
+    scheduler = importlib.import_module("bro_pm.services.report_scheduler")
+    now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)
+    project_id = _create_project(decision_db)
+    older_task_id = _create_task(
+        decision_db,
+        project_id,
+        assignee="alice",
+        status="in_progress",
+        last_progress_at=now - timedelta(hours=37),
+        title="Blocked beyond custom threshold",
+    )
+    _create_task(
+        decision_db,
+        project_id,
+        assignee="bob",
+        status="in_progress",
+        last_progress_at=now - timedelta(hours=30),
+        title="Still within custom threshold",
+    )
+
+    session = decision_db.SessionLocal()
+    try:
+        active = (
+            session.query(models.HeuristicVersion)
+            .filter_by(heuristic_key="stalled_task", is_active=True)
+            .one()
+        )
+        active.is_active = False
+        session.add(
+            models.HeuristicVersion(
+                family="decision_timer",
+                heuristic_key="stalled_task",
+                version=2,
+                description="Tighter stalled-task window",
+                config_json={"lookback_hours": 36},
+                is_active=True,
+                activated_at=now,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    create_calls: list[dict] = []
+
+    def execute_stub(*, action: str, payload: dict):
+        create_calls.append(payload)
+        return IntegrationResult(ok=True, detail="notion executed: create_task")
+
+    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
+
+    result = scheduler.run_due_decisions_once(session_factory=decision_db.SessionLocal, now=now)
+
+    assert result == 1
+    assert len(create_calls) == 1
+    payload = create_calls[0]
+    assert payload["trace_label"] == f"timer_stalled_task:{older_task_id}"
+    assert payload["heuristic"] == {
+        "family": "decision_timer",
+        "heuristic_key": "stalled_task",
+        "version": 2,
+        "config": {"lookback_hours": 36},
+    }
+
+    autonomy_events = _events_for(
+        decision_db,
+        project_id,
+        actor=scheduler.AUTONOMOUS_ACTOR,
+        action="create_task",
+    )
+    assert len(autonomy_events) == 1
+    audit_payload = _payload(autonomy_events[0])
+    assert audit_payload["proposal"]["payload"]["heuristic"] == payload["heuristic"]
+
+
 def test_run_due_decisions_once_creates_deadline_risk_followup_from_commitment_pressure(decision_db, monkeypatch):
     scheduler = importlib.import_module("bro_pm.services.report_scheduler")
     now = datetime(2026, 4, 18, 10, 4, tzinfo=timezone.utc)

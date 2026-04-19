@@ -185,6 +185,220 @@ def test_policy_versions_allow_only_one_active_row_per_policy_key(monkeypatch):
         db_session.close()
 
 
+def test_init_db_seeds_active_default_stalled_task_heuristic(monkeypatch):
+    monkeypatch.setenv("BRO_PM_DATABASE_URL", "sqlite:///:memory:")
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db("sqlite:///:memory:")
+
+    inspector = inspect(database._engine)
+    tables = set(inspector.get_table_names())
+    assert "heuristic_versions" in tables
+
+    db_session = database.SessionLocal()
+    try:
+        active_heuristic = (
+            db_session.query(models.HeuristicVersion)
+            .filter_by(heuristic_key="stalled_task", is_active=True)
+            .one()
+        )
+        assert active_heuristic.version == 1
+        assert active_heuristic.family == "decision_timer"
+        assert active_heuristic.config_json == {"lookback_hours": 48}
+    finally:
+        db_session.close()
+
+
+
+def test_init_db_adds_missing_heuristic_key_version_uniqueness_to_legacy_table(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'legacy_heuristic_versions.db'}"
+    legacy_engine = create_engine(db_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE heuristic_versions (
+                    id TEXT PRIMARY KEY,
+                    family TEXT NOT NULL,
+                    heuristic_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    config JSON NOT NULL DEFAULT '{}',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    activated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO heuristic_versions (
+                    id,
+                    family,
+                    heuristic_key,
+                    version,
+                    description,
+                    config,
+                    is_active,
+                    activated_at
+                ) VALUES (
+                    'heuristic-1',
+                    'decision_timer',
+                    'stalled_task',
+                    1,
+                    'legacy default stalled-task heuristic',
+                    '{"lookback_hours": 48}',
+                    1,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(db_url)
+
+    db_session = database.SessionLocal()
+    try:
+        db_session.add(
+            models.HeuristicVersion(
+                id="heuristic-duplicate",
+                family="decision_timer",
+                heuristic_key="stalled_task",
+                version=1,
+                description="duplicate version should be rejected",
+                config_json={"lookback_hours": 24},
+                is_active=False,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+    finally:
+        db_session.rollback()
+        db_session.close()
+
+
+
+def test_init_db_fails_closed_when_active_stalled_task_heuristic_config_is_invalid(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'invalid_stalled_task_heuristic.db'}"
+    legacy_engine = create_engine(db_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE heuristic_versions (
+                    id TEXT PRIMARY KEY,
+                    family TEXT NOT NULL,
+                    heuristic_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    config JSON NOT NULL DEFAULT '{}',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    activated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO heuristic_versions (
+                    id,
+                    family,
+                    heuristic_key,
+                    version,
+                    description,
+                    config,
+                    is_active,
+                    activated_at
+                ) VALUES (
+                    'heuristic-invalid',
+                    'decision_timer',
+                    'stalled_task',
+                    1,
+                    'legacy stalled-task heuristic missing lookback',
+                    '{}',
+                    1,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+
+    with pytest.raises(RuntimeError, match="positive integer lookback_hours"):
+        database.init_db(db_url)
+
+
+
+def test_init_db_fails_closed_when_heuristic_key_version_uniqueness_has_wrong_shape(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'wrong_shape_heuristic_uniqueness.db'}"
+    legacy_engine = create_engine(db_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE heuristic_versions (
+                    id TEXT PRIMARY KEY,
+                    family TEXT NOT NULL,
+                    heuristic_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    config JSON NOT NULL DEFAULT '{}',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    activated_at DATETIME
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX uq_heuristic_versions_key_version
+                ON heuristic_versions (family, version)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO heuristic_versions (
+                    id,
+                    family,
+                    heuristic_key,
+                    version,
+                    description,
+                    config,
+                    is_active,
+                    activated_at
+                ) VALUES (
+                    'heuristic-1',
+                    'decision_timer',
+                    'stalled_task',
+                    1,
+                    'legacy default stalled-task heuristic',
+                    '{"lookback_hours": 48}',
+                    1,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+
+    with pytest.raises(RuntimeError, match="unexpected shape"):
+        database.init_db(db_url)
+
+
 
 def test_init_db_fails_closed_when_default_policy_rows_exist_but_none_is_active(tmp_path):
     db_url = f"sqlite:///{tmp_path / 'inactive_default_policy.db'}"

@@ -26,10 +26,10 @@ DECISION_FAILURE_LOOKBACK = timedelta(hours=24)
 AUTONOMY_HEURISTIC_COOLDOWN = timedelta(hours=24)
 FAILURE_ESCALATION_THRESHOLD = 2
 OVERDUE_REPLAN_THRESHOLD = 3
-STALL_LOOKBACK = timedelta(days=2)
 COMMITMENT_SOON_WINDOW = timedelta(days=3)
 FAILURE_ACTIONS = frozenset({"create_task", "publish_report", "onboard_project"})
 TERMINAL_TASK_STATUSES = frozenset({"done", "closed", "cancelled", "failed", "archived"})
+STALLED_TASK_HEURISTIC_KEY = "stalled_task"
 
 
 @dataclass(frozen=True)
@@ -273,8 +273,47 @@ def _stalled_reference_at(task: models.Task) -> datetime:
     return _normalize_timestamp(task.last_progress_at or task.updated_at or task.created_at)
 
 
-def _first_stalled_task(tasks: list[models.Task], *, now: datetime) -> models.Task | None:
-    cutoff = now - STALL_LOOKBACK
+def _active_stalled_task_heuristic(session: Session) -> models.HeuristicVersion:
+    rows = (
+        session.query(models.HeuristicVersion)
+        .filter_by(heuristic_key=STALLED_TASK_HEURISTIC_KEY, is_active=True)
+        .order_by(models.HeuristicVersion.version.desc())
+        .all()
+    )
+    if len(rows) > 1:
+        raise RuntimeError("multiple active heuristic versions detected for stalled_task")
+    if not rows:
+        raise RuntimeError("active heuristic version not found for stalled_task")
+    heuristic = rows[0]
+    config = heuristic.config_json if isinstance(heuristic.config_json, dict) else {}
+    lookback_hours = config.get("lookback_hours")
+    if not isinstance(lookback_hours, int) or lookback_hours <= 0:
+        raise RuntimeError("active stalled_task heuristic is missing a positive integer lookback_hours")
+    return heuristic
+
+
+def _stalled_task_heuristic_payload(heuristic: models.HeuristicVersion) -> dict:
+    config = heuristic.config_json if isinstance(heuristic.config_json, dict) else {}
+    return {
+        "family": heuristic.family,
+        "heuristic_key": heuristic.heuristic_key,
+        "version": heuristic.version,
+        "config": dict(config),
+    }
+
+
+def _stalled_task_lookback(heuristic: models.HeuristicVersion) -> timedelta:
+    config = heuristic.config_json if isinstance(heuristic.config_json, dict) else {}
+    return timedelta(hours=config["lookback_hours"])
+
+
+def _first_stalled_task(
+    tasks: list[models.Task],
+    *,
+    now: datetime,
+    lookback: timedelta,
+) -> models.Task | None:
+    cutoff = now - lookback
     for task in tasks:
         if _stalled_reference_at(task) <= cutoff:
             return task
@@ -514,7 +553,13 @@ def _build_idle_executor_proposal(
     )
 
 
-def _build_stalled_task_proposal(project: models.Project, *, task: models.Task, stalled_since: datetime) -> CommandProposal:
+def _build_stalled_task_proposal(
+    project: models.Project,
+    *,
+    task: models.Task,
+    stalled_since: datetime,
+    heuristic: models.HeuristicVersion,
+) -> CommandProposal:
     return CommandProposal(
         action="create_task",
         project_id=project.id,
@@ -528,6 +573,7 @@ def _build_stalled_task_proposal(project: models.Project, *, task: models.Task, 
             ),
             "mode": "timer_autonomy",
             "trace_label": f"timer_stalled_task:{task.id}",
+            "heuristic": _stalled_task_heuristic_payload(heuristic),
         },
     )
 
@@ -654,7 +700,12 @@ def _run_due_project_decision(project_id: str, *, session_factory: sessionmaker,
             if decisions_taken:
                 return decisions_taken
 
-        stalled_task = _first_stalled_task(open_tasks, now=now)
+        stalled_task_heuristic = _active_stalled_task_heuristic(session)
+        stalled_task = _first_stalled_task(
+            open_tasks,
+            now=now,
+            lookback=_stalled_task_lookback(stalled_task_heuristic),
+        )
         if stalled_task is not None:
             stalled_trace_label = f"timer_stalled_task:{stalled_task.id}"
             if not _recent_autonomy_action_exists(
@@ -672,6 +723,7 @@ def _run_due_project_decision(project_id: str, *, session_factory: sessionmaker,
                     project,
                     task=stalled_task,
                     stalled_since=_stalled_reference_at(stalled_task),
+                    heuristic=stalled_task_heuristic,
                 )
                 decisions_taken += int(
                     _execute_autonomous_proposal(

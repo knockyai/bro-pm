@@ -314,6 +314,31 @@ class PolicyVersion(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class HeuristicVersion(Base):
+    __tablename__ = "heuristic_versions"
+    __table_args__ = (
+        UniqueConstraint("heuristic_key", "version", name="uq_heuristic_versions_key_version"),
+        Index(
+            "uq_heuristic_versions_active_key",
+            "heuristic_key",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+            postgresql_where=text("is_active = true"),
+        ),
+        Index("ix_heuristic_versions_key_is_active", "heuristic_key", "is_active"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    family: Mapped[str] = mapped_column(String(120))
+    heuristic_key: Mapped[str] = mapped_column(String(120))
+    version: Mapped[int] = mapped_column(Integer)
+    description: Mapped[str] = mapped_column(Text, default="")
+    config_json: Mapped[dict] = mapped_column("config", JSON, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class DueAction(Base):
     __tablename__ = "due_actions"
     __table_args__ = (
