@@ -4,6 +4,7 @@ from asyncio import Task
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 
 from ..config import settings
 from ..database import SessionLocal, init_db
@@ -51,6 +52,11 @@ def create_app(
         await stop_polling_task(scheduler_task)
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/onboarding/")
+
     app.include_router(ui_router, prefix="/onboarding")
     app.include_router(project_router, prefix="/api/v1")
     app.include_router(command_router, prefix="/api/v1")

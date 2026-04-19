@@ -650,8 +650,10 @@ python -m uvicorn bro_pm.api.app:app --reload
 Если нужен живой UI, открой в браузере:
 
 ```text
-http://127.0.0.1:8000/onboarding/
+http://127.0.0.1:8000/
 ```
+
+Корневой путь сейчас специально ведёт на demo entrypoint `/onboarding/`, чтобы сервис не открывался 404 на первом запуске.
 
 Что делает page flow:
 

@@ -123,6 +123,13 @@ def test_onboarding_page_renders_form(web_client: TestClient):
     assert 'value="notion"' not in body
 
 
+def test_root_redirects_to_onboarding(web_client: TestClient):
+    response = web_client.get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/onboarding/"
+
+
 def test_onboarding_page_submit_creates_project_credentials_and_goal(onboarding_context, monkeypatch):
     ui_module, database_session, db_module = onboarding_context
 
