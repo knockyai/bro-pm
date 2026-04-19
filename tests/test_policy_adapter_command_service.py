@@ -4271,6 +4271,196 @@ def test_command_service_approval_required_path_does_not_apply_action(db_session
     assert execution_record.awaiting_approval_at is not None
     assert execution_record.executed_at is None
     assert execution_record.verified_at is None
+    approval_request = session.query(models.ApprovalRequest).filter_by(audit_event_id=result.audit_id).one()
+    assert approval_request.project_id == project.id
+    assert approval_request.action == "pause_project"
+    assert approval_request.status == "pending"
+    assert approval_request.requested_by == "alice"
+    assert approval_request.requested_at is not None
+    assert approval_request.expires_at is not None
+
+
+def test_command_service_approved_action_requires_explicit_resume_and_executes_once(db_session):
+    session = db_session
+    project = _create_project(session, name="Approved resume project", slug="approved-resume")
+    service = CommandService(db_session=session)
+
+    protected = CommandProposal(
+        action="pause_project",
+        project_id=project.id,
+        reason="forced approval",
+        payload={"note": "bounded approval"},
+        requires_approval=True,
+    )
+    gated = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=protected,
+        actor_trusted=True,
+        idempotency_key="approval-resume-once",
+    )
+
+    approval = service.decide_approval(
+        audit_event_id=gated.audit_id,
+        actor="boss-user",
+        role="owner",
+        approved=True,
+        decision_text="approved",
+    )
+
+    session.refresh(project)
+    assert project.safe_paused is False
+    assert approval.status == "approved"
+    assert approval.reviewer_actor == "boss-user"
+    assert approval.reviewer_role == "owner"
+    assert approval.decision_text == "approved"
+    assert approval.decided_at is not None
+
+    resumed = service.resume_approval(
+        audit_event_id=gated.audit_id,
+        actor="alice",
+        role="admin",
+        actor_trusted=True,
+    )
+
+    assert resumed.success is True
+    assert resumed.result == "executed"
+    assert resumed.audit_id == gated.audit_id
+
+    session.refresh(project)
+    assert project.safe_paused is True
+
+    refreshed_approval = session.query(models.ApprovalRequest).filter_by(audit_event_id=gated.audit_id).one()
+    assert refreshed_approval.status == "executed"
+    assert refreshed_approval.resumed_at is not None
+
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=gated.audit_id).one()
+    assert execution_record.status == "verified"
+    assert execution_record.executed_at is not None
+    assert execution_record.verified_at is not None
+
+    replay = service.resume_approval(
+        audit_event_id=gated.audit_id,
+        actor="alice",
+        role="admin",
+        actor_trusted=True,
+    )
+    assert replay.success is True
+    assert replay.result == "executed"
+    assert replay.audit_id == gated.audit_id
+
+
+def test_command_service_rejected_approval_does_not_execute_downstream_action(db_session):
+    session = db_session
+    project = _create_project(session, name="Rejected approval project", slug="rejected-approval")
+    service = CommandService(db_session=session)
+
+    protected = CommandProposal(
+        action="pause_project",
+        project_id=project.id,
+        reason="forced approval",
+        payload={"note": "reject path"},
+        requires_approval=True,
+    )
+    gated = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=protected,
+        actor_trusted=True,
+    )
+
+    approval = service.decide_approval(
+        audit_event_id=gated.audit_id,
+        actor="boss-user",
+        role="owner",
+        approved=False,
+        decision_text="rejected",
+    )
+    assert approval.status == "rejected"
+
+    resumed = service.resume_approval(
+        audit_event_id=gated.audit_id,
+        actor="alice",
+        role="admin",
+        actor_trusted=True,
+    )
+    assert resumed.success is False
+    assert resumed.result == "rejected"
+
+    session.refresh(project)
+    assert project.safe_paused is False
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=gated.audit_id).one()
+    assert execution_record.status == "rejected"
+
+
+def test_command_service_idempotent_replay_prefers_durable_approval_state_after_restart(tmp_path):
+    database, db_path = _make_file_backed_db_module(tmp_path)
+    session = database.SessionLocal()
+    try:
+        project = _create_project(session, name="Durable replay approval", slug="durable-replay-approval")
+        service = CommandService(db_session=session)
+        proposal = CommandProposal(
+            action="pause_project",
+            project_id=project.id,
+            reason="forced approval",
+            payload={"note": "restart replay"},
+            requires_approval=True,
+        )
+        first = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key="durable-approval-replay",
+        )
+        service.decide_approval(
+            audit_event_id=first.audit_id,
+            actor="boss-user",
+            role="owner",
+            approved=True,
+            decision_text="approved after restart",
+        )
+
+        audit = session.get(models.AuditEvent, first.audit_id)
+        assert audit is not None
+        payload = json.loads(audit.payload)
+        payload.pop("approval", None)
+        audit.payload = json.dumps(payload, ensure_ascii=False)
+        audit.result = "awaiting_approval"
+        execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=first.audit_id).one()
+        execution_record.status = "awaiting_approval"
+        session.commit()
+    finally:
+        session.close()
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(f"sqlite:///{db_path}")
+    replay_session = database.SessionLocal()
+    try:
+        service = CommandService(db_session=replay_session)
+        stored_project = replay_session.query(models.Project).filter_by(slug="durable-replay-approval").one()
+        proposal = CommandProposal(
+            action="pause_project",
+            project_id=stored_project.id,
+            reason="forced approval",
+            payload={"note": "restart replay"},
+            requires_approval=True,
+        )
+        replay = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=proposal,
+            actor_trusted=True,
+            idempotency_key="durable-approval-replay",
+        )
+
+        assert replay.success is True
+        assert replay.result == "approved"
+        approval = replay_session.query(models.ApprovalRequest).filter_by(audit_event_id=replay.audit_id).one()
+        assert approval.status == "approved"
+    finally:
+        replay_session.close()
 
 
 def test_command_service_draft_boss_escalation_is_audit_only_and_no_mutation(db_session):

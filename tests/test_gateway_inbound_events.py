@@ -280,6 +280,17 @@ def test_gateway_inbound_event_updates_action_execution_status_for_approval_repl
                 awaiting_approval_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
         )
+        session.add(
+            models.ApprovalRequest(
+                audit_event_id=pending_audit.id,
+                project_id=project["id"],
+                action="draft_boss_escalation",
+                status="pending",
+                requested_by="alice",
+                requested_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                expires_at=(datetime.now(timezone.utc) + timedelta(days=7)).replace(tzinfo=None),
+            )
+        )
         session.commit()
         pending_audit_id = pending_audit.id
     finally:
@@ -305,6 +316,12 @@ def test_gateway_inbound_event_updates_action_execution_status_for_approval_repl
         assert execution.awaiting_approval_at is not None
         assert execution.executed_at is None
         assert execution.verified_at is None
+        approval = session.query(models.ApprovalRequest).filter_by(audit_event_id=pending_audit_id).one()
+        assert approval.status == "approved"
+        assert approval.reviewer_actor == "boss-user"
+        assert approval.reviewer_role == "boss"
+        assert approval.decision_text == "approved"
+        assert approval.decided_at is not None
     finally:
         session.close()
 

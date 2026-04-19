@@ -275,6 +275,31 @@ class ActionExecuteRequest(BaseModel):
     approved: bool = False
 
 
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=2, max_length=120)
+    role: str = Field(pattern="^(owner|admin|operator|viewer)$")
+    approved: bool
+    decision_text: str | None = Field(default=None, max_length=1000)
+
+
+class ApprovalDecisionResponse(BaseModel):
+    audit_id: str
+    approval_id: str
+    status: str
+    reviewer_actor: str | None = None
+    reviewer_role: str | None = None
+    decision_text: str | None = None
+
+
+class ApprovalResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=2, max_length=120)
+    role: str = Field(pattern="^(owner|admin|operator|viewer)$")
+
+
 class CommandResponse(BaseModel):
     accepted: bool
     result: str

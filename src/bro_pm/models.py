@@ -166,6 +166,11 @@ class AuditEvent(Base):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    approval_request: Mapped["ApprovalRequest | None"] = relationship(
+        back_populates="audit_event",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class ActionExecution(Base):
@@ -189,6 +194,34 @@ class ActionExecution(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     audit_event: Mapped[AuditEvent] = relationship(back_populates="action_execution")
+    project: Mapped[Project | None] = relationship()
+
+
+class ApprovalRequest(Base):
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        UniqueConstraint("audit_event_id", name="uq_approval_requests_audit_event_id"),
+        Index("ix_approval_requests_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    audit_event_id: Mapped[str] = mapped_column(String, ForeignKey("audit_events.id"), index=True)
+    project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    requested_by: Mapped[str] = mapped_column(String(120))
+    requested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewer_actor: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    reviewer_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    decision_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decision_payload_json: Mapped[dict | None] = mapped_column("decision_payload", JSON, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    audit_event: Mapped[AuditEvent] = relationship(back_populates="approval_request")
     project: Mapped[Project | None] = relationship()
 
 

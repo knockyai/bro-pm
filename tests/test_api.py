@@ -977,6 +977,73 @@ def test_api_command_draft_boss_escalation_idempotent_replay(api_client: TestCli
     assert first.json()["audit_id"] == second.json()["audit_id"]
 
 
+def test_api_command_approval_decision_and_resume_flow(api_client: TestClient):
+    project = _create_project(api_client)
+
+    db_module = importlib.import_module("bro_pm.database")
+    command_service = importlib.import_module("bro_pm.services.command_service")
+    schemas = importlib.import_module("bro_pm.schemas")
+
+    setup_session = db_module.SessionLocal()
+    try:
+        service = command_service.CommandService(db_session=setup_session)
+        gated = service.execute(
+            actor="alice",
+            role="admin",
+            proposal=schemas.CommandProposal(
+                action="pause_project",
+                project_id=project["id"],
+                reason="forced approval for API resume flow",
+                payload={"note": "api approval resume"},
+                requires_approval=True,
+            ),
+            actor_trusted=True,
+            idempotency_key="api-approval-resume",
+        )
+        setup_session.commit()
+    finally:
+        setup_session.close()
+
+    assert gated.result == "requires_approval"
+
+    decision = api_client.post(
+        f"/api/v1/commands/{gated.audit_id}/approval",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "actor": "boss-user",
+            "role": "owner",
+            "approved": True,
+            "decision_text": "approved",
+        },
+    )
+    assert decision.status_code == 200
+    assert decision.json()["status"] == "approved"
+    assert decision.json()["audit_id"] == gated.audit_id
+
+    resume = api_client.post(
+        f"/api/v1/commands/{gated.audit_id}/resume",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "actor": "alice",
+            "role": "admin",
+        },
+    )
+    assert resume.status_code == 200
+    assert resume.json()["result"] == "executed"
+    assert resume.json()["audit_id"] == gated.audit_id
+
+    session = db_module.SessionLocal()
+    try:
+        refreshed = session.get(models.Project, project["id"])
+        assert refreshed is not None
+        assert refreshed.safe_paused is True
+        approval = session.query(models.ApprovalRequest).filter_by(audit_event_id=gated.audit_id).one()
+        assert approval.status == "executed"
+        assert approval.reviewer_actor == "boss-user"
+    finally:
+        session.close()
+
+
 def test_api_draft_boss_escalation_rejects_viewer(api_client: TestClient):
     project = _create_project(api_client)
     response = api_client.post(

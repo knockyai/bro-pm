@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
+from .command_service import CommandService
 
 
 PENDING_STATUSES = frozenset({"pending"})
@@ -215,17 +216,17 @@ class GatewayService:
                     project=project,
                     actor=actor,
                 ):
-                    pending_audit.result = approval_status
-                    payload = self._audit_payload(pending_audit.payload)
-                    payload["approval"] = {
-                        "status": approval_status,
-                        "actor": actor.strip(),
-                        "actor_role": actor_role.strip() if isinstance(actor_role, str) and actor_role.strip() else None,
-                        "text": text.strip(),
-                    }
-                    pending_audit.payload = json.dumps(payload, ensure_ascii=False)
-                    if pending_audit.action_execution is not None:
-                        pending_audit.action_execution.status = approval_status
+                    approval_role = self._approval_role_for_actor(project=project, actor=actor)
+                    CommandService(db_session=self.db_session).decide_approval(
+                        audit_event_id=pending_audit.id,
+                        actor=actor.strip(),
+                        role=approval_role,
+                        reviewer_role=actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else None,
+                        approved=approval_status == "approved",
+                        decision_text=text.strip(),
+                        decision_payload={"source": "gateway_inbound", "actor_role": actor_role},
+                        actor_trusted=True,
+                    )
                     disposition = "approval_reply_recorded"
                     reason = "approval reply recorded for pending audit event"
 
@@ -331,6 +332,31 @@ class GatewayService:
         if normalized in {"reject", "rejected", "deny", "denied"}:
             return "rejected"
         return None
+
+    def _approval_role_for_actor(self, *, project: models.Project, actor: str) -> str:
+        normalized_actor = actor.strip().lower()
+        metadata = project.metadata_json if isinstance(project.metadata_json, dict) else {}
+        onboarding = metadata.get("onboarding") if isinstance(metadata.get("onboarding"), dict) else {}
+        boss = onboarding.get("boss")
+        admin = onboarding.get("admin")
+        if isinstance(admin, str) and admin.strip().lower() == normalized_actor:
+            return "admin"
+        if isinstance(boss, str) and boss.strip().lower() == normalized_actor:
+            return "owner"
+
+        membership = (
+            self.db_session.query(models.ProjectMembership)
+            .filter(
+                models.ProjectMembership.project_id == project.id,
+                models.ProjectMembership.actor == actor.strip(),
+            )
+            .one_or_none()
+        )
+        if membership is not None:
+            normalized_role = membership.role.strip().lower()
+            if normalized_role in {"owner", "admin"}:
+                return normalized_role
+        return "owner"
 
     def _audit_payload(self, raw_payload: str | None) -> dict:
         try:

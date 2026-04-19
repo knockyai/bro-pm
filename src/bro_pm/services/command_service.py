@@ -42,6 +42,7 @@ class CommandService:
     """Convert parsed commands into durable audit-ready operations."""
 
     PENDING_INTEGRATION_STALE_AFTER = timedelta(minutes=5)
+    APPROVAL_TTL = timedelta(days=7)
     PENDING_INTEGRATION_WAIT_ATTEMPTS = 100
     PENDING_INTEGRATION_WAIT_DELAY_SECONDS = 0.05
     SQLITE_CLEAN_CALLER_TRANSACTION_DETAIL = (
@@ -134,6 +135,322 @@ class CommandService:
             execution.executed_at = executed_at
         if verified_at is not None:
             execution.verified_at = verified_at
+
+    def _approval_expires_at(self, requested_at: datetime) -> datetime:
+        return requested_at + self.APPROVAL_TTL
+
+    def _approval_request_for_audit(self, audit_event_id: str) -> models.ApprovalRequest | None:
+        return self.db.query(models.ApprovalRequest).filter_by(audit_event_id=audit_event_id).one_or_none()
+
+    def _proposal_from_audit(self, audit_event: models.AuditEvent) -> CommandProposal | None:
+        try:
+            payload = json.loads(audit_event.payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        proposal_payload = payload.get("proposal")
+        if not isinstance(proposal_payload, dict):
+            return None
+        try:
+            return CommandProposal.model_validate(proposal_payload)
+        except Exception:
+            return None
+
+    def _approval_payload_update(
+        self,
+        *,
+        audit_event: models.AuditEvent,
+        status: str,
+        actor: str | None = None,
+        role: str | None = None,
+        decision_text: str | None = None,
+    ) -> None:
+        try:
+            payload = json.loads(audit_event.payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        approval_payload = {
+            "status": status,
+        }
+        if actor is not None:
+            approval_payload["actor"] = actor
+        if role is not None:
+            approval_payload["actor_role"] = role
+        if decision_text is not None:
+            approval_payload["text"] = decision_text
+        payload["approval"] = approval_payload
+        audit_event.payload = json.dumps(payload, ensure_ascii=False)
+
+    def _ensure_approval_request(
+        self,
+        *,
+        audit_event: models.AuditEvent,
+        actor: str,
+        proposal: CommandProposal | None = None,
+        requested_at: datetime | None = None,
+    ) -> models.ApprovalRequest:
+        approval = self._approval_request_for_audit(audit_event.id)
+        if approval is not None:
+            return approval
+
+        proposal = proposal or self._proposal_from_audit(audit_event)
+        requested_at = requested_at or datetime.utcnow()
+        approval = models.ApprovalRequest(
+            audit_event_id=audit_event.id,
+            project_id=audit_event.project_id,
+            action=audit_event.action,
+            status="pending",
+            requested_by=actor,
+            requested_at=requested_at,
+            expires_at=self._approval_expires_at(requested_at),
+        )
+        if proposal is not None and proposal.project_id is not None:
+            approval.project_id = proposal.project_id
+        self.db.add(approval)
+        self.db.flush()
+        return approval
+
+    def _expire_approval_request(
+        self,
+        *,
+        approval: models.ApprovalRequest,
+        audit_event: models.AuditEvent,
+    ) -> None:
+        now = datetime.utcnow()
+        approval.status = "expired"
+        if approval.decided_at is None:
+            approval.decided_at = now
+        audit_event.result = "expired"
+        self._approval_payload_update(audit_event=audit_event, status="expired")
+        if audit_event.action_execution is not None:
+            audit_event.action_execution.status = "expired"
+
+    def decide_approval(
+        self,
+        *,
+        audit_event_id: str,
+        actor: str,
+        role: str,
+        reviewer_role: str | None = None,
+        approved: bool,
+        decision_text: str | None = None,
+        decision_payload: dict | None = None,
+        actor_trusted: bool = True,
+    ) -> models.ApprovalRequest:
+        audit_event = self.db.get(models.AuditEvent, audit_event_id)
+        if audit_event is None:
+            raise ValueError("approval audit event not found")
+
+        project = self._get_project(audit_event.project_id)
+        safe_paused = bool(project.safe_paused) if project is not None else False
+        decision = self.policy.evaluate(
+            actor_role=role,
+            actor_trusted=actor_trusted,
+            action="approve_action",
+            safe_paused=safe_paused,
+        )
+        if not decision.allowed:
+            raise ValueError(decision.reason)
+
+        proposal = self._proposal_from_audit(audit_event)
+        stored_reviewer_role = reviewer_role or role
+        approval = self._ensure_approval_request(
+            audit_event=audit_event,
+            actor=audit_event.actor,
+            proposal=proposal,
+            requested_at=audit_event.created_at or datetime.utcnow(),
+        )
+        if approval.status == "executed":
+            return approval
+        if approval.expires_at is not None and approval.expires_at <= datetime.utcnow():
+            self._expire_approval_request(approval=approval, audit_event=audit_event)
+            self.db.flush()
+            return approval
+
+        approval.status = "approved" if approved else "rejected"
+        approval.reviewer_actor = actor
+        approval.reviewer_role = stored_reviewer_role
+        approval.decision_text = decision_text
+        approval.decision_payload_json = decision_payload
+        approval.decided_at = datetime.utcnow()
+        audit_event.result = approval.status
+        self._approval_payload_update(
+            audit_event=audit_event,
+            status=approval.status,
+            actor=actor,
+            role=stored_reviewer_role,
+            decision_text=decision_text,
+        )
+        if audit_event.action_execution is not None:
+            audit_event.action_execution.status = approval.status
+        self.db.flush()
+        return approval
+
+    def _reconcile_approval_from_audit(
+        self,
+        *,
+        approval: models.ApprovalRequest,
+        audit_event: models.AuditEvent,
+    ) -> models.ApprovalRequest:
+        try:
+            payload = json.loads(audit_event.payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        approval_payload = payload.get("approval") if isinstance(payload, dict) else None
+
+        desired_status = approval.status
+        if audit_event.result in {"approved", "rejected", "expired", "executed"}:
+            desired_status = "executed" if audit_event.result == "executed" else audit_event.result
+        if isinstance(approval_payload, dict) and approval_payload.get("status") in {
+            "approved",
+            "rejected",
+            "expired",
+            "executed",
+        }:
+            desired_status = str(approval_payload["status"])
+
+        if approval.status == "pending" and desired_status != "pending":
+            approval.status = desired_status
+            approval.reviewer_actor = approval.reviewer_actor or approval_payload.get("actor") if isinstance(approval_payload, dict) else approval.reviewer_actor
+            approval.reviewer_role = approval.reviewer_role or approval_payload.get("actor_role") if isinstance(approval_payload, dict) else approval.reviewer_role
+            approval.decision_text = approval.decision_text or approval_payload.get("text") if isinstance(approval_payload, dict) else approval.decision_text
+            if desired_status in {"approved", "rejected", "expired"} and approval.decided_at is None:
+                approval.decided_at = datetime.utcnow()
+            if desired_status == "executed" and approval.resumed_at is None:
+                approval.resumed_at = datetime.utcnow()
+            self.db.flush()
+        return approval
+
+    def resume_approval(
+        self,
+        *,
+        audit_event_id: str,
+        actor: str,
+        role: str,
+        actor_trusted: bool = True,
+    ) -> ProposalExecution:
+        audit_event = self.db.get(models.AuditEvent, audit_event_id)
+        if audit_event is None:
+            return ProposalExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action="noop",
+                    project_id=None,
+                    reason="approval audit event not found",
+                    payload={},
+                ),
+                audit_id=audit_event_id,
+                result="rejected",
+                detail="approval audit event not found",
+            )
+
+        proposal = self._proposal_from_audit(audit_event)
+        if proposal is None:
+            return ProposalExecution(
+                success=False,
+                proposal=CommandProposal(
+                    action=audit_event.action,
+                    project_id=audit_event.project_id,
+                    reason="stored proposal is unreadable",
+                    payload={},
+                ),
+                audit_id=audit_event.id,
+                result="rejected",
+                detail="stored proposal is unreadable",
+            )
+
+        approval = self._ensure_approval_request(
+            audit_event=audit_event,
+            actor=audit_event.actor,
+            proposal=proposal,
+            requested_at=audit_event.created_at or datetime.utcnow(),
+        )
+        approval = self._reconcile_approval_from_audit(approval=approval, audit_event=audit_event)
+        if approval.status == "executed":
+            return ProposalExecution(
+                success=True,
+                proposal=proposal,
+                audit_id=audit_event.id,
+                result="executed",
+                detail="approved action already resumed",
+            )
+
+        project = self._get_project(audit_event.project_id)
+        safe_paused = bool(project.safe_paused) if project is not None else False
+        decision = self.policy.evaluate(
+            actor_role=role,
+            actor_trusted=actor_trusted,
+            action="approve_action",
+            safe_paused=safe_paused,
+        )
+        if not decision.allowed:
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=audit_event.id,
+                result="rejected",
+                detail=decision.reason,
+            )
+
+        if approval.expires_at is not None and approval.expires_at <= datetime.utcnow():
+            self._expire_approval_request(approval=approval, audit_event=audit_event)
+            self.db.flush()
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=audit_event.id,
+                result="rejected",
+                detail="approval expired",
+            )
+        if approval.status == "rejected":
+            audit_event.result = "rejected"
+            if audit_event.action_execution is not None:
+                audit_event.action_execution.status = "rejected"
+            self.db.flush()
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=audit_event.id,
+                result="rejected",
+                detail="approval rejected",
+            )
+        if approval.status != "approved":
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=audit_event.id,
+                result="rejected",
+                detail="approval still pending",
+            )
+
+        execution_now = datetime.utcnow()
+        self._apply_action(proposal)
+        approval.status = "executed"
+        approval.resumed_at = execution_now
+        audit_event.result = "executed"
+        if audit_event.action_execution is not None:
+            audit_event.action_execution.status = "executed"
+            audit_event.action_execution.executed_at = execution_now
+        self.db.flush()
+        if self._verify_applied_action(proposal):
+            self._record_action_execution(
+                audit_event_id=audit_event.id,
+                actor=audit_event.actor,
+                project_id=proposal.project_id,
+                action=proposal.action,
+                status="verified",
+                verified_at=datetime.utcnow(),
+            )
+        return ProposalExecution(
+            success=True,
+            proposal=proposal,
+            audit_id=audit_event.id,
+            result="executed",
+            detail="approved action resumed",
+        )
 
     def _proposal_is_synchronously_verifiable(self, proposal: CommandProposal) -> bool:
         return proposal.action in {"pause_project", "unpause_project"} and bool(proposal.project_id)
@@ -463,6 +780,13 @@ class CommandService:
             executed_at=execution_executed_at,
             verified_at=execution_verified_at,
         )
+        if stored_result == "awaiting_approval":
+            self._ensure_approval_request(
+                audit_event=record,
+                actor=actor,
+                proposal=proposal,
+                requested_at=execution_requested_at,
+            )
 
         if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
@@ -1132,6 +1456,61 @@ class CommandService:
                 result="rejected",
                 detail="idempotency key already used for different request context",
             )
+
+        approval = self._approval_request_for_audit(existing.id)
+        if approval is None and existing.result in {"awaiting_approval", "approved", "rejected", "expired"}:
+            approval = self._ensure_approval_request(
+                audit_event=existing,
+                actor=existing.actor,
+                proposal=proposal,
+                requested_at=existing.created_at or datetime.utcnow(),
+            )
+        if approval is not None:
+            approval = self._reconcile_approval_from_audit(approval=approval, audit_event=existing)
+        if approval is not None:
+            if approval.expires_at is not None and approval.expires_at <= datetime.utcnow() and approval.status == "pending":
+                self._expire_approval_request(approval=approval, audit_event=existing)
+                self.db.flush()
+            if approval.status == "approved":
+                return ProposalExecution(
+                    success=True,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="approved",
+                    detail=detail,
+                )
+            if approval.status == "rejected":
+                return ProposalExecution(
+                    success=False,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="rejected",
+                    detail=detail,
+                )
+            if approval.status == "expired":
+                return ProposalExecution(
+                    success=False,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="rejected",
+                    detail="approval expired",
+                )
+            if approval.status == "executed":
+                return ProposalExecution(
+                    success=True,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="executed",
+                    detail=detail,
+                )
+            if approval.status == "pending":
+                return ProposalExecution(
+                    success=True,
+                    proposal=proposal,
+                    audit_id=existing.id,
+                    result="requires_approval",
+                    detail=detail,
+                )
 
         if existing.result == "denied":
             return ProposalExecution(
