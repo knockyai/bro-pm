@@ -25,7 +25,7 @@ def propose_and_execute(
     actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
     db: Session = Depends(get_db_session),
 ) -> CommandResponse:
-    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine())
+    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine(db_session=db))
     proposal = service.parse(
         actor=payload.actor,
         command=payload.command_text,
@@ -67,7 +67,7 @@ def decide_command_approval(
     actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
     db: Session = Depends(get_db_session),
 ) -> ApprovalDecisionResponse:
-    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine())
+    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine(db_session=db))
     try:
         approval = service.decide_approval(
             audit_event_id=audit_event_id,
@@ -98,7 +98,7 @@ def resume_command_approval(
     actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
     db: Session = Depends(get_db_session),
 ) -> CommandResponse:
-    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine())
+    service = CommandService(db_session=db, hermes=HermesAdapter(), policy=PolicyEngine(db_session=db))
     execution = service.resume_approval(
         audit_event_id=audit_event_id,
         actor=payload.actor,

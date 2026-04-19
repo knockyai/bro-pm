@@ -54,7 +54,7 @@ class CommandService:
     def __init__(self, db_session: Session, hermes: HermesAdapter | None = None, policy: PolicyEngine | None = None):
         self.db = db_session
         self.hermes = hermes or HermesAdapter()
-        self.policy = policy or PolicyEngine()
+        self.policy = policy or PolicyEngine(db_session=db_session)
 
     def parse(self, *, actor: str, command: str, project_id: str | None) -> CommandProposal:
         proposal = self.hermes.propose(actor=actor, command_text=command)
@@ -118,7 +118,7 @@ class CommandService:
         integration_detail: str,
         integration_payload: dict,
     ) -> dict:
-        return {
+        payload = {
             "actor": actor,
             "auth": {
                 "role": role,
@@ -128,7 +128,6 @@ class CommandService:
                 "execute_integration": execute_integration,
             },
             "proposal": proposal.model_dump(),
-            "policy": decision.__dict__,
             "integration": {
                 "name": integration_name,
                 "action": proposal.action,
@@ -137,6 +136,34 @@ class CommandService:
             },
             "integration_payload": integration_payload,
         }
+        payload.update(self._policy_payload(decision))
+        return payload
+
+    @staticmethod
+    def _policy_payload(decision: PolicyDecision) -> dict:
+        return {
+            "policy": {
+                "allowed": decision.allowed,
+                "reason": decision.reason,
+                "requires_approval": decision.requires_approval,
+                "safe_pause_blocked": decision.safe_pause_blocked,
+            },
+            "policy_version": {
+                "policy_key": decision.policy_key,
+                "policy_version": decision.policy_version,
+                "policy_rule": decision.policy_rule,
+            },
+        }
+
+    def _policy_context_decision(self, *, allowed: bool, reason: str, policy_rule: str) -> PolicyDecision:
+        active_policy = self.policy._active_policy()
+        return PolicyDecision(
+            allowed=allowed,
+            reason=reason,
+            policy_key=active_policy.policy_key,
+            policy_version=active_policy.version,
+            policy_rule=policy_rule,
+        )
 
     def _reserve_integration_execution_isolated(
         self,
@@ -293,6 +320,45 @@ class CommandService:
             return {}
         nested_payload = proposal_payload.get("payload")
         return nested_payload if isinstance(nested_payload, dict) else {}
+
+    def explain_policy_decision(self, audit_event_id: str) -> dict:
+        with self.db.no_autoflush:
+            audit_event = self.db.get(models.AuditEvent, audit_event_id)
+        if audit_event is None:
+            raise ValueError("audit event not found")
+
+        payload = self._audit_payload_dict(audit_event)
+        decision = self._mapping_payload_member(payload, "policy")
+        policy_version_info = self._mapping_payload_member(payload, "policy_version")
+        policy_key = policy_version_info.get("policy_key")
+        policy_version = policy_version_info.get("policy_version")
+        if not isinstance(policy_key, str) or not isinstance(policy_version, int):
+            raise ValueError("policy version data missing from audit event")
+
+        with self.db.no_autoflush:
+            stored_policy = (
+                self.db.query(models.PolicyVersion)
+                .filter_by(policy_key=policy_key, version=policy_version)
+                .one_or_none()
+            )
+        if stored_policy is None:
+            raise ValueError("stored policy version not found")
+
+        return {
+            "audit_id": audit_event.id,
+            "action": audit_event.action,
+            "result": audit_event.result,
+            "decision": decision,
+            "policy_version": {
+                "id": stored_policy.id,
+                "policy_key": stored_policy.policy_key,
+                "version": stored_policy.version,
+                "description": stored_policy.description,
+                "rules": stored_policy.rules_json or {},
+                "is_active": stored_policy.is_active,
+                "policy_rule": policy_version_info.get("policy_rule"),
+            },
+        }
 
     def _rollback_dependents_for(
         self,
@@ -757,17 +823,33 @@ class CommandService:
                 )
 
         if proposal.action == "noop":
-            decision = PolicyDecision(False, proposal.reason or "unrecognized command")
+            decision = self._policy_context_decision(
+                allowed=False,
+                reason=proposal.reason or "unrecognized command",
+                policy_rule="input::noop_unrecognized_command",
+            )
         elif proposal.action == "draft_boss_escalation":
             if not project_id:
-                decision = PolicyDecision(False, "project context required for draft_boss_escalation")
+                decision = self._policy_context_decision(
+                    allowed=False,
+                    reason="project context required for draft_boss_escalation",
+                    policy_rule="input::draft_boss_project_context_required",
+                )
             else:
                 with self.db.no_autoflush:
                     project = self.db.get(models.Project, project_id)
                 if not project:
-                    decision = PolicyDecision(False, "project not found for draft_boss_escalation")
+                    decision = self._policy_context_decision(
+                        allowed=False,
+                        reason="project not found for draft_boss_escalation",
+                        policy_rule="input::draft_boss_project_not_found",
+                    )
                 elif not proposal.payload.get("escalation_message"):
-                    decision = PolicyDecision(False, "escalation message required for draft_boss_escalation")
+                    decision = self._policy_context_decision(
+                        allowed=False,
+                        reason="escalation message required for draft_boss_escalation",
+                        policy_rule="input::draft_boss_message_required",
+                    )
                 else:
                     decision = self.policy.evaluate(
                         actor_role=role,
@@ -975,8 +1057,8 @@ class CommandService:
                 "execute_integration": execute_integration,
             },
             "proposal": proposal.model_dump(),
-            "policy": decision.__dict__,
         }
+        payload.update(self._policy_payload(decision))
         if validate_integration or execute_integration:
             payload["integration"] = {
                 "name": integration_name,
@@ -1303,9 +1385,9 @@ class CommandService:
                     "reason": "rollback of audit event",
                     "payload": rollback_payload,
                 },
-                "policy": decision.__dict__,
                 "rollback_plan": rollback_plan,
             }
+            payload.update(self._policy_payload(decision))
             record = models.AuditEvent(
                 project_id=project_id,
                 actor=actor,
@@ -1369,15 +1451,15 @@ class CommandService:
                 "role": role,
                 "actor_trusted": actor_trusted,
             },
-                "proposal": {
-                    "action": "rollback_action",
-                    "project_id": project_id,
-                    "reason": "rollback of action",
-                    "payload": rollback_payload,
-                },
-                "policy": decision.__dict__,
-                "rollback_plan": rollback_plan,
-            }
+            "proposal": {
+                "action": "rollback_action",
+                "project_id": project_id,
+                "reason": "rollback of action",
+                "payload": rollback_payload,
+            },
+            "rollback_plan": rollback_plan,
+        }
+        payload.update(self._policy_payload(decision))
         record = models.AuditEvent(
             project_id=project_id,
             actor=actor,

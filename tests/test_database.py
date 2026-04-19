@@ -137,6 +137,71 @@ def test_database_module_import_and_init_db_with_memory_url(monkeypatch):
     assert "audit_events" in tables
     assert "action_executions" in tables
     assert "execution_outbox" in tables
+    assert "policy_versions" in tables
+
+    db_session = database.SessionLocal()
+    try:
+        active_policy = db_session.query(models.PolicyVersion).filter_by(is_active=True).one()
+        assert active_policy.policy_key == "default"
+        assert active_policy.version == 1
+        assert active_policy.rules_json["role_order"] == ["viewer", "operator", "admin", "owner"]
+    finally:
+        db_session.close()
+
+
+def test_policy_version_active_unique_index_compiles_for_sqlite_and_postgresql():
+    index = next(index for index in models.PolicyVersion.__table__.indexes if index.name == "uq_policy_versions_active_key")
+
+    sqlite_sql = str(CreateIndex(index).compile(dialect=sqlite.dialect())).lower()
+    postgres_sql = str(CreateIndex(index).compile(dialect=postgresql.dialect())).lower()
+
+    assert "create unique index uq_policy_versions_active_key" in sqlite_sql
+    assert "where is_active = 1" in sqlite_sql
+    assert "create unique index uq_policy_versions_active_key" in postgres_sql
+    assert "where is_active = true" in postgres_sql
+
+
+def test_policy_versions_allow_only_one_active_row_per_policy_key(monkeypatch):
+    monkeypatch.setenv("BRO_PM_DATABASE_URL", "sqlite:///:memory:")
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db("sqlite:///:memory:")
+
+    db_session = database.SessionLocal()
+    try:
+        db_session.add(
+            models.PolicyVersion(
+                policy_key="default",
+                version=2,
+                description="conflicting active policy",
+                rules_json={"role_order": ["viewer", "operator", "admin", "owner"]},
+                is_active=True,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+    finally:
+        db_session.rollback()
+        db_session.close()
+
+
+
+def test_init_db_fails_closed_when_default_policy_rows_exist_but_none_is_active(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'inactive_default_policy.db'}"
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(db_url)
+
+    db_session = database.SessionLocal()
+    try:
+        active_policy = db_session.query(models.PolicyVersion).filter_by(policy_key="default", is_active=True).one()
+        active_policy.is_active = False
+        db_session.commit()
+    finally:
+        db_session.close()
+
+    with pytest.raises(RuntimeError, match="no active default policy version"):
+        database.init_db(db_url)
 
 
 def test_init_db_adds_goal_id_to_legacy_tasks_schema(tmp_path):

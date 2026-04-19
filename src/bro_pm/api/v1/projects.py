@@ -396,7 +396,7 @@ def _enforce_direct_mutation_policy(
     target_type: str,
     target_id: str | None = None,
 ) -> PolicyDecision:
-    decision = PolicyEngine().evaluate(
+    decision = PolicyEngine(db_session=db).evaluate(
         actor_role=role,
         actor_trusted=actor_trusted,
         action=action,
@@ -861,7 +861,7 @@ def get_project_runtime_status(
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
 
-    decision = PolicyEngine().evaluate(
+    decision = PolicyEngine(db_session=db).evaluate(
         actor_role=role,
         actor_trusted=bool(actor_trusted),
         action="audit_view",
@@ -884,7 +884,7 @@ def list_audit_events(
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
 
-    decision = PolicyEngine().evaluate(
+    decision = PolicyEngine(db_session=db).evaluate(
         actor_role=role,
         actor_trusted=bool(actor_trusted),
         action="audit_view",
@@ -917,7 +917,7 @@ def get_audit_event_detail(
     if not project:
         raise HTTPException(status_code=404, detail="project not found")
 
-    decision = PolicyEngine().evaluate(
+    decision = PolicyEngine(db_session=db).evaluate(
         actor_role=role,
         actor_trusted=bool(actor_trusted),
         action="audit_view",
@@ -958,7 +958,7 @@ def generate_project_report(
             return replayed
 
         policy_action = "publish_report" if payload.execute_publish else "audit_view"
-        decision = PolicyEngine().evaluate(
+        decision = PolicyEngine(db_session=db).evaluate(
             actor_role=payload.role,
             actor_trusted=bool(actor_trusted),
             action=policy_action,

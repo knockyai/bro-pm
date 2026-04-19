@@ -4,6 +4,7 @@ import json
 import importlib
 import sys
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from bro_pm import models
 from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
+from bro_pm.policy import DEFAULT_POLICY_RULES, PolicyEngine
 from bro_pm.services.reporting_service import ReportingService
 
 HERMES_PUBLISH_DETAIL = (
@@ -93,6 +95,40 @@ def _mutation_auth_params(*, actor: str = "alice", role: str = "admin") -> dict:
 
 def _mutation_auth_headers(*, trusted: bool = True) -> dict[str, str]:
     return {"x-actor-trusted": "true"} if trusted else {}
+
+
+def _policy_rules(**overrides) -> dict:
+    rules = deepcopy(DEFAULT_POLICY_RULES)
+    rules.update(overrides)
+    return rules
+
+
+def _activate_policy_version(
+    api_client: TestClient,
+    *,
+    version: int = 2,
+    expected_previous_version: int = 1,
+    actor_role: str = "admin",
+    actor_trusted: bool = True,
+    description: str = "test policy override",
+    **rule_overrides,
+) -> None:
+    _ = api_client
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        PolicyEngine(db_session=session).activate_policy_version(
+            actor_role=actor_role,
+            actor_trusted=actor_trusted,
+            policy_key="default",
+            version=version,
+            rules=_policy_rules(**rule_overrides),
+            expected_previous_version=expected_previous_version,
+            description=description,
+        )
+        session.commit()
+    finally:
+        session.close()
 
 
 
@@ -448,6 +484,44 @@ def test_api_direct_task_mutation_rejects_untrusted_actor(api_client: TestClient
 
     assert response.status_code == 403
     assert response.json()["detail"] == "untrusted actor blocked"
+
+
+def test_api_direct_task_mutation_uses_active_persisted_policy_version(api_client: TestClient):
+    project = _create_project(api_client)
+    _activate_policy_version(
+        api_client,
+        admin_actions=DEFAULT_POLICY_RULES["admin_actions"] + ["create_task"],
+        description="Treat create_task as admin-only for direct mutation API test",
+    )
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        params=_mutation_auth_params(actor="olivia", role="operator"),
+        headers=_mutation_auth_headers(),
+        json={
+            "title": "Policy-gated direct task",
+            "description": "Should be denied by persisted policy version",
+            "status": "todo",
+            "priority": "medium",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "requires admin or owner role"
+
+    audit_events = _get_project_audit_events(api_client, project["id"], role="admin").json()
+    assert audit_events[0]["action"] == "create_task"
+    assert audit_events[0]["result"] == "denied"
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(id=audit_events[0]["id"]).one()
+        payload = json.loads(audit.payload)
+        assert payload["policy"]["policy_version"] == 2
+        assert payload["policy"]["policy_rule"] == "role::admin_required"
+    finally:
+        session.close()
 
 
 def test_api_direct_goal_mutation_respects_safe_pause_and_records_denial_audit(api_client: TestClient):
@@ -876,6 +950,47 @@ def test_api_command_denial_and_approval_paths(api_client: TestClient):
     assert approval_result["result"] == "requires_approval"
     assert approval_result["action"] == "close_task"
     assert approval_result["detail"] == "approved with human confirmation"
+
+
+def test_api_commands_use_active_persisted_policy_version(api_client: TestClient):
+    project = _create_project(api_client)
+    _activate_policy_version(
+        api_client,
+        admin_actions=DEFAULT_POLICY_RULES["admin_actions"] + ["create_task"],
+        description="Treat create_task as admin-only for commands API test",
+    )
+
+    response = api_client.post(
+        "/api/v1/commands",
+        headers={"x-actor-trusted": "true"},
+        json={
+            "command_text": "create task policy gated work",
+            "project_id": project["id"],
+            "actor": "olivia",
+            "role": "operator",
+            "validate_integration": True,
+        },
+    )
+
+    assert response.status_code == 200
+    command_result = response.json()
+    assert command_result["accepted"] is False
+    assert command_result["result"] == "rejected"
+    assert command_result["detail"] == "requires admin or owner role"
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        audit = session.query(models.AuditEvent).filter_by(id=command_result["audit_id"]).one()
+        payload = json.loads(audit.payload)
+        assert audit.result == "denied"
+        assert payload["policy_version"] == {
+            "policy_key": "default",
+            "policy_version": 2,
+            "policy_rule": "role::admin_required",
+        }
+    finally:
+        session.close()
 
 
 def test_api_unknown_command_is_rejected_and_audited(api_client: TestClient):
@@ -2618,6 +2733,24 @@ def test_api_project_report_rejects_viewer_role(api_client: TestClient):
     assert response.status_code == 403
     assert response.json()["detail"] == "requires operator role"
 
+
+
+def test_api_project_report_uses_active_persisted_policy_version(api_client: TestClient):
+    project = _create_project(api_client)
+    _activate_policy_version(
+        api_client,
+        admin_actions=DEFAULT_POLICY_RULES["admin_actions"] + ["audit_view"],
+        description="Treat audit_view as admin-only for report API test",
+    )
+
+    response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json=_report_auth_payload(actor="olivia", role="operator"),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "requires admin or owner role"
 
 
 def test_api_project_report_ignores_publish_audits_in_report_content(api_client: TestClient):

@@ -4,6 +4,7 @@ import json
 import importlib
 import sys
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from bro_pm.policy import PolicyEngine
+from bro_pm.policy import DEFAULT_POLICY_RULES, PolicyEngine
 from bro_pm.adapters.hermes_runtime import HermesAdapter
 from bro_pm.schemas import CommandProposal
 from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
@@ -46,6 +47,12 @@ def _create_project(session, *, name: str = "Default", slug: str = "default") ->
     session.add(project)
     session.flush()
     return project
+
+
+def _policy_rules(**overrides) -> dict:
+    rules = deepcopy(DEFAULT_POLICY_RULES)
+    rules.update(overrides)
+    return rules
 
 
 @pytest.fixture
@@ -84,6 +91,169 @@ def test_policy_engine_trusted_and_untrusted_actor_behavior():
     assert "accepted" in trusted_decision.reason.lower()
     assert untrusted_decision.allowed is False
     assert untrusted_decision.reason == "untrusted actor blocked"
+
+
+def test_policy_engine_uses_persisted_active_policy_version(db_session):
+    session = db_session
+    engine = PolicyEngine(db_session=session)
+
+    decision = engine.evaluate(
+        actor_role="operator",
+        actor_trusted=True,
+        action="create_task",
+        safe_paused=False,
+    )
+
+    assert decision.policy_key == "default"
+    assert decision.policy_version == 1
+    assert decision.policy_rule == "default::allow"
+
+
+def test_policy_engine_rejects_unauthorized_or_conflicting_policy_version_update(db_session):
+    session = db_session
+    engine = PolicyEngine(db_session=session)
+
+    with pytest.raises(ValueError, match="requires admin or owner role"):
+        engine.activate_policy_version(
+            actor_role="operator",
+            actor_trusted=True,
+            policy_key="default",
+            version=2,
+            rules=_policy_rules(),
+            expected_previous_version=1,
+        )
+
+    with pytest.raises(ValueError, match="policy version conflict"):
+        engine.activate_policy_version(
+            actor_role="admin",
+            actor_trusted=True,
+            policy_key="default",
+            version=2,
+            rules=_policy_rules(),
+            expected_previous_version=999,
+        )
+
+
+def test_policy_engine_enforces_admin_actions_from_active_policy_version(db_session):
+    session = db_session
+    engine = PolicyEngine(db_session=session)
+    activated = engine.activate_policy_version(
+        actor_role="admin",
+        actor_trusted=True,
+        policy_key="default",
+        version=2,
+        rules=_policy_rules(admin_actions=DEFAULT_POLICY_RULES["admin_actions"] + ["create_task"]),
+        expected_previous_version=1,
+        description="Treat create_task as admin-only for this test",
+    )
+    session.commit()
+
+    assert activated.version == 2
+
+    operator_decision = engine.evaluate(
+        actor_role="operator",
+        actor_trusted=True,
+        action="create_task",
+        safe_paused=False,
+    )
+    admin_decision = engine.evaluate(
+        actor_role="admin",
+        actor_trusted=True,
+        action="create_task",
+        safe_paused=False,
+    )
+
+    assert operator_decision.allowed is False
+    assert operator_decision.reason == "requires admin or owner role"
+    assert operator_decision.policy_version == 2
+    assert admin_decision.allowed is True
+    assert admin_decision.policy_version == 2
+
+
+
+def test_policy_engine_rejects_malformed_policy_rules(db_session):
+    session = db_session
+    engine = PolicyEngine(db_session=session)
+
+    with pytest.raises(ValueError, match="role_order must contain viewer, operator, admin, and owner exactly once"):
+        engine.activate_policy_version(
+            actor_role="admin",
+            actor_trusted=True,
+            policy_key="default",
+            version=2,
+            rules=_policy_rules(role_order=["viewer", "operator", "owner"]),
+            expected_previous_version=1,
+        )
+
+    with pytest.raises(ValueError, match="approval_reason_by_action"):
+        engine.activate_policy_version(
+            actor_role="admin",
+            actor_trusted=True,
+            policy_key="default",
+            version=2,
+            rules=_policy_rules(approval_reason_by_action={"close_task": 1}),
+            expected_previous_version=1,
+        )
+
+
+
+def test_policy_engine_fails_closed_on_invalid_stored_active_policy_rules(db_session):
+    session = db_session
+    active_policy = session.query(models.PolicyVersion).filter_by(policy_key="default", is_active=True).one()
+    active_policy.rules_json = {}
+    session.flush()
+
+    engine = PolicyEngine(db_session=session)
+    with pytest.raises(ValueError, match="policy rules missing required keys"):
+        engine.evaluate(
+            actor_role="admin",
+            actor_trusted=True,
+            action="create_task",
+            safe_paused=False,
+        )
+
+
+
+def test_policy_engine_fails_closed_when_active_policy_row_is_missing(db_session):
+    session = db_session
+    active_policy = session.query(models.PolicyVersion).filter_by(policy_key="default", is_active=True).one()
+    session.delete(active_policy)
+    session.flush()
+
+    engine = PolicyEngine(db_session=session)
+    with pytest.raises(RuntimeError, match="active policy version not found"):
+        engine.evaluate(
+            actor_role="admin",
+            actor_trusted=True,
+            action="create_task",
+            safe_paused=False,
+        )
+
+
+
+def test_policy_engine_keeps_set_trust_policy_admin_only_even_if_active_policy_omits_it(db_session):
+    session = db_session
+    engine = PolicyEngine(db_session=session)
+    engine.activate_policy_version(
+        actor_role="admin",
+        actor_trusted=True,
+        policy_key="default",
+        version=2,
+        rules=_policy_rules(admin_actions=["delete_project"]),
+        expected_previous_version=1,
+        description="Remove mutable policy-management action from admin_actions",
+    )
+    session.commit()
+
+    with pytest.raises(ValueError, match="requires admin or owner role"):
+        engine.activate_policy_version(
+            actor_role="viewer",
+            actor_trusted=True,
+            policy_key="default",
+            version=3,
+            rules=_policy_rules(admin_actions=["delete_project"]),
+            expected_previous_version=2,
+        )
 
 
 def test_policy_engine_safe_pause_blocks_unsafe_actions():
@@ -270,6 +440,11 @@ def test_command_service_rejects_unrecognized_noop_command_and_persists_denied_a
     assert payload["proposal"]["action"] == "noop"
     assert payload["proposal"]["reason"] == "unrecognized command"
     assert payload["policy"]["reason"] == "unrecognized command"
+    assert payload["policy_version"] == {
+        "policy_key": "default",
+        "policy_version": 1,
+        "policy_rule": "input::noop_unrecognized_command",
+    }
 
 
 def test_command_service_execute_writes_audit_event(db_session):
@@ -308,6 +483,37 @@ def test_command_service_execute_writes_audit_event(db_session):
     assert execution_record.requested_at is not None
     assert execution_record.executed_at is not None
     assert execution_record.verified_at is not None
+
+
+def test_command_service_explains_decision_against_stored_policy_version(db_session):
+    session = db_session
+    project = _create_project(session, name="Explained policy project", slug="explained-policy")
+    service = CommandService(db_session=session)
+    proposal = service.parse(
+        actor="alice",
+        command=f"pause project {project.id}",
+        project_id=project.id,
+    )
+
+    execution = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+    )
+
+    explanation = service.explain_policy_decision(execution.audit_id)
+
+    assert explanation["audit_id"] == execution.audit_id
+    assert explanation["decision"]["allowed"] is True
+    assert explanation["policy_version"]["policy_key"] == "default"
+    assert explanation["policy_version"]["version"] == 1
+    assert explanation["policy_version"]["policy_rule"] == "default::allow"
+    assert explanation["policy_version"]["rules"]["approval_required_actions"] == [
+        "close_task",
+        "delete_task",
+        "apply_bulk",
+    ]
 
 
 # dry-run path intentionally reuses policy and audit evidence
@@ -804,6 +1010,11 @@ def test_command_service_create_task_assisted_execution_commits_pending_reservat
                 "requires_approval": False,
                 "safe_pause_blocked": False,
             },
+            "policy_version": {
+                "policy_key": "default",
+                "policy_version": 1,
+                "policy_rule": "default::allow",
+            },
             "integration": {
                 "name": "notion",
                 "action": "create_task",
@@ -823,6 +1034,16 @@ def test_command_service_create_task_assisted_execution_commits_pending_reservat
         outbox_item = observer_session.query(models.ExecutionOutbox).filter_by(audit_event_id=execution.audit_id).one()
     finally:
         observer_session.close()
+
+    explanation_session = database.SessionLocal()
+    try:
+        explanation = CommandService(db_session=explanation_session).explain_policy_decision(execution.audit_id)
+    finally:
+        explanation_session.close()
+
+    assert explanation["policy_version"]["policy_key"] == "default"
+    assert explanation["policy_version"]["version"] == 1
+    assert explanation["policy_version"]["policy_rule"] == "default::allow"
 
     assert outbox_item.integration_name == "notion"
     assert outbox_item.integration_action == "create_task"

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Iterator
+
+from datetime import datetime
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
-from .models import Base
+from .models import Base, PolicyVersion
+from .policy import DEFAULT_POLICY_RULES
 
 
 _ENGINE_OPTIONS = {"echo": False, "future": True}
@@ -17,6 +21,12 @@ SessionLocal = sessionmaker(bind=_engine, class_=Session, autocommit=False, auto
 _ACTIVE_GOAL_INDEX_NAME = "uq_goals_project_active"
 _ACTIVE_GOAL_PARTIAL_INDEX_DIALECTS = frozenset({"sqlite", "postgresql"})
 _ACTIVE_GOAL_INDEX_PREDICATE = "lower(trim(status)) = 'active'"
+_POLICY_VERSION_ACTIVE_INDEX_NAME = "uq_policy_versions_active_key"
+_POLICY_VERSION_PARTIAL_INDEX_DIALECTS = frozenset({"sqlite", "postgresql"})
+_POLICY_VERSION_ACTIVE_INDEX_PREDICATE = {
+    "sqlite": "is_active = 1",
+    "postgresql": "is_active = true",
+}
 _CONVERSATION_EVENT_CORRELATION_INDEX_NAME = "ix_conversation_events_correlation_key"
 _CONVERSATION_EVENT_SOURCE_EVENT_INDEX_NAME = "uq_conversation_events_source_event_key"
 
@@ -37,13 +47,22 @@ def assert_active_goal_uniqueness_dialect_supported(dialect_name: str | None = N
         )
 
 
+def assert_active_policy_version_dialect_supported(dialect_name: str | None = None) -> None:
+    dialect = dialect_name or _engine.dialect.name
+    if dialect not in _POLICY_VERSION_PARTIAL_INDEX_DIALECTS:
+        supported = ", ".join(sorted(_POLICY_VERSION_PARTIAL_INDEX_DIALECTS))
+        raise RuntimeError(
+            f"active policy-version uniqueness is only supported on dialects: {supported}"
+            f"; {dialect} does not support required partial unique index semantics"
+        )
+
+
 def _initialize_engine(database_url: str) -> None:
     """(Re)initialize the SQLAlchemy engine and session factory for tests/runtime."""
 
     global _engine
     global SessionLocal
 
-    _engine.dispose()
     _engine = create_engine(database_url, **_ENGINE_OPTIONS)
     SessionLocal.configure(bind=_engine)
 
@@ -109,6 +128,98 @@ def _assert_active_goal_index_shape() -> None:
     raise RuntimeError(
         f"active-goal unique index {_ACTIVE_GOAL_INDEX_NAME} has unexpected shape; "
         f"definition={definition}; expected unique predicate `{_ACTIVE_GOAL_INDEX_PREDICATE}`"
+    )
+
+
+def _policy_version_active_index_definition() -> str | None:
+    if _engine.dialect.name == "sqlite":
+        with _engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name = :index_name AND tbl_name='policy_versions'"
+                ),
+                {"index_name": _POLICY_VERSION_ACTIVE_INDEX_NAME},
+            ).first()
+        if row is None:
+            return None
+        return row[0]
+
+    if _engine.dialect.name == "postgresql":
+        with _engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes WHERE tablename='policy_versions' AND indexname=:index_name"
+                ),
+                {"index_name": _POLICY_VERSION_ACTIVE_INDEX_NAME},
+            ).first()
+        if row is None:
+            return None
+        return row[0]
+
+    return None
+
+
+def _policy_version_active_index_has_expected_shape() -> bool:
+    definition = _policy_version_active_index_definition()
+    if definition is None:
+        return False
+
+    compact = _compact_sql(definition)
+    if "createuniqueindex" not in compact:
+        return False
+
+    if not re.search(
+        r"on(?:\"?[a-z0-9_]+\"?\.)?\"?policy_versions\"?\([^\)]*policy_key[^\)]*\)",
+        compact,
+    ):
+        return False
+
+    expected_predicate = _compact_sql(_POLICY_VERSION_ACTIVE_INDEX_PREDICATE[_engine.dialect.name])
+    return expected_predicate in compact
+
+
+def _assert_policy_version_active_index_shape() -> None:
+    definition = _policy_version_active_index_definition()
+    if definition is None:
+        return
+    if _policy_version_active_index_has_expected_shape():
+        return
+
+    raise RuntimeError(
+        f"policy-version active unique index {_POLICY_VERSION_ACTIVE_INDEX_NAME} has unexpected shape; "
+        f"definition={definition}; expected predicate `{_POLICY_VERSION_ACTIVE_INDEX_PREDICATE[_engine.dialect.name]}`"
+    )
+
+
+def _legacy_active_policy_version_duplicates() -> list[tuple[str, int]]:
+    predicate = _POLICY_VERSION_ACTIVE_INDEX_PREDICATE[_engine.dialect.name]
+    rows = []
+    with _engine.connect() as connection:
+        results = connection.execute(
+            text(
+                f"""
+                SELECT policy_key, COUNT(*) AS active_policy_count
+                FROM policy_versions
+                WHERE {predicate}
+                GROUP BY policy_key
+                HAVING COUNT(*) > 1
+                """
+            )
+        ).mappings().all()
+    for row in results:
+        rows.append((row["policy_key"], row["active_policy_count"]))
+    return rows
+
+
+def _assert_no_legacy_active_policy_version_duplicates() -> None:
+    duplicates = _legacy_active_policy_version_duplicates()
+    if not duplicates:
+        return
+
+    duplicates_summary = ", ".join(f"{policy_key} ({count})" for policy_key, count in duplicates)
+    raise RuntimeError(
+        "duplicate active policy versions detected for legacy migration: "
+        f"unique active policy constraint would be violated for {duplicates_summary}"
     )
 
 
@@ -218,6 +329,20 @@ def _upgrade_legacy_schema() -> None:
                         )
                     )
 
+    if "policy_versions" in inspector.get_table_names():
+        if _has_index(inspector, "policy_versions", _POLICY_VERSION_ACTIVE_INDEX_NAME):
+            _assert_policy_version_active_index_shape()
+        else:
+            _assert_no_legacy_active_policy_version_duplicates()
+            with _engine.begin() as connection:
+                predicate = _POLICY_VERSION_ACTIVE_INDEX_PREDICATE[_engine.dialect.name]
+                connection.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {_POLICY_VERSION_ACTIVE_INDEX_NAME} "
+                        f"ON policy_versions (policy_key) WHERE {predicate}"
+                    )
+                )
+
     if "conversation_events" in inspector.get_table_names():
         conversation_event_columns = {column["name"] for column in inspector.get_columns("conversation_events")}
         if "source_event_key" not in conversation_event_columns:
@@ -270,14 +395,44 @@ def _upgrade_legacy_schema() -> None:
             )
 
 
+def _seed_default_policy_version() -> None:
+    with SessionLocal() as session:
+        default_rows = session.query(PolicyVersion).filter_by(policy_key="default").order_by(PolicyVersion.version.asc()).all()
+        active_rows = [row for row in default_rows if row.is_active]
+        if len(active_rows) > 1:
+            raise RuntimeError("multiple active policy versions detected for default policy")
+        if active_rows:
+            return
+        if default_rows:
+            raise RuntimeError("default policy rows exist but no active default policy version is present")
+
+        other_rows_exist = session.query(PolicyVersion.id).first() is not None
+        if other_rows_exist:
+            raise RuntimeError("policy_versions table is populated but the default active policy row is missing")
+
+        session.add(
+            PolicyVersion(
+                policy_key="default",
+                version=1,
+                description="Default deterministic MVP policy",
+                rules_json=deepcopy(DEFAULT_POLICY_RULES),
+                is_active=True,
+                activated_at=datetime.utcnow(),
+            )
+        )
+        session.commit()
+
+
 def init_db(database_url: str | None = None) -> None:
     """Initialize or reinitialize DB schema for a concrete database URL."""
 
     if database_url is not None and database_url != settings.database_url:
         _initialize_engine(database_url)
     assert_active_goal_uniqueness_dialect_supported()
+    assert_active_policy_version_dialect_supported()
     _upgrade_legacy_schema()
     Base.metadata.create_all(bind=_engine)
+    _seed_default_policy_version()
 
 
 def get_db_session() -> Iterator[Session]:
