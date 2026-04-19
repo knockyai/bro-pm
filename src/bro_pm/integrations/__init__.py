@@ -22,14 +22,70 @@ class Integration(Protocol):
 
     def validate(self, *, action: str, payload: dict) -> None: ...
 
+    def supports_verification(self, *, action: str, payload: dict) -> bool: ...
+
+    def verify_action_result(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult,
+    ) -> IntegrationResult: ...
+
+    def fetch_state(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class DurableIntegrationAdapter:
+    def supports_verification(self, *, action: str, payload: dict) -> bool:
+        return False
+
+    def verify_action_result(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult,
+    ) -> IntegrationResult:
+        state = self.fetch_state(action=action, payload=payload, result=result)
+        return IntegrationResult(
+            ok=False,
+            detail=f"{getattr(self, 'name', 'integration')} verification not implemented for {action}",
+            metadata={"state": state},
+        )
+
+    def fetch_state(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult | None = None,
+    ) -> dict[str, Any]:
+        metadata = dict(result.metadata) if result is not None else {}
+        return {
+            "exists": False,
+            "action": action,
+            **metadata,
+        }
+
 
 @dataclass
-class NotionIntegration:
+class NotionIntegration(DurableIntegrationAdapter):
     name: str = "notion"
 
     def validate(self, *, action: str, payload: dict) -> None:
         if action not in {"noop", "create_task", "close_task", "publish_report"}:
             raise IntegrationError(f"unsupported action for notion: {action}")
+        if action == "create_task":
+            if not payload.get("project_id"):
+                raise IntegrationError("missing project_id for notion create_task")
+            if not payload.get("title"):
+                raise IntegrationError("missing title for notion create_task")
         if action == "publish_report":
             if not payload.get("report"):
                 raise IntegrationError("missing report payload for notion publish_report")
@@ -38,11 +94,29 @@ class NotionIntegration:
 
     def execute(self, *, action: str, payload: dict) -> IntegrationResult:
         self.validate(action=action, payload=payload)
+        if action == "create_task":
+            return IntegrationResult(
+                ok=True,
+                detail="notion executed: create_task",
+                metadata={
+                    "external_id": self._task_external_id(payload),
+                },
+            )
         return IntegrationResult(ok=True, detail=f"notion executed: {action}")
+
+    def _task_external_id(self, payload: dict) -> str:
+        execution = payload.get("bro_pm_execution")
+        if isinstance(execution, dict):
+            if execution.get("audit_event_id"):
+                return f"notion-task:{execution['audit_event_id']}"
+            if execution.get("idempotency_key"):
+                return f"notion-task:{execution['idempotency_key']}"
+        title = str(payload.get("title") or "task").strip().lower().replace(" ", "-")
+        return f"notion-task:{title}"
 
 
 @dataclass
-class JiraIntegration:
+class JiraIntegration(DurableIntegrationAdapter):
     name: str = "jira"
 
     def validate(self, *, action: str, payload: dict) -> None:
@@ -55,7 +129,7 @@ class JiraIntegration:
 
 
 @dataclass
-class TrelloIntegration:
+class TrelloIntegration(DurableIntegrationAdapter):
     name: str = "trello"
 
     def validate(self, *, action: str, payload: dict) -> None:
@@ -71,7 +145,7 @@ from .yandex_tracker import YandexTrackerIntegration
 
 
 @dataclass
-class TelegramIntegration:
+class TelegramIntegration(DurableIntegrationAdapter):
     name: str = "telegram"
 
     def validate(self, *, action: str, payload: dict) -> None:
@@ -85,7 +159,7 @@ class TelegramIntegration:
 
 
 @dataclass
-class SlackIntegration:
+class SlackIntegration(DurableIntegrationAdapter):
     name: str = "slack"
 
     def validate(self, *, action: str, payload: dict) -> None:

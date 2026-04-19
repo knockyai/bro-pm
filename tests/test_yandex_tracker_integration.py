@@ -10,7 +10,7 @@ import pytest
 from bro_pm import models
 from bro_pm.config import Settings
 from bro_pm.database import init_db
-from bro_pm.integrations import IntegrationError, YandexTrackerIntegration
+from bro_pm.integrations import IntegrationError, IntegrationResult, YandexTrackerIntegration
 
 
 class _FakeHTTPResponse:
@@ -418,3 +418,91 @@ def test_yandex_tracker_execute_mcp_maps_error_result_to_integration_error():
                 "queue": "OPS",
             },
         )
+
+
+def test_yandex_tracker_verify_action_result_fetches_issue_state_and_confirms_summary():
+    requests: list[tuple[str, str, dict[str, str]]] = []
+
+    def fake_urlopen(request, timeout: int = 0):
+        requests.append((request.get_method(), request.full_url, {key.lower(): value for key, value in request.header_items()}))
+        if request.get_method() == "POST":
+            return _FakeHTTPResponse({"id": "42", "key": "OPS-42"})
+        if request.get_method() == "GET":
+            return _FakeHTTPResponse({"id": "42", "key": "OPS-42", "summary": "Verify tracker task", "queue": "OPS"}, status=200)
+        raise AssertionError(f"unexpected method {request.get_method()}")
+
+    integration = YandexTrackerIntegration(settings=_settings(), urlopen=fake_urlopen)
+    payload = {
+        "project_id": "project-1",
+        "title": "Verify tracker task",
+        "queue": "OPS",
+    }
+
+    result = integration.execute(action="create_task", payload=payload)
+    verification = integration.verify_action_result(action="create_task", payload=payload, result=result)
+
+    assert integration.supports_verification(action="create_task", payload=payload) is True
+    assert verification.ok is True
+    assert verification.metadata["issue_key"] == "OPS-42"
+    assert verification.metadata["state"] == {
+        "exists": True,
+        "issue_key": "OPS-42",
+        "issue_id": "42",
+        "summary": "Verify tracker task",
+        "queue": "OPS",
+    }
+    assert requests[0][0:2] == ("POST", "https://tracker.example.test/v2/issues/")
+    assert requests[1][0:2] == ("GET", "https://tracker.example.test/v2/issues/OPS-42")
+
+
+def test_yandex_tracker_fetch_state_returns_missing_for_404():
+    def fake_urlopen(request, timeout: int = 0):
+        if request.get_method() == "GET":
+            raise HTTPError(url=request.full_url, code=404, msg="Not found", hdrs=None, fp=io.BytesIO(b'{"error": "not found"}'))
+        raise AssertionError("fetch_state should only issue GET requests")
+
+    integration = YandexTrackerIntegration(settings=_settings(), urlopen=fake_urlopen)
+    payload = {
+        "project_id": "project-1",
+        "title": "Missing tracker task",
+        "queue": "OPS",
+    }
+    result = IntegrationResult(ok=True, detail="yandex_tracker created task OPS-404", metadata={"issue_key": "OPS-404", "issue_id": "404", "queue": "OPS"})
+
+    state = integration.fetch_state(action="create_task", payload=payload, result=result)
+    verification = integration.verify_action_result(action="create_task", payload=payload, result=result)
+
+    assert state == {
+        "exists": False,
+        "issue_key": "OPS-404",
+        "issue_id": "404",
+        "queue": "OPS",
+    }
+    assert verification.ok is False
+    assert verification.detail == "yandex_tracker create_task verification failed: issue not found"
+
+
+def test_yandex_tracker_verify_action_result_fails_when_remote_queue_is_missing():
+    requests: list[str] = []
+
+    def fake_urlopen(request, timeout: int = 0):
+        requests.append(request.get_method())
+        if request.get_method() == "POST":
+            return _FakeHTTPResponse({"id": "42", "key": "OPS-42"})
+        if request.get_method() == "GET":
+            return _FakeHTTPResponse({"id": "42", "key": "OPS-42", "summary": "Verify tracker task"}, status=200)
+        raise AssertionError(f"unexpected method {request.get_method()}")
+
+    integration = YandexTrackerIntegration(settings=_settings(), urlopen=fake_urlopen)
+    payload = {
+        "project_id": "project-1",
+        "title": "Verify tracker task",
+        "queue": "OPS",
+    }
+
+    result = integration.execute(action="create_task", payload=payload)
+    verification = integration.verify_action_result(action="create_task", payload=payload, result=result)
+
+    assert requests == ["POST", "GET"]
+    assert verification.ok is False
+    assert verification.detail == "yandex_tracker create_task verification failed: queue missing from fetched state"

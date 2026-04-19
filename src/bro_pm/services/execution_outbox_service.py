@@ -326,14 +326,44 @@ class ExecutionOutboxService:
                 payload=integration_payload,
             )
             if result.ok:
-                detail = result.detail or f"{item.integration_name} executed: {item.integration_action}"
-                self._mark_completed(
-                    item=item,
-                    audit_event=audit_event,
-                    execution=execution,
-                    detail=detail,
-                    processed_at=processed_at,
-                )
+                if integration.supports_verification(action=item.integration_action, payload=integration_payload):
+                    verification = integration.verify_action_result(
+                        action=item.integration_action,
+                        payload=integration_payload,
+                        result=result,
+                    )
+                    if verification.ok:
+                        detail = verification.detail or result.detail or f"{item.integration_name} executed: {item.integration_action}"
+                        self._mark_completed(
+                            item=item,
+                            audit_event=audit_event,
+                            execution=execution,
+                            detail=detail,
+                            processed_at=processed_at,
+                            execution_metadata=result.metadata,
+                            verification_metadata=verification.metadata,
+                        )
+                    else:
+                        detail = verification.detail or "integration verification reported failure"
+                        self._mark_failed(
+                            item=item,
+                            audit_event=audit_event,
+                            execution=execution,
+                            detail=detail,
+                            processed_at=processed_at,
+                            execution_metadata=result.metadata,
+                            verification_metadata=verification.metadata,
+                        )
+                else:
+                    detail = result.detail or f"{item.integration_name} executed: {item.integration_action}"
+                    self._mark_completed(
+                        item=item,
+                        audit_event=audit_event,
+                        execution=execution,
+                        detail=detail,
+                        processed_at=processed_at,
+                        execution_metadata=result.metadata,
+                    )
             else:
                 detail = result.detail or "integration execution reported failure"
                 self._mark_failed(
@@ -342,6 +372,7 @@ class ExecutionOutboxService:
                     execution=execution,
                     detail=detail,
                     processed_at=processed_at,
+                    execution_metadata=result.metadata,
                 )
             self.db_session.commit()
             self.db_session.refresh(item)
@@ -443,18 +474,25 @@ class ExecutionOutboxService:
         execution: models.ActionExecution | None,
         detail: str,
         processed_at: datetime,
+        execution_metadata: dict | None = None,
+        verification_metadata: dict | None = None,
     ) -> None:
         payload = self._reservation_payload(audit_event)
         integration_payload = payload.get("integration")
         if not isinstance(integration_payload, dict):
             integration_payload = {}
-        payload["integration"] = {
+        updated_integration_payload = {
             **integration_payload,
             "name": integration_payload.get("name") or item.integration_name,
             "action": integration_payload.get("action") or item.integration_action,
             "status": "executed",
             "detail": detail,
         }
+        if execution_metadata:
+            updated_integration_payload["execution_metadata"] = execution_metadata
+        if verification_metadata:
+            updated_integration_payload["verification"] = verification_metadata
+        payload["integration"] = updated_integration_payload
         audit_event.payload = json.dumps(payload, ensure_ascii=False)
         audit_event.result = "executed"
 
@@ -477,18 +515,25 @@ class ExecutionOutboxService:
         execution: models.ActionExecution | None,
         detail: str,
         processed_at: datetime,
+        execution_metadata: dict | None = None,
+        verification_metadata: dict | None = None,
     ) -> None:
         payload = self._reservation_payload(audit_event)
         integration_payload = payload.get("integration")
         if not isinstance(integration_payload, dict):
             integration_payload = {}
-        payload["integration"] = {
+        updated_integration_payload = {
             **integration_payload,
             "name": integration_payload.get("name") or item.integration_name,
             "action": integration_payload.get("action") or item.integration_action,
             "status": "rejected",
             "detail": detail,
         }
+        if execution_metadata:
+            updated_integration_payload["execution_metadata"] = execution_metadata
+        if verification_metadata:
+            updated_integration_payload["verification"] = verification_metadata
+        payload["integration"] = updated_integration_payload
         audit_event.payload = json.dumps(payload, ensure_ascii=False)
         audit_event.result = "denied"
 

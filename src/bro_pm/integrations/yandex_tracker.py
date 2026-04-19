@@ -13,13 +13,13 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from ..config import Settings, settings as runtime_settings
 from ..services.tracker_credentials import load_tracker_credentials
-from . import IntegrationError, IntegrationResult
+from . import DurableIntegrationAdapter, IntegrationError, IntegrationResult
 
 McpToolRunner = Callable[..., dict[str, Any]]
 
 
 @dataclass
-class YandexTrackerIntegration:
+class YandexTrackerIntegration(DurableIntegrationAdapter):
     name: str = "yandex_tracker"
     settings: Settings = field(default_factory=lambda: runtime_settings)
     urlopen: Callable[..., Any] = field(default_factory=lambda: urllib.request.urlopen, repr=False)
@@ -57,6 +57,115 @@ class YandexTrackerIntegration:
             return self._execute_mcp(payload)
         raise IntegrationError(f"unsupported yandex_tracker backend: {backend}")
 
+    def supports_verification(self, *, action: str, payload: dict) -> bool:
+        if action != "create_task":
+            return False
+        try:
+            self._validated_native_context(payload)
+        except IntegrationError:
+            return False
+        return True
+
+    def verify_action_result(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult,
+    ) -> IntegrationResult:
+        if not self.supports_verification(action=action, payload=payload):
+            return super().verify_action_result(action=action, payload=payload, result=result)
+
+        state = self.fetch_state(action=action, payload=payload, result=result)
+        metadata = {key: state[key] for key in ("issue_key", "issue_id") if key in state}
+        metadata["state"] = state
+        if not state.get("exists"):
+            return IntegrationResult(
+                ok=False,
+                detail="yandex_tracker create_task verification failed: issue not found",
+                metadata=metadata,
+            )
+        expected_title = self._normalized_text(payload.get("title"))
+        if expected_title and state.get("summary") != expected_title:
+            return IntegrationResult(
+                ok=False,
+                detail="yandex_tracker create_task verification failed: summary mismatch",
+                metadata=metadata,
+            )
+        expected_queue = self._resolve_queue(payload)
+        if expected_queue:
+            if not state.get("queue"):
+                return IntegrationResult(
+                    ok=False,
+                    detail="yandex_tracker create_task verification failed: queue missing from fetched state",
+                    metadata=metadata,
+                )
+            if state.get("queue") != expected_queue:
+                return IntegrationResult(
+                    ok=False,
+                    detail="yandex_tracker create_task verification failed: queue mismatch",
+                    metadata=metadata,
+                )
+        return IntegrationResult(
+            ok=True,
+            detail=result.detail or "yandex_tracker verified: create_task",
+            metadata=metadata,
+        )
+
+    def fetch_state(
+        self,
+        *,
+        action: str,
+        payload: dict,
+        result: IntegrationResult | None = None,
+    ) -> dict[str, Any]:
+        if action != "create_task":
+            return super().fetch_state(action=action, payload=payload, result=result)
+
+        issue_key = self._normalized_text(result.metadata.get("issue_key")) if result is not None else None
+        issue_id = self._normalized_text(result.metadata.get("issue_id")) if result is not None else None
+        expected_queue = self._normalized_text(result.metadata.get("queue")) if result is not None else None
+        if not expected_queue:
+            expected_queue = self._resolve_queue(payload)
+        issue_ref = issue_key or issue_id
+        base_state = {key: value for key, value in (("issue_key", issue_key), ("issue_id", issue_id), ("queue", expected_queue)) if value}
+        if not issue_ref:
+            return {"exists": False, **base_state}
+
+        context = self._validated_native_context(payload)
+        request = urllib.request.Request(
+            f"{context['api_base'].rstrip('/')}/issues/{issue_ref}",
+            headers=self._request_headers(authorization=context["authorization"], org_header_name=context["org_header_name"], org_id=context["org_id"]),
+            method="GET",
+        )
+        try:
+            with self.urlopen(request, timeout=self.timeout_seconds) as response:
+                response_payload = self._load_json_bytes(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return {"exists": False, **base_state}
+            error_detail = self._extract_error_detail(self._load_json_bytes(exc.read()), fallback=str(exc.reason or exc.msg))
+            raise IntegrationError(f"yandex_tracker fetch_state failed with HTTP {exc.code}: {error_detail}") from exc
+        except urllib.error.URLError as exc:
+            raise IntegrationError(f"yandex_tracker fetch_state failed: {exc.reason}") from exc
+        except OSError as exc:
+            raise IntegrationError(f"yandex_tracker fetch_state failed: {exc}") from exc
+
+        fetched_issue_key = self._extract_issue_key(response_payload) or issue_key
+        fetched_issue_id = self._extract_issue_id(response_payload) or issue_id
+        fetched_queue = self._extract_nested_value(response_payload, ("queue", "queueKey", "queue_key"))
+        summary = self._extract_nested_value(response_payload, ("summary", "title"))
+        state = {"exists": True}
+        if fetched_issue_key:
+            state["issue_key"] = fetched_issue_key
+        if fetched_issue_id:
+            state["issue_id"] = fetched_issue_id
+        if fetched_queue:
+            state["queue"] = fetched_queue
+        if summary:
+            state["summary"] = summary
+        return state
+
     def _execute_native(self, payload: dict) -> IntegrationResult:
         context = self._validated_native_context(payload)
         request_payload = {
@@ -69,12 +178,11 @@ class YandexTrackerIntegration:
         request = urllib.request.Request(
             f"{context['api_base'].rstrip('/')}/issues/",
             data=json.dumps(request_payload).encode("utf-8"),
-            headers={
-                "Authorization": context["authorization"],
-                context["org_header_name"]: context["org_id"],
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-            },
+            headers=self._request_headers(
+                authorization=context["authorization"],
+                org_header_name=context["org_header_name"],
+                org_id=context["org_id"],
+            ),
             method="POST",
         )
 
@@ -201,6 +309,15 @@ class YandexTrackerIntegration:
             "queue": queue,
             "title": self._normalized_text(payload.get("title")),
             "description": self._normalized_text(payload.get("description")),
+        }
+
+    @staticmethod
+    def _request_headers(*, authorization: str, org_header_name: str, org_id: str) -> dict[str, str]:
+        return {
+            "Authorization": authorization,
+            org_header_name: org_id,
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
         }
 
     def _resolve_backend(self, payload: dict) -> str:
