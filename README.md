@@ -528,6 +528,43 @@ python -m uvicorn bro_pm.api.app:app --reload
 PYTHONPATH=src python -m uvicorn bro_pm.api.app:app --reload
 ```
 
+## Запуск через Docker
+
+Для MVP самый короткий путь теперь такой:
+
+```bash
+cd /home/olegb/projects/bro-pm
+docker compose up --build
+```
+
+Что это поднимет:
+
+- контейнер с реальным FastAPI entrypoint `bro_pm.api.app:app`;
+- `uvicorn` на `0.0.0.0:8000`;
+- SQLite через `BRO_PM_DATABASE_URL=sqlite:////data/bro_pm.db`;
+- named volume `bro_pm_data`, чтобы demo-данные переживали перезапуск контейнера.
+
+После старта сервис будет доступен на:
+
+```text
+http://127.0.0.1:8000/
+```
+
+Полезные команды:
+
+```bash
+docker compose up --build -d
+docker compose logs -f
+docker compose down
+```
+
+Если нужен чистый локальный state SQLite для demo, можно удалить volume и поднять сервис заново:
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
 ## Что уже используется в локальном setup
 
 По `pyproject.toml` и `requirements.txt` сейчас реально видны такие зависимости:

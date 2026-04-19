@@ -1,0 +1,13 @@
+services:
+  bro-pm:
+    build:
+      context: .
+    environment:
+      BRO_PM_DATABASE_URL: sqlite:////data/bro_pm.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - bro_pm_data:/data
+
+volumes:
+  bro_pm_data:

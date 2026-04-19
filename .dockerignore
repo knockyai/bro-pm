@@ -1,0 +1,10 @@
+.git
+.gitignore
+.codex/
+.pytest_cache/
+.tmp/
+__pycache__/
+*.py[cod]
+*.db
+.venv/
+tmp_test_bind.db
