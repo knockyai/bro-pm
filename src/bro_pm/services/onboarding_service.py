@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -61,6 +61,7 @@ class OnboardingExecutionInput:
 class OnboardingExecutionResult:
     project: models.Project
     initial_goal: models.Goal | None = None
+    launch_due_action: models.DueAction | None = None
 
 
 def execute_project_onboarding(
@@ -159,6 +160,8 @@ def execute_project_onboarding(
             reporting_cadence=payload.reporting_cadence,
             communication_integrations=communication_integrations,
             board_integration=board_integration,
+            boss=payload.boss,
+            admin=payload.admin,
             team=payload.team,
             employee_rows=payload.employee_rows,
             gate_checks=gate_checks,
@@ -174,6 +177,30 @@ def execute_project_onboarding(
                 "title": created_goal.title,
                 "status": created_goal.status,
             }
+
+        launch_due_action = _enqueue_launch_due_action(
+            db,
+            project=project,
+            onboarding_metadata=onboarding_metadata,
+            board_integration=board_integration,
+            reporting_cadence=payload.reporting_cadence,
+            communication_integrations=communication_integrations,
+            boss=payload.boss,
+            admin=payload.admin,
+            initial_goal=created_goal,
+        )
+        onboarding_metadata["launch_due_action"] = {
+            "id": launch_due_action.id,
+            "kind": launch_due_action.kind,
+            "channel": launch_due_action.channel,
+            "recipient": launch_due_action.recipient,
+            "status": launch_due_action.status,
+            "idempotency_key": launch_due_action.idempotency_key,
+        }
+        project.metadata_json = {
+            **(project.metadata_json or {}),
+            "onboarding": dict(onboarding_metadata),
+        }
 
         db.add(
             models.AuditEvent(
@@ -197,7 +224,12 @@ def execute_project_onboarding(
         db.refresh(project)
         if created_goal is not None:
             db.refresh(created_goal)
-        return OnboardingExecutionResult(project=project, initial_goal=created_goal)
+        db.refresh(launch_due_action)
+        return OnboardingExecutionResult(
+            project=project,
+            initial_goal=created_goal,
+            launch_due_action=launch_due_action,
+        )
     except IntegrationError as exc:
         detail = str(exc)
         project.safe_paused = True
@@ -214,6 +246,8 @@ def execute_project_onboarding(
             reporting_cadence=payload.reporting_cadence,
             communication_integrations=communication_integrations,
             board_integration=board_integration,
+            boss=payload.boss,
+            admin=payload.admin,
             team=payload.team,
             employee_rows=payload.employee_rows,
             gate_checks=failure_gate_checks,
@@ -310,6 +344,8 @@ def _build_project_metadata(
         reporting_cadence=reporting_cadence,
         communication_integrations=communication_integrations,
         board_integration=board_integration,
+        boss="",
+        admin="",
         team=team,
         employee_rows=employee_rows,
         gate_checks={
@@ -330,6 +366,8 @@ def _build_onboarding_metadata(
     reporting_cadence: str,
     communication_integrations: list[str],
     board_integration: str,
+    boss: str,
+    admin: str,
     team: list[dict],
     employee_rows: list[dict[str, str | int]],
     gate_checks: dict[str, bool],
@@ -342,6 +380,8 @@ def _build_onboarding_metadata(
         "reporting_cadence": reporting_cadence,
         "communication_integrations": list(communication_integrations),
         "board_integration": board_integration,
+        "boss": boss,
+        "admin": admin,
         "team": [dict(entry) for entry in team],
         "employees": [dict(entry) for entry in employee_rows],
         "gate_checks": dict(gate_checks),
@@ -383,3 +423,98 @@ def _create_initial_goal(db: Session, *, project_id: str, goal: InitialGoalInput
         db.flush()
         sync_executor_load(db, project_id=project_id)
     return goal_record
+
+
+def _preferred_launch_channel(communication_integrations: list[str]) -> str | None:
+    normalized = [value.strip().lower() for value in communication_integrations if isinstance(value, str) and value.strip()]
+    if "telegram" in normalized:
+        return "telegram"
+    return normalized[0] if normalized else None
+
+
+def _launch_recipient(*, boss: str, admin: str, created_by: str | None) -> str | None:
+    for candidate in (boss, admin, created_by):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _enqueue_launch_due_action(
+    db: Session,
+    *,
+    project: models.Project,
+    onboarding_metadata: dict,
+    board_integration: str,
+    reporting_cadence: str,
+    communication_integrations: list[str],
+    boss: str,
+    admin: str,
+    initial_goal: models.Goal | None,
+) -> models.DueAction:
+    channel = _preferred_launch_channel(communication_integrations)
+    recipient = _launch_recipient(boss=boss, admin=admin, created_by=project.created_by)
+    if channel is None or recipient is None:
+        raise HTTPException(status_code=422, detail="launch bootstrap requires communication recipient context")
+
+    idempotency_key = f"onboarding-launch:{project.id}"
+    existing = db.query(models.DueAction).filter_by(idempotency_key=idempotency_key).one_or_none()
+    if existing is not None:
+        return existing
+
+    goal_summary: dict[str, str | bool | None]
+    if initial_goal is not None:
+        goal_summary = {
+            "present": True,
+            "title": initial_goal.title,
+            "description": initial_goal.description,
+            "status": initial_goal.status,
+            "commitment_due_at": initial_goal.commitment_due_at.isoformat() if initial_goal.commitment_due_at else None,
+        }
+        launch_text = (
+            f"Project {project.slug} finished onboarding and is ready for runtime launch. "
+            f"Initial goal: {initial_goal.title}."
+        )
+    else:
+        goal_summary = {
+            "present": False,
+            "title": None,
+            "description": None,
+            "status": None,
+            "commitment_due_at": None,
+        }
+        launch_text = (
+            f"Project {project.slug} finished onboarding but no initial goal was captured. "
+            "First-goal follow-up is required before runtime execution can proceed."
+        )
+
+    due_action = models.DueAction(
+        project_id=project.id,
+        channel=channel,
+        recipient=recipient,
+        kind="project_launch_bootstrap",
+        payload_json={
+            "text": launch_text,
+            "trace_label": "onboarding_launch_bootstrap",
+            "project_id": project.id,
+            "project_slug": project.slug,
+            "project_name": project.name,
+            "onboarding_status": onboarding_metadata.get("status"),
+            "board_integration": board_integration,
+            "reporting_cadence": reporting_cadence,
+            "boss": boss,
+            "admin": admin,
+            "communication_integrations": list(communication_integrations),
+            "goal_summary": goal_summary,
+            "follow_up": {
+                "required": initial_goal is None,
+                "type": "capture_initial_goal" if initial_goal is None else "start_initial_goal",
+            },
+        },
+        due_at=datetime.now(timezone.utc),
+        status="pending",
+        actor=admin.strip() if isinstance(admin, str) and admin.strip() else None,
+        idempotency_key=idempotency_key,
+    )
+    db.add(due_action)
+    db.flush()
+    return due_action

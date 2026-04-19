@@ -167,6 +167,8 @@ def test_onboarding_page_submit_creates_project_credentials_and_goal(onboarding_
     assert response.status_code == 201
     assert "Project launched." in body
     assert "Launch first milestone" in body
+    assert "Runtime bootstrap queued:" in body
+    assert "telegram -&gt; olga" in body or "telegram -> olga" in body
 
     database_session = db_module.SessionLocal()
     try:
@@ -175,6 +177,8 @@ def test_onboarding_page_submit_creates_project_credentials_and_goal(onboarding_
         onboarding = metadata.get("onboarding") or {}
         assert onboarding["communication_integrations"] == ["telegram"]
         assert onboarding["board_integration"] == "yandex_tracker"
+        assert onboarding["boss"] == "olga"
+        assert onboarding["admin"] == "alice"
         assert onboarding["employees"] == [
             {"name": "alice", "function": "operations", "capacity_hours": 160},
             {"name": "bob", "function": "qa", "capacity_hours": 160},
@@ -204,6 +208,27 @@ def test_onboarding_page_submit_creates_project_credentials_and_goal(onboarding_
         goal = database_session.query(models.Goal).filter_by(project_id=project.id).one()
         assert goal.title == "Launch first milestone"
         assert goal.status == "active"
+        due_action = (
+            database_session.query(models.DueAction)
+            .filter_by(project_id=project.id)
+            .one()
+        )
+        assert due_action.kind == "project_launch_bootstrap"
+        assert due_action.channel == "telegram"
+        assert due_action.recipient == "olga"
+        assert due_action.idempotency_key == f"onboarding-launch:{project.id}"
+        assert due_action.payload_json["goal_summary"] == {
+            "present": True,
+            "title": "Launch first milestone",
+            "description": "Create a visible first slice",
+            "status": "active",
+            "commitment_due_at": "2026-05-03T09:30:00",
+        }
+        assert due_action.payload_json["follow_up"] == {
+            "required": False,
+            "type": "start_initial_goal",
+        }
+        assert "initial goal: launch first milestone." in due_action.payload_json["text"].lower()
         tasks = (
             database_session.query(models.Task)
             .filter_by(project_id=project.id, goal_id=goal.id)

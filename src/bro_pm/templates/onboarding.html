@@ -274,6 +274,9 @@
           {% if success_summary.initial_goal_title %}
           <span>Initial goal: {{ success_summary.initial_goal_title }}</span>
           {% endif %}
+          {% if success_summary.launch_due_action_channel and success_summary.launch_due_action_recipient %}
+          <span>Runtime bootstrap queued: {{ success_summary.launch_due_action_channel }} -> {{ success_summary.launch_due_action_recipient }}</span>
+          {% endif %}
         </div>
       </section>
       {% endif %}

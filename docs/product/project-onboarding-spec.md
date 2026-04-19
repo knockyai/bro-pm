@@ -37,6 +37,9 @@ Bring a project from zero state to active, constrained autonomy.
    - `manual` and unsupported cadence values are intentionally skipped by the scheduler
 
 8. confirm first goal intake
+   - successful onboarding must enqueue durable `DueAction(kind="project_launch_bootstrap")` for Hermes/runtime handoff
+   - payload must include project identity, routing context (`boss`, `admin`, communication integration), and launch state
+   - if no initial goal exists, payload must explicitly request first-goal follow-up instead of ending silently
 
 ## 8.3 Gate checks
 

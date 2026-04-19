@@ -119,6 +119,8 @@ async def submit_onboarding_page(request: Request, db: Session = Depends(get_db_
                 "board_integration": board_integration,
                 "reporting_cadence": reporting_cadence,
                 "initial_goal_title": result.initial_goal.title if result.initial_goal is not None else None,
+                "launch_due_action_channel": result.launch_due_action.channel if result.launch_due_action is not None else None,
+                "launch_due_action_recipient": result.launch_due_action.recipient if result.launch_due_action is not None else None,
             },
         )
     except ValidationError as exc:
