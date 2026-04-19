@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import hashlib
 import json
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +14,7 @@ from .command_service import CommandService
 
 PENDING_STATUSES = frozenset({"pending"})
 CLAIMED_STATUS = "claimed"
+_MAX_CANONICAL_EVENT_KEY_LENGTH = 255
 
 
 def _utc_now() -> datetime:
@@ -179,6 +181,68 @@ class GatewayService:
         pending_audit_id: str | None,
         metadata: dict | None = None,
     ) -> models.ConversationEvent:
+        normalized_platform = platform.strip().lower()
+        normalized_chat_id = chat_id.strip() if isinstance(chat_id, str) and chat_id.strip() else None
+        normalized_thread_id = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
+        normalized_actor = actor.strip()
+        normalized_actor_role = actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else None
+        normalized_text = text.strip()
+        normalized_intent = normalized_intent.strip().lower() if isinstance(normalized_intent, str) and normalized_intent.strip() else None
+        normalized_metadata = metadata or {}
+        source_event_key = self._source_event_key(
+            platform=normalized_platform,
+            chat_id=normalized_chat_id,
+            thread_id=normalized_thread_id,
+            metadata=normalized_metadata,
+        )
+        correlation_key = self._correlation_key(
+            project_id=project_id,
+            platform=normalized_platform,
+            chat_id=normalized_chat_id,
+            thread_id=normalized_thread_id,
+            actor=normalized_actor,
+            due_action_id=due_action_id,
+            pending_audit_id=pending_audit_id,
+        )
+        incoming_event_payload = {
+            "project_id": project_id,
+            "due_action_id": due_action_id,
+            "pending_audit_id": pending_audit_id,
+            "platform": normalized_platform,
+            "chat_id": normalized_chat_id,
+            "thread_id": normalized_thread_id,
+            "actor": normalized_actor,
+            "text": normalized_text,
+            "normalized_intent": normalized_intent,
+            "correlation_key": correlation_key,
+        }
+        existing_event = self._existing_source_event(source_event_key=source_event_key)
+        if existing_event is not None:
+            if self._matches_existing_source_event(
+                event=existing_event,
+                project_id=project_id,
+                due_action_id=due_action_id,
+                pending_audit_id=pending_audit_id,
+                platform=normalized_platform,
+                chat_id=normalized_chat_id,
+                thread_id=normalized_thread_id,
+                actor=normalized_actor,
+                text=normalized_text,
+                normalized_intent=normalized_intent,
+                correlation_key=correlation_key,
+            ):
+                return existing_event
+            self._record_inbound_contradiction(
+                existing_event=existing_event,
+                project_id=project_id,
+                actor=normalized_actor,
+                source_event_key=source_event_key,
+                incoming_event=incoming_event_payload,
+            )
+            raise InboundReferenceConflictError(
+                f"source event {source_event_key} replayed with conflicting canonical facts"
+            )
+
         disposition = "ignore"
         reason = "no allowed reaction for inbound event"
 
@@ -192,8 +256,8 @@ class GatewayService:
             self._assert_due_action_matches_context(
                 due_action=due_action,
                 project_id=project_id,
-                platform=platform,
-                actor=actor,
+                platform=normalized_platform,
+                actor=normalized_actor,
             )
             if normalized_intent in {"ack", "acknowledge", "confirm", "confirmed"}:
                 due_action.status = "acked"
@@ -214,16 +278,16 @@ class GatewayService:
                 approval_status = self._approval_status_for_intent(normalized_intent)
                 if approval_status is not None and project is not None and self._actor_has_project_reply_privilege(
                     project=project,
-                    actor=actor,
+                    actor=normalized_actor,
                 ):
                     approval_role = self._approval_role_for_actor(project=project, actor=actor)
                     CommandService(db_session=self.db_session).decide_approval(
                         audit_event_id=pending_audit.id,
-                        actor=actor.strip(),
+                        actor=normalized_actor,
                         role=approval_role,
-                        reviewer_role=actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else None,
+                        reviewer_role=normalized_actor_role,
                         approved=approval_status == "approved",
-                        decision_text=text.strip(),
+                        decision_text=normalized_text,
                         decision_payload={"source": "gateway_inbound", "actor_role": actor_role},
                         actor_trusted=True,
                     )
@@ -231,7 +295,7 @@ class GatewayService:
                     reason = "approval reply recorded for pending audit event"
 
         if disposition == "ignore":
-            if project and self._actor_has_project_reply_privilege(project=project, actor=actor):
+            if project and self._actor_has_project_reply_privilege(project=project, actor=normalized_actor):
                 disposition = "allow_reply"
                 reason = "trusted project actor may receive a reply"
 
@@ -239,21 +303,190 @@ class GatewayService:
             project_id=project_id,
             due_action_id=due_action.id if due_action is not None else due_action_id,
             pending_audit_id=pending_audit.id if pending_audit is not None else pending_audit_id,
-            platform=platform.strip().lower(),
-            chat_id=chat_id.strip() if isinstance(chat_id, str) and chat_id.strip() else None,
-            thread_id=thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None,
-            actor=actor.strip(),
-            actor_role=actor_role.strip().lower() if isinstance(actor_role, str) and actor_role.strip() else None,
-            text=text.strip(),
-            normalized_intent=normalized_intent.strip().lower() if isinstance(normalized_intent, str) and normalized_intent.strip() else None,
-            metadata_json=metadata or {},
+            platform=normalized_platform,
+            chat_id=normalized_chat_id,
+            thread_id=normalized_thread_id,
+            actor=normalized_actor,
+            actor_role=normalized_actor_role,
+            text=normalized_text,
+            normalized_intent=normalized_intent,
+            source_event_key=source_event_key,
+            correlation_key=correlation_key,
+            metadata_json=normalized_metadata,
             disposition=disposition,
             decision_reason=reason,
         )
         self.db_session.add(event)
-        self.db_session.commit()
+        try:
+            self.db_session.commit()
+        except IntegrityError as exc:
+            self.db_session.rollback()
+            existing_event = self._existing_source_event(source_event_key=source_event_key)
+            if source_event_key and existing_event is not None:
+                if self._matches_existing_source_event(
+                    event=existing_event,
+                    project_id=project_id,
+                    due_action_id=due_action_id,
+                    pending_audit_id=pending_audit_id,
+                    platform=normalized_platform,
+                    chat_id=normalized_chat_id,
+                    thread_id=normalized_thread_id,
+                    actor=normalized_actor,
+                    text=normalized_text,
+                    normalized_intent=normalized_intent,
+                    correlation_key=correlation_key,
+                ):
+                    return existing_event
+                self._record_inbound_contradiction(
+                    existing_event=existing_event,
+                    project_id=project_id,
+                    actor=normalized_actor,
+                    source_event_key=source_event_key,
+                    incoming_event=incoming_event_payload,
+                )
+                raise InboundReferenceConflictError(
+                    f"source event {source_event_key} replayed with conflicting canonical facts"
+                ) from exc
+            raise InboundReferenceConflictError("failed to persist inbound event") from exc
         self.db_session.refresh(event)
         return event
+
+    def _existing_source_event(self, *, source_event_key: str | None) -> models.ConversationEvent | None:
+        if not source_event_key:
+            return None
+        return (
+            self.db_session.query(models.ConversationEvent)
+            .filter(models.ConversationEvent.source_event_key == source_event_key)
+            .one_or_none()
+        )
+
+    def _bounded_event_key(self, *, key_type: str, candidate: str) -> str:
+        if len(candidate) <= _MAX_CANONICAL_EVENT_KEY_LENGTH:
+            return candidate
+        return f"{key_type}:sha256:{hashlib.sha256(candidate.encode('utf-8')).hexdigest()}"
+
+    def _source_event_key(
+        self,
+        *,
+        platform: str,
+        chat_id: str | None,
+        thread_id: str | None,
+        metadata: dict,
+    ) -> str | None:
+        message_id = None
+        for key in ("telegram_message_id", "message_id", "source_event_id", "event_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                message_id = value.strip()
+                break
+            if isinstance(value, int) and not isinstance(value, bool):
+                message_id = str(value)
+                break
+        if message_id is None:
+            return None
+
+        parts = [f"gateway:{platform}", chat_id or "chat:none"]
+        if thread_id:
+            parts.append(thread_id)
+        parts.append(f"message:{message_id}")
+        return self._bounded_event_key(key_type="source_event", candidate=":".join(parts))
+
+    def _correlation_key(
+        self,
+        *,
+        project_id: str | None,
+        platform: str,
+        chat_id: str | None,
+        thread_id: str | None,
+        actor: str,
+        due_action_id: str | None,
+        pending_audit_id: str | None,
+    ) -> str:
+        if due_action_id:
+            candidate = f"project:{project_id}:due_action:{due_action_id}"
+        elif pending_audit_id:
+            candidate = f"project:{project_id}:pending_audit:{pending_audit_id}"
+        elif project_id:
+            candidate = (
+                f"project:{project_id}:platform:{platform}:chat:{chat_id or 'none'}:"
+                f"thread:{thread_id or 'none'}:actor:{actor.lower()}"
+            )
+        else:
+            candidate = f"platform:{platform}:chat:{chat_id or 'none'}:thread:{thread_id or 'none'}:actor:{actor.lower()}"
+        return self._bounded_event_key(key_type="correlation", candidate=candidate)
+
+    def _matches_existing_source_event(
+        self,
+        *,
+        event: models.ConversationEvent,
+        project_id: str | None,
+        due_action_id: str | None,
+        pending_audit_id: str | None,
+        platform: str,
+        chat_id: str | None,
+        thread_id: str | None,
+        actor: str,
+        text: str,
+        normalized_intent: str | None,
+        correlation_key: str,
+    ) -> bool:
+        return (
+            event.project_id == project_id
+            and event.due_action_id == due_action_id
+            and event.pending_audit_id == pending_audit_id
+            and event.platform == platform
+            and event.chat_id == chat_id
+            and event.thread_id == thread_id
+            and event.actor == actor
+            and event.text == text
+            and event.normalized_intent == normalized_intent
+            and event.correlation_key == correlation_key
+        )
+
+    def _record_inbound_contradiction(
+        self,
+        *,
+        existing_event: models.ConversationEvent,
+        project_id: str | None,
+        actor: str,
+        source_event_key: str | None,
+        incoming_event: dict,
+    ) -> None:
+        contradiction_project_id = existing_event.project_id or project_id
+        project = self.db_session.get(models.Project, contradiction_project_id) if contradiction_project_id else None
+        if project is not None:
+            project.safe_paused = True
+
+        audit_event = models.AuditEvent(
+            project_id=contradiction_project_id,
+            actor=actor,
+            action="gateway_inbound_contradiction",
+            target_type="conversation_event",
+            target_id=existing_event.id,
+            payload=json.dumps(
+                {
+                    "source_event_key": source_event_key,
+                    "existing_event": {
+                        "project_id": existing_event.project_id,
+                        "due_action_id": existing_event.due_action_id,
+                        "pending_audit_id": existing_event.pending_audit_id,
+                        "platform": existing_event.platform,
+                        "chat_id": existing_event.chat_id,
+                        "thread_id": existing_event.thread_id,
+                        "actor": existing_event.actor,
+                        "text": existing_event.text,
+                        "normalized_intent": existing_event.normalized_intent,
+                        "correlation_key": existing_event.correlation_key,
+                    },
+                    "incoming_event": incoming_event,
+                    "safe_paused": project is not None,
+                },
+                ensure_ascii=False,
+            ),
+            result="detected",
+        )
+        self.db_session.add(audit_event)
+        self.db_session.commit()
 
     def _actor_has_project_reply_privilege(
         self,

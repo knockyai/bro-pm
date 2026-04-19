@@ -320,6 +320,10 @@ class DueAction(Base):
 
 class ConversationEvent(Base):
     __tablename__ = "conversation_events"
+    __table_args__ = (
+        Index("ix_conversation_events_correlation_key", "correlation_key"),
+        UniqueConstraint("source_event_key", name="uq_conversation_events_source_event_key"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
@@ -332,6 +336,8 @@ class ConversationEvent(Base):
     actor_role: Mapped[str | None] = mapped_column(String(80), nullable=True)
     text: Mapped[str] = mapped_column(Text)
     normalized_intent: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    source_event_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    correlation_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     disposition: Mapped[str] = mapped_column(String(80), default="ignore")
     decision_reason: Mapped[str] = mapped_column(Text, default="")

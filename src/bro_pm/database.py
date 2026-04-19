@@ -17,6 +17,8 @@ SessionLocal = sessionmaker(bind=_engine, class_=Session, autocommit=False, auto
 _ACTIVE_GOAL_INDEX_NAME = "uq_goals_project_active"
 _ACTIVE_GOAL_PARTIAL_INDEX_DIALECTS = frozenset({"sqlite", "postgresql"})
 _ACTIVE_GOAL_INDEX_PREDICATE = "lower(trim(status)) = 'active'"
+_CONVERSATION_EVENT_CORRELATION_INDEX_NAME = "ix_conversation_events_correlation_key"
+_CONVERSATION_EVENT_SOURCE_EVENT_INDEX_NAME = "uq_conversation_events_source_event_key"
 
 
 def _compact_sql(sql: str) -> str:
@@ -183,6 +185,28 @@ def _upgrade_legacy_schema() -> None:
                             "ON goals (project_id) WHERE lower(trim(status)) = 'active'"
                         )
                     )
+
+    if "conversation_events" in inspector.get_table_names():
+        conversation_event_columns = {column["name"] for column in inspector.get_columns("conversation_events")}
+        if "source_event_key" not in conversation_event_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE conversation_events ADD COLUMN source_event_key VARCHAR(255)"))
+        if "correlation_key" not in conversation_event_columns:
+            with _engine.begin() as connection:
+                connection.execute(text("ALTER TABLE conversation_events ADD COLUMN correlation_key VARCHAR(255)"))
+        with _engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {_CONVERSATION_EVENT_SOURCE_EVENT_INDEX_NAME} "
+                    "ON conversation_events (source_event_key)"
+                )
+            )
+            connection.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {_CONVERSATION_EVENT_CORRELATION_INDEX_NAME} "
+                    "ON conversation_events (correlation_key)"
+                )
+            )
 
 
 def init_db(database_url: str | None = None) -> None:
