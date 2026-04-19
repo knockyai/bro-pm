@@ -209,6 +209,154 @@ def test_init_db_upgrades_legacy_schema_for_autonomy_state(tmp_path):
     assert "action_executions" in tables
 
 
+def test_init_db_upgrades_legacy_rollback_records_schema_for_dependency_plans(tmp_path):
+    legacy_db_url = f"sqlite:///{tmp_path / 'legacy_rollback_records.db'}"
+
+    _create_legacy_schema(legacy_db_url)
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(legacy_db_url)
+
+    inspector = inspect(database._engine)
+    rollback_columns = {column["name"] for column in inspector.get_columns("rollback_records")}
+
+    assert "rollback_root_audit_event_id" in rollback_columns
+    assert "plan" in rollback_columns
+    assert "verification_detail" in rollback_columns
+    assert "remediation_detail" in rollback_columns
+
+
+def test_init_db_upgrades_legacy_rollback_records_schema_preserves_unique_audit_event_id(tmp_path):
+    legacy_db_url = f"sqlite:///{tmp_path / 'legacy_rollback_records_unique.db'}"
+
+    _create_legacy_schema(legacy_db_url)
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+    database.init_db(legacy_db_url)
+
+    db_session = database.SessionLocal()
+    try:
+        project = models.Project(
+            id="project-legacy-rollback-1",
+            name="Legacy rollback project",
+            slug="legacy-rollback-project",
+            visibility="internal",
+        )
+        db_session.add(project)
+        db_session.flush()
+
+        audit = models.AuditEvent(
+            project_id=project.id,
+            actor="alice",
+            action="pause_project",
+            target_type="project",
+            target_id=project.id,
+            payload="{}",
+            result="executed",
+        )
+        db_session.add(audit)
+        db_session.flush()
+
+        db_session.add(
+            models.RollbackRecord(
+                audit_event_id=audit.id,
+                rollback_root_audit_event_id=audit.id,
+                actor="alice",
+                reason="first rollback",
+                plan_json={},
+                verification_detail="verify",
+                remediation_detail="",
+                executed=True,
+            )
+        )
+        db_session.flush()
+
+        db_session.add(
+            models.RollbackRecord(
+                audit_event_id=audit.id,
+                rollback_root_audit_event_id=audit.id,
+                actor="bob",
+                reason="duplicate rollback",
+                plan_json={},
+                verification_detail="verify",
+                remediation_detail="",
+                executed=True,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db_session.flush()
+    finally:
+        db_session.rollback()
+        db_session.close()
+
+
+def test_init_db_rejects_legacy_duplicate_rollback_records_before_creating_unique_index(tmp_path):
+    legacy_db_url = f"sqlite:///{tmp_path / 'legacy_rollback_records_duplicates.db'}"
+
+    _create_legacy_schema(legacy_db_url)
+    legacy_engine = create_engine(legacy_db_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, slug, visibility) VALUES (:id, :name, :slug, :visibility)"
+            ),
+            {
+                "id": "project-legacy-rollback-dup",
+                "name": "Legacy rollback duplicate project",
+                "slug": "legacy-rollback-duplicate-project",
+                "visibility": "internal",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO audit_events (id, project_id, actor, action, target_type, target_id, payload, result)
+                VALUES (:id, :project_id, :actor, :action, :target_type, :target_id, :payload, :result)
+                """
+            ),
+            {
+                "id": "audit-legacy-rollback-dup",
+                "project_id": "project-legacy-rollback-dup",
+                "actor": "alice",
+                "action": "pause_project",
+                "target_type": "project",
+                "target_id": "project-legacy-rollback-dup",
+                "payload": "{}",
+                "result": "executed",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO rollback_records (id, audit_event_id, actor, reason, executed)
+                VALUES (:id, :audit_event_id, :actor, :reason, :executed)
+                """
+            ),
+            [
+                {
+                    "id": "rollback-legacy-dup-1",
+                    "audit_event_id": "audit-legacy-rollback-dup",
+                    "actor": "alice",
+                    "reason": "first legacy rollback",
+                    "executed": 1,
+                },
+                {
+                    "id": "rollback-legacy-dup-2",
+                    "audit_event_id": "audit-legacy-rollback-dup",
+                    "actor": "bob",
+                    "reason": "duplicate legacy rollback",
+                    "executed": 1,
+                },
+            ],
+        )
+
+    sys.modules.pop("bro_pm.database", None)
+    database = importlib.import_module("bro_pm.database")
+
+    with pytest.raises(RuntimeError, match="duplicate rollback records detected for legacy migration"):
+        database.init_db(legacy_db_url)
+
+
 def test_init_db_rejects_legacy_duplicates_before_creating_active_goal_index(tmp_path):
     """Legacy active-goal duplicates should fail with a clear migration preflight error."""
 

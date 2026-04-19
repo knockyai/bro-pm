@@ -269,8 +269,12 @@ class RollbackRecord(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     audit_event_id: Mapped[str] = mapped_column(String, ForeignKey("audit_events.id"))
+    rollback_root_audit_event_id: Mapped[str] = mapped_column(String, index=True)
     actor: Mapped[str] = mapped_column(String(120))
     reason: Mapped[str] = mapped_column(Text)
+    plan_json: Mapped[dict] = mapped_column("plan", JSON, default=dict)
+    verification_detail: Mapped[str] = mapped_column(Text, default="")
+    remediation_detail: Mapped[str] = mapped_column(Text, default="")
     executed: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

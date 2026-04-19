@@ -278,6 +278,126 @@ class CommandService:
         except Exception:
             return None
 
+    @staticmethod
+    def _audit_payload_dict(audit_event: models.AuditEvent) -> dict:
+        try:
+            payload = json.loads(audit_event.payload or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _proposal_payload_from_audit(self, audit_event: models.AuditEvent) -> dict:
+        payload = self._audit_payload_dict(audit_event)
+        proposal_payload = payload.get("proposal")
+        if not isinstance(proposal_payload, dict):
+            return {}
+        nested_payload = proposal_payload.get("payload")
+        return nested_payload if isinstance(nested_payload, dict) else {}
+
+    def _rollback_dependents_for(
+        self,
+        original: models.AuditEvent,
+    ) -> tuple[list[models.AuditEvent], models.AuditEvent | None]:
+        reversible_actions = {"pause_project", "unpause_project"}
+        root_lineage_ids = {original.id}
+        dependents: list[models.AuditEvent] = []
+        conflicting_reversible_event: models.AuditEvent | None = None
+        candidates = (
+            self.db.query(models.AuditEvent)
+            .filter(
+                models.AuditEvent.project_id == original.project_id,
+                models.AuditEvent.result == "executed",
+                models.AuditEvent.created_at >= original.created_at,
+                models.AuditEvent.id != original.id,
+            )
+            .order_by(models.AuditEvent.created_at.asc(), models.AuditEvent.id.asc())
+            .all()
+        )
+        candidate_ids = [candidate.id for candidate in candidates]
+        rolled_back_audit_event_ids = {
+            audit_event_id
+            for (audit_event_id,) in self.db.query(models.RollbackRecord.audit_event_id)
+            .filter(
+                models.RollbackRecord.executed.is_(True),
+                models.RollbackRecord.audit_event_id.in_(candidate_ids),
+            )
+            .all()
+        }
+        for candidate in candidates:
+            if candidate.id in rolled_back_audit_event_ids:
+                continue
+            candidate_payload = self._proposal_payload_from_audit(candidate)
+            depends_on_audit_event_id = candidate_payload.get("depends_on_audit_event_id")
+            explicitly_dependent = isinstance(depends_on_audit_event_id, str) and depends_on_audit_event_id in root_lineage_ids
+            if explicitly_dependent:
+                dependents.append(candidate)
+                root_lineage_ids.add(candidate.id)
+                continue
+            if candidate.action in reversible_actions and conflicting_reversible_event is None:
+                conflicting_reversible_event = candidate
+        return dependents, conflicting_reversible_event
+
+    def _rollback_plan_for(self, original: models.AuditEvent) -> tuple[list[models.AuditEvent], dict]:
+        dependents, conflicting_reversible_event = self._rollback_dependents_for(original)
+        plan_events = [*reversed(dependents), original]
+        step_audit_event_ids = [event.id for event in plan_events]
+        step_actions: list[str] = []
+        blocked_event: models.AuditEvent | None = None
+        blocked_reason: str | None = None
+        for event in plan_events:
+            rollback_action = self._rollback_action_for(event.action)
+            if rollback_action is None:
+                blocked_event = event
+                blocked_reason = "irreversible_dependent_action"
+                break
+            step_actions.append(rollback_action)
+
+        verification_target = step_actions[-1] if step_actions else self._rollback_action_for(original.action)
+        expected_safe_paused = verification_target == "pause_project"
+        verification_detail = f"verify project.safe_paused is {str(expected_safe_paused)} after rollback plan execution"
+        remediation_detail = ""
+        status = "ready"
+        if blocked_event is not None:
+            status = "blocked"
+            verification_detail = "verify project.safe_paused before retrying"
+            remediation_detail = "remediate the dependent side effect and verify project.safe_paused before retrying"
+        elif conflicting_reversible_event is not None:
+            blocked_event = conflicting_reversible_event
+            blocked_reason = "later_independent_reversible_action"
+            status = "blocked"
+            verification_detail = "verify project.safe_paused before retrying"
+            remediation_detail = "verify the newer operator decisions and attach an explicit dependency chain before retrying"
+
+        plan_payload = {
+            "status": status,
+            "step_audit_event_ids": step_audit_event_ids,
+            "step_actions": step_actions,
+            "verification_detail": verification_detail,
+            "remediation_detail": remediation_detail,
+        }
+        if blocked_event is not None:
+            plan_payload["blocked_by_audit_event_id"] = blocked_event.id
+            plan_payload["blocked_by_action"] = blocked_event.action
+        if blocked_reason is not None:
+            plan_payload["blocked_reason"] = blocked_reason
+        return plan_events, plan_payload
+
+    def _verify_rollback_plan(self, *, project_id: str, plan_payload: dict) -> bool:
+        verification_detail = plan_payload.get("verification_detail")
+        if not isinstance(verification_detail, str):
+            return False
+        if "project.safe_paused is True" in verification_detail:
+            expected_safe_paused = True
+        elif "project.safe_paused is False" in verification_detail:
+            expected_safe_paused = False
+        else:
+            return False
+        project = self._get_project(project_id)
+        if project is None:
+            return False
+        self.db.refresh(project)
+        return bool(project.safe_paused) is expected_safe_paused
+
     def _approval_payload_update(
         self,
         *,
@@ -1114,6 +1234,55 @@ class CommandService:
             reason="rollback of action",
             payload=rollback_payload,
         )
+        plan_events, rollback_plan = self._rollback_plan_for(original)
+        if rollback_plan["status"] == "blocked":
+            blocked_reason = rollback_plan.get("blocked_reason")
+            if blocked_reason == "later_independent_reversible_action":
+                detail = (
+                    f"unsafe rollback: later audit event {rollback_plan['blocked_by_audit_event_id']} "
+                    "changed reversible project state without explicit dependency linkage; "
+                    f"{rollback_plan['remediation_detail']}"
+                )
+            else:
+                detail = (
+                    f"unsafe rollback: dependent audit event {rollback_plan['blocked_by_audit_event_id']} "
+                    f"with action {rollback_plan['blocked_by_action']} cannot be safely reversed; "
+                    f"{rollback_plan['remediation_detail']}"
+                )
+            payload = {
+                "actor": actor,
+                "auth": {
+                    "role": role,
+                    "actor_trusted": actor_trusted,
+                },
+                "proposal": {
+                    "action": "rollback_action",
+                    "project_id": project_id,
+                    "reason": "rollback blocked by dependent side effect",
+                    "payload": rollback_payload,
+                },
+                "rollback_plan": rollback_plan,
+            }
+            record = models.AuditEvent(
+                project_id=project_id,
+                actor=actor,
+                action="rollback_action",
+                target_type="rollback",
+                target_id=original.id,
+                payload=json.dumps(payload, ensure_ascii=False),
+                result="denied",
+                created_at=datetime.utcnow(),
+            )
+            self.db.add(record)
+            self.db.flush()
+            return RollbackExecution(
+                success=False,
+                proposal=rollback_proposal,
+                audit_id=record.id,
+                rollback_record_id="",
+                result="rejected",
+                detail=detail,
+            )
 
         decision: PolicyDecision = self.policy.evaluate(
             actor_role=role,
@@ -1135,6 +1304,7 @@ class CommandService:
                     "payload": rollback_payload,
                 },
                 "policy": decision.__dict__,
+                "rollback_plan": rollback_plan,
             }
             record = models.AuditEvent(
                 project_id=project_id,
@@ -1157,14 +1327,21 @@ class CommandService:
                 detail=decision.reason,
             )
 
-        rollback_record = models.RollbackRecord(
-            audit_event_id=original.id,
-            actor=actor,
-            reason=reason,
-            executed=True,
-            created_at=datetime.utcnow(),
-        )
-        self.db.add(rollback_record)
+        rollback_records: list[models.RollbackRecord] = []
+        for plan_event in plan_events:
+            rollback_record = models.RollbackRecord(
+                audit_event_id=plan_event.id,
+                rollback_root_audit_event_id=original.id,
+                actor=actor,
+                reason=reason,
+                plan_json=rollback_plan,
+                verification_detail=str(rollback_plan["verification_detail"]),
+                remediation_detail=str(rollback_plan["remediation_detail"]),
+                executed=True,
+                created_at=datetime.utcnow(),
+            )
+            rollback_records.append(rollback_record)
+            self.db.add(rollback_record)
         try:
             self.db.flush()
         except IntegrityError:
@@ -1192,14 +1369,15 @@ class CommandService:
                 "role": role,
                 "actor_trusted": actor_trusted,
             },
-            "proposal": {
-                "action": "rollback_action",
-                "project_id": project_id,
-                "reason": "rollback of action",
-                "payload": rollback_payload,
-            },
-            "policy": decision.__dict__,
-        }
+                "proposal": {
+                    "action": "rollback_action",
+                    "project_id": project_id,
+                    "reason": "rollback of action",
+                    "payload": rollback_payload,
+                },
+                "policy": decision.__dict__,
+                "rollback_plan": rollback_plan,
+            }
         record = models.AuditEvent(
             project_id=project_id,
             actor=actor,
@@ -1223,17 +1401,20 @@ class CommandService:
                 "rollback_target_action": rollback_action,
             },
         )
-        self._apply_action(action=rollback_action, project_id=project_id)
+        for plan_action in rollback_plan["step_actions"]:
+            self._apply_action(action=plan_action, project_id=project_id)
         self.db.query(models.AuditEvent).filter_by(id=record.id).update(
             {models.AuditEvent.result: "executed"},
             synchronize_session=False,
         )
+        if not self._verify_rollback_plan(project_id=project_id, plan_payload=rollback_plan):
+            raise RuntimeError("rollback plan verification failed")
 
         return RollbackExecution(
             success=True,
             proposal=rollback_proposal,
             audit_id=record.id,
-            rollback_record_id=rollback_record.id,
+            rollback_record_id=rollback_records[0].id,
             result="executed",
             detail="rollback action applied",
         )

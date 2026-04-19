@@ -145,6 +145,38 @@ def _assert_no_legacy_active_goal_duplicates() -> None:
     )
 
 
+def _legacy_rollback_record_duplicates() -> list[tuple[str, int]]:
+    rows = []
+    with _engine.connect() as connection:
+        results = connection.execute(
+            text(
+                """
+                SELECT audit_event_id, COUNT(*) AS rollback_count
+                FROM rollback_records
+                GROUP BY audit_event_id
+                HAVING COUNT(*) > 1
+                """
+            )
+        ).mappings().all()
+    for row in results:
+        rows.append((row["audit_event_id"], row["rollback_count"]))
+    return rows
+
+
+def _assert_no_legacy_rollback_record_duplicates() -> None:
+    duplicates = _legacy_rollback_record_duplicates()
+    if not duplicates:
+        return
+
+    duplicates_summary = ", ".join(
+        f"{audit_event_id} ({count})" for audit_event_id, count in duplicates
+    )
+    raise RuntimeError(
+        "duplicate rollback records detected for legacy migration: "
+        f"unique rollback constraint would be violated for {duplicates_summary}"
+    )
+
+
 def _upgrade_legacy_schema() -> None:
     inspector = inspect(_engine)
 
@@ -205,6 +237,35 @@ def _upgrade_legacy_schema() -> None:
                 text(
                     f"CREATE INDEX IF NOT EXISTS {_CONVERSATION_EVENT_CORRELATION_INDEX_NAME} "
                     "ON conversation_events (correlation_key)"
+                )
+            )
+
+    if "rollback_records" in inspector.get_table_names():
+        rollback_columns = {column["name"] for column in inspector.get_columns("rollback_records")}
+        _assert_no_legacy_rollback_record_duplicates()
+        with _engine.begin() as connection:
+            if "rollback_root_audit_event_id" not in rollback_columns:
+                connection.execute(text("ALTER TABLE rollback_records ADD COLUMN rollback_root_audit_event_id VARCHAR"))
+            if "plan" not in rollback_columns:
+                connection.execute(text("ALTER TABLE rollback_records ADD COLUMN plan JSON"))
+            if "verification_detail" not in rollback_columns:
+                connection.execute(
+                    text("ALTER TABLE rollback_records ADD COLUMN verification_detail TEXT NOT NULL DEFAULT ''")
+                )
+            if "remediation_detail" not in rollback_columns:
+                connection.execute(
+                    text("ALTER TABLE rollback_records ADD COLUMN remediation_detail TEXT NOT NULL DEFAULT ''")
+                )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_rollback_records_audit_event_id "
+                    "ON rollback_records (audit_event_id)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_rollback_records_rollback_root_audit_event_id "
+                    "ON rollback_records (rollback_root_audit_event_id)"
                 )
             )
 

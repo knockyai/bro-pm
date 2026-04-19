@@ -5262,6 +5262,492 @@ def test_command_service_rejects_concurrent_rollback_of_same_event(tmp_path):
         verify_session.close()
 
 
+def test_command_service_rollback_plans_explicit_dependents_in_reverse_lineage_order(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback lineage project", slug="rollback-lineage")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    unpause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    repause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+    assert unpause_result.result == "executed"
+    assert repause_result.result == "executed"
+
+    unpause_audit = session.query(models.AuditEvent).filter_by(id=unpause_result.audit_id).one()
+    unpause_payload = json.loads(unpause_audit.payload)
+    unpause_payload.setdefault("proposal", {}).setdefault("payload", {})["depends_on_audit_event_id"] = pause_result.audit_id
+    unpause_audit.payload = json.dumps(unpause_payload, ensure_ascii=False)
+
+    repause_audit = session.query(models.AuditEvent).filter_by(id=repause_result.audit_id).one()
+    repause_payload = json.loads(repause_audit.payload)
+    repause_payload.setdefault("proposal", {}).setdefault("payload", {})["depends_on_audit_event_id"] = unpause_result.audit_id
+    repause_audit.payload = json.dumps(repause_payload, ensure_ascii=False)
+    session.flush()
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="undo the whole pause lineage",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is True
+    assert rollback_result.result == "executed"
+
+    session.refresh(project)
+    assert project.safe_paused is False
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    payload = json.loads(rollback_audit.payload)
+    assert payload["rollback_plan"]["step_audit_event_ids"] == [
+        repause_result.audit_id,
+        unpause_result.audit_id,
+        pause_result.audit_id,
+    ]
+    assert payload["rollback_plan"]["step_actions"] == [
+        "unpause_project",
+        "pause_project",
+        "unpause_project",
+    ]
+
+
+def test_command_service_rejects_rollback_when_later_reversible_actions_are_not_explicitly_dependent(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback conflict project", slug="rollback-conflict")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    independent_resume = service.execute(
+        actor="bob",
+        role="admin",
+        proposal=service.parse(
+            actor="bob",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    independent_repause = service.execute(
+        actor="carol",
+        role="admin",
+        proposal=service.parse(
+            actor="carol",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+    assert independent_resume.result == "executed"
+    assert independent_repause.result == "executed"
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="do not undo later independent operator decisions",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == (
+        f"unsafe rollback: later audit event {independent_resume.audit_id} "
+        "changed reversible project state without explicit dependency linkage; "
+        "verify the newer operator decisions and attach an explicit dependency chain before retrying"
+    )
+
+    session.refresh(project)
+    assert project.safe_paused is True
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    payload = json.loads(rollback_audit.payload)
+    assert payload["rollback_plan"]["status"] == "blocked"
+    assert payload["rollback_plan"]["blocked_by_audit_event_id"] == independent_resume.audit_id
+    assert payload["rollback_plan"]["blocked_by_action"] == "unpause_project"
+    assert payload["rollback_plan"]["remediation_detail"] == (
+        "verify the newer operator decisions and attach an explicit dependency chain before retrying"
+    )
+    assert payload["rollback_plan"]["verification_detail"] == "verify project.safe_paused before retrying"
+
+
+def test_command_service_prioritizes_irreversible_dependents_over_later_independent_reversible_actions(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback mixed blocker project", slug="rollback-mixed-blocker")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+
+    dependent_payload = {
+        "proposal": {
+            "action": "create_task",
+            "project_id": project.id,
+            "reason": "dependent external side effect",
+            "payload": {
+                "depends_on_audit_event_id": pause_result.audit_id,
+                "title": "external task creation",
+            },
+        }
+    }
+    dependent_record = models.AuditEvent(
+        project_id=project.id,
+        actor="alice",
+        action="create_task",
+        target_type="proposal",
+        target_id=project.id,
+        payload=json.dumps(dependent_payload, ensure_ascii=False),
+        result="executed",
+        created_at=datetime.utcnow(),
+    )
+    session.add(dependent_record)
+    session.flush()
+
+    independent_resume = service.execute(
+        actor="bob",
+        role="admin",
+        proposal=service.parse(
+            actor="bob",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert independent_resume.result == "executed"
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="mixed blockers should report the irreversible dependent first",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == (
+        f"unsafe rollback: dependent audit event {dependent_record.id} "
+        "with action create_task cannot be safely reversed; "
+        "remediate the dependent side effect and verify project.safe_paused before retrying"
+    )
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    payload = json.loads(rollback_audit.payload)
+    assert payload["rollback_plan"]["blocked_reason"] == "irreversible_dependent_action"
+    assert payload["rollback_plan"]["blocked_by_audit_event_id"] == dependent_record.id
+    assert payload["rollback_plan"]["blocked_by_action"] == "create_task"
+
+
+def test_command_service_prioritizes_later_irreversible_dependents_over_earlier_independent_reversible_actions(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback later mixed blocker project", slug="rollback-later-mixed-blocker")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+
+    independent_resume = service.execute(
+        actor="bob",
+        role="admin",
+        proposal=service.parse(
+            actor="bob",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert independent_resume.result == "executed"
+
+    dependent_payload = {
+        "proposal": {
+            "action": "create_task",
+            "project_id": project.id,
+            "reason": "dependent external side effect",
+            "payload": {
+                "depends_on_audit_event_id": pause_result.audit_id,
+                "title": "external task creation",
+            },
+        }
+    }
+    dependent_record = models.AuditEvent(
+        project_id=project.id,
+        actor="alice",
+        action="create_task",
+        target_type="proposal",
+        target_id=project.id,
+        payload=json.dumps(dependent_payload, ensure_ascii=False),
+        result="executed",
+        created_at=datetime.utcnow(),
+    )
+    session.add(dependent_record)
+    session.flush()
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="later explicit dependent must outrank earlier independent resume",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == (
+        f"unsafe rollback: dependent audit event {dependent_record.id} "
+        "with action create_task cannot be safely reversed; "
+        "remediate the dependent side effect and verify project.safe_paused before retrying"
+    )
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    payload = json.loads(rollback_audit.payload)
+    assert payload["rollback_plan"]["blocked_reason"] == "irreversible_dependent_action"
+    assert payload["rollback_plan"]["blocked_by_audit_event_id"] == dependent_record.id
+    assert payload["rollback_plan"]["blocked_by_action"] == "create_task"
+
+
+def test_command_service_allows_rollback_after_later_reversible_action_was_itself_rolled_back(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback resolved blocker project", slug="rollback-resolved-blocker")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    resume_result = service.execute(
+        actor="bob",
+        role="admin",
+        proposal=service.parse(
+            actor="bob",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+    assert resume_result.result == "executed"
+
+    rollback_resume = service.rollback(
+        actor="bob",
+        role="admin",
+        audit_event_id=resume_result.audit_id,
+        reason="undo later independent resume first",
+        actor_trusted=True,
+    )
+    assert rollback_resume.success is True
+    assert rollback_resume.result == "executed"
+
+    rollback_pause = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="original pause can roll back once later resume is undone",
+        actor_trusted=True,
+    )
+
+    assert rollback_pause.success is True
+    assert rollback_pause.result == "executed"
+
+    session.refresh(project)
+    assert project.safe_paused is False
+
+
+def test_command_service_rejects_rollback_when_dependent_side_effect_is_not_safely_reversible(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback blocked project", slug="rollback-blocked")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+
+    dependent_payload = {
+        "proposal": {
+            "action": "create_task",
+            "project_id": project.id,
+            "reason": "dependent external side effect",
+            "payload": {
+                "depends_on_audit_event_id": pause_result.audit_id,
+                "title": "external task creation",
+            },
+        }
+    }
+    dependent_record = models.AuditEvent(
+        project_id=project.id,
+        actor="alice",
+        action="create_task",
+        target_type="proposal",
+        target_id=project.id,
+        payload=json.dumps(dependent_payload, ensure_ascii=False),
+        result="executed",
+        created_at=datetime.utcnow(),
+    )
+    session.add(dependent_record)
+    session.flush()
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="cannot safely reverse dependent side effect",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is False
+    assert rollback_result.result == "rejected"
+    assert rollback_result.detail == (
+        f"unsafe rollback: dependent audit event {dependent_record.id} "
+        "with action create_task cannot be safely reversed; "
+        "remediate the dependent side effect and verify project.safe_paused before retrying"
+    )
+
+    session.refresh(project)
+    assert project.safe_paused is True
+
+    rollback_audit = session.query(models.AuditEvent).filter_by(id=rollback_result.audit_id).one()
+    payload = json.loads(rollback_audit.payload)
+    assert payload["rollback_plan"]["status"] == "blocked"
+    assert payload["rollback_plan"]["blocked_by_audit_event_id"] == dependent_record.id
+    assert payload["rollback_plan"]["remediation_detail"] == (
+        "remediate the dependent side effect and verify project.safe_paused before retrying"
+    )
+    assert payload["rollback_plan"]["verification_detail"] == "verify project.safe_paused before retrying"
+
+
+def test_command_service_rollback_persists_plan_and_verification_detail_on_rollback_records(db_session):
+    session = db_session
+    project = _create_project(session, name="Rollback evidence project", slug="rollback-evidence")
+    service = CommandService(db_session=session)
+
+    pause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"pause project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    unpause_result = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=service.parse(
+            actor="alice",
+            command=f"resume project {project.id}",
+            project_id=project.id,
+        ),
+        actor_trusted=True,
+    )
+    assert pause_result.result == "executed"
+    assert unpause_result.result == "executed"
+
+    unpause_audit = session.query(models.AuditEvent).filter_by(id=unpause_result.audit_id).one()
+    unpause_payload = json.loads(unpause_audit.payload)
+    unpause_payload.setdefault("proposal", {}).setdefault("payload", {})["depends_on_audit_event_id"] = pause_result.audit_id
+    unpause_audit.payload = json.dumps(unpause_payload, ensure_ascii=False)
+    session.flush()
+
+    rollback_result = service.rollback(
+        actor="alice",
+        role="admin",
+        audit_event_id=pause_result.audit_id,
+        reason="persist rollback evidence",
+        actor_trusted=True,
+    )
+
+    assert rollback_result.success is True
+
+    rollback_records = (
+        session.query(models.RollbackRecord)
+        .filter(models.RollbackRecord.audit_event_id.in_([pause_result.audit_id, unpause_result.audit_id]))
+        .order_by(models.RollbackRecord.audit_event_id.asc())
+        .all()
+    )
+    assert len(rollback_records) == 2
+    for record in rollback_records:
+        assert record.rollback_root_audit_event_id == pause_result.audit_id
+        assert record.verification_detail == "verify project.safe_paused is False after rollback plan execution"
+        assert record.remediation_detail == ""
+        assert record.plan_json["step_audit_event_ids"] == [
+            unpause_result.audit_id,
+            pause_result.audit_id,
+        ]
+        assert record.plan_json["step_actions"] == [
+            "pause_project",
+            "unpause_project",
+        ]
+
 def test_command_service_approval_required_path_does_not_apply_action(db_session):
     session = db_session
     project = _create_project(session, name="Approval project", slug="approval")
