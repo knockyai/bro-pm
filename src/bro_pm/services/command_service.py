@@ -101,6 +101,56 @@ class CommandService:
             return "notion"
         return normalized
 
+    def _record_action_execution(
+        self,
+        *,
+        audit_event_id: str,
+        actor: str,
+        project_id: str | None,
+        action: str,
+        status: str,
+        requested_at: datetime | None = None,
+        awaiting_approval_at: datetime | None = None,
+        executed_at: datetime | None = None,
+        verified_at: datetime | None = None,
+    ) -> None:
+        execution = self.db.query(models.ActionExecution).filter_by(audit_event_id=audit_event_id).one_or_none()
+        if execution is None:
+            execution = models.ActionExecution(
+                audit_event_id=audit_event_id,
+                project_id=project_id,
+                actor=actor,
+                action=action,
+                status="requested",
+                requested_at=requested_at or datetime.utcnow(),
+            )
+            self.db.add(execution)
+            self.db.flush()
+
+        execution.status = status
+        if awaiting_approval_at is not None:
+            execution.awaiting_approval_at = awaiting_approval_at
+        if executed_at is not None:
+            execution.executed_at = executed_at
+        if verified_at is not None:
+            execution.verified_at = verified_at
+
+    def _proposal_is_synchronously_verifiable(self, proposal: CommandProposal) -> bool:
+        return proposal.action in {"pause_project", "unpause_project"} and bool(proposal.project_id)
+
+    def _verify_applied_action(self, proposal: CommandProposal) -> bool:
+        if not self._proposal_is_synchronously_verifiable(proposal):
+            return False
+        project = self._get_project(proposal.project_id)
+        if project is None:
+            return False
+        self.db.refresh(project)
+        if proposal.action == "pause_project":
+            return bool(project.safe_paused) is True
+        if proposal.action == "unpause_project":
+            return bool(project.safe_paused) is False
+        return False
+
     def execute(
         self,
         *,
@@ -388,12 +438,47 @@ class CommandService:
                     )
                 raise
 
+        execution_status = "requested"
+        execution_requested_at = datetime.utcnow()
+        execution_awaiting_approval_at = None
+        execution_executed_at = None
+        execution_verified_at = None
+        if stored_result == "awaiting_approval":
+            execution_status = "awaiting_approval"
+            execution_awaiting_approval_at = datetime.utcnow()
+        elif stored_result in {"accepted", "executed"}:
+            execution_status = "executed"
+            execution_executed_at = datetime.utcnow()
+        elif stored_result in {"validated", "simulated", "denied"}:
+            execution_status = stored_result
+
+        self._record_action_execution(
+            audit_event_id=record.id,
+            actor=actor,
+            project_id=project_id,
+            action=proposal.action,
+            status=execution_status,
+            requested_at=execution_requested_at,
+            awaiting_approval_at=execution_awaiting_approval_at,
+            executed_at=execution_executed_at,
+            verified_at=execution_verified_at,
+        )
+
         if success and response_result == "executed" and not dry_run:
             self._apply_action(proposal)
             if reserved_integration_record is None:
                 self.db.query(models.AuditEvent).filter_by(id=record.id).update(
                     {models.AuditEvent.result: "executed"},
                     synchronize_session=False,
+                )
+            if self._verify_applied_action(proposal):
+                self._record_action_execution(
+                    audit_event_id=record.id,
+                    actor=actor,
+                    project_id=project_id,
+                    action=proposal.action,
+                    status="verified",
+                    verified_at=datetime.utcnow(),
                 )
 
         if unexpected_execute_exc is not None:
@@ -1062,6 +1147,22 @@ class CommandService:
                 proposal=proposal,
                 audit_id=existing.id,
                 result="simulated",
+                detail=detail,
+            )
+        if existing.result == "approved":
+            return ProposalExecution(
+                success=True,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="approved",
+                detail=detail,
+            )
+        if existing.result == "rejected":
+            return ProposalExecution(
+                success=False,
+                proposal=proposal,
+                audit_id=existing.id,
+                result="rejected",
                 detail=detail,
             )
         if existing.result == "awaiting_approval":

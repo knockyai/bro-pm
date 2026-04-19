@@ -135,6 +135,7 @@ def test_database_module_import_and_init_db_with_memory_url(monkeypatch):
     assert "projects" in tables
     assert "tasks" in tables
     assert "audit_events" in tables
+    assert "action_executions" in tables
 
 
 def test_init_db_adds_goal_id_to_legacy_tasks_schema(tmp_path):
@@ -204,6 +205,7 @@ def test_init_db_upgrades_legacy_schema_for_autonomy_state(tmp_path):
     assert "commitment_due_at" in goal_columns
     assert "last_progress_at" in task_columns
     assert "executor_capacity_profiles" in tables
+    assert "action_executions" in tables
 
 
 def test_init_db_rejects_legacy_duplicates_before_creating_active_goal_index(tmp_path):

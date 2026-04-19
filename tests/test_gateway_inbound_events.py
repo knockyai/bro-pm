@@ -245,6 +245,70 @@ def test_gateway_inbound_event_records_minimal_approval_reply(gateway_db):
         session.close()
 
 
+def test_gateway_inbound_event_updates_action_execution_status_for_approval_reply(gateway_db):
+    database = importlib.import_module("bro_pm.database")
+    project = _create_project(gateway_db)
+
+    session = database.SessionLocal()
+    try:
+        pending_audit = models.AuditEvent(
+            project_id=project["id"],
+            actor="alice",
+            action="draft_boss_escalation",
+            target_type="proposal",
+            target_id=project["id"],
+            payload=json.dumps(
+                {
+                    "proposal": {
+                        "action": "draft_boss_escalation",
+                        "project_id": project["id"],
+                        "payload": {"escalation_message": "Customers are blocked"},
+                    }
+                }
+            ),
+            result="awaiting_approval",
+        )
+        session.add(pending_audit)
+        session.flush()
+        session.add(
+            models.ActionExecution(
+                audit_event_id=pending_audit.id,
+                project_id=project["id"],
+                actor="alice",
+                action="draft_boss_escalation",
+                status="awaiting_approval",
+                awaiting_approval_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+        )
+        session.commit()
+        pending_audit_id = pending_audit.id
+    finally:
+        session.close()
+
+    _ingest_event(
+        gateway_db,
+        platform="telegram",
+        chat_id="approval-chat",
+        project_id=project["id"],
+        actor="boss-user",
+        actor_role="boss",
+        text="approved",
+        normalized_intent="approve",
+        pending_audit_id=pending_audit_id,
+        metadata={"source": "dm"},
+    )
+
+    session = database.SessionLocal()
+    try:
+        execution = session.query(models.ActionExecution).filter_by(audit_event_id=pending_audit_id).one()
+        assert execution.status == "approved"
+        assert execution.awaiting_approval_at is not None
+        assert execution.executed_at is None
+        assert execution.verified_at is None
+    finally:
+        session.close()
+
+
 def test_gateway_inbound_event_does_not_allow_reply_from_forged_actor_role(gateway_db):
     database = importlib.import_module("bro_pm.database")
     project = _create_project(gateway_db)

@@ -300,6 +300,14 @@ def test_command_service_execute_writes_audit_event(db_session):
     assert audit.action == "pause_project"
     assert audit.result == "executed"
 
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=execution.audit_id).one()
+    assert execution_record.project_id == project.id
+    assert execution_record.action == "pause_project"
+    assert execution_record.status == "verified"
+    assert execution_record.requested_at is not None
+    assert execution_record.executed_at is not None
+    assert execution_record.verified_at is not None
+
 
 # dry-run path intentionally reuses policy and audit evidence
 # while never applying any mutating project state changes.
@@ -4255,6 +4263,14 @@ def test_command_service_approval_required_path_does_not_apply_action(db_session
     assert project.safe_paused is False
     audit = session.query(models.AuditEvent).filter_by(id=result.audit_id).one()
     assert audit.result == "awaiting_approval"
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=result.audit_id).one()
+    assert execution_record.project_id == project.id
+    assert execution_record.action == "pause_project"
+    assert execution_record.status == "awaiting_approval"
+    assert execution_record.requested_at is not None
+    assert execution_record.awaiting_approval_at is not None
+    assert execution_record.executed_at is None
+    assert execution_record.verified_at is None
 
 
 def test_command_service_draft_boss_escalation_is_audit_only_and_no_mutation(db_session):
@@ -4291,6 +4307,106 @@ def test_command_service_draft_boss_escalation_is_audit_only_and_no_mutation(db_
     assert payload["proposal"]["payload"]["escalation_message"] == "project telemetry blocked"
     assert payload["proposal"]["payload"]["risk_level"] == "high"
     assert payload["proposal"]["payload"]["trace_label"] == "draft_boss_escalation"
+
+
+def test_command_service_idempotent_replay_returns_approved_for_recorded_approval_reply(db_session):
+    session = db_session
+    project = _create_project(session, name="Replay approved escalation", slug="replay-approved-escalation")
+    service = CommandService(db_session=session)
+    idempotency_key = "replay-approved-escalation"
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation project telemetry blocked",
+        project_id=project.id,
+    )
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+    )
+
+    audit = session.get(models.AuditEvent, first.audit_id)
+    assert audit is not None
+    audit.result = "approved"
+    payload = json.loads(audit.payload)
+    payload["approval"] = {
+        "status": "approved",
+        "actor": "boss-user",
+        "actor_role": "boss",
+        "text": "approved",
+    }
+    audit.payload = json.dumps(payload, ensure_ascii=False)
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=first.audit_id).one()
+    execution_record.status = "approved"
+    session.commit()
+
+    replay = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+    )
+
+    assert replay.success is True
+    assert replay.result == "approved"
+    assert replay.audit_id == first.audit_id
+
+    refreshed = session.query(models.ActionExecution).filter_by(audit_event_id=first.audit_id).one()
+    assert refreshed.status == "approved"
+
+
+def test_command_service_idempotent_replay_returns_rejected_for_recorded_rejection_reply(db_session):
+    session = db_session
+    project = _create_project(session, name="Replay rejected escalation", slug="replay-rejected-escalation")
+    service = CommandService(db_session=session)
+    idempotency_key = "replay-rejected-escalation"
+
+    proposal = service.parse(
+        actor="alice",
+        command="draft_boss_escalation project telemetry blocked",
+        project_id=project.id,
+    )
+    first = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+    )
+
+    audit = session.get(models.AuditEvent, first.audit_id)
+    assert audit is not None
+    audit.result = "rejected"
+    payload = json.loads(audit.payload)
+    payload["approval"] = {
+        "status": "rejected",
+        "actor": "boss-user",
+        "actor_role": "boss",
+        "text": "rejected",
+    }
+    audit.payload = json.dumps(payload, ensure_ascii=False)
+    execution_record = session.query(models.ActionExecution).filter_by(audit_event_id=first.audit_id).one()
+    execution_record.status = "rejected"
+    session.commit()
+
+    replay = service.execute(
+        actor="alice",
+        role="admin",
+        proposal=proposal,
+        actor_trusted=True,
+        idempotency_key=idempotency_key,
+    )
+
+    assert replay.success is False
+    assert replay.result == "rejected"
+    assert replay.audit_id == first.audit_id
+
+    refreshed = session.query(models.ActionExecution).filter_by(audit_event_id=first.audit_id).one()
+    assert refreshed.status == "rejected"
 
 
 def test_command_service_draft_boss_escalation_is_allowed_in_safe_paused_project(db_session):

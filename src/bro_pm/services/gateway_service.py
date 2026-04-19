@@ -224,6 +224,8 @@ class GatewayService:
                         "text": text.strip(),
                     }
                     pending_audit.payload = json.dumps(payload, ensure_ascii=False)
+                    if pending_audit.action_execution is not None:
+                        pending_audit.action_execution.status = approval_status
                     disposition = "approval_reply_recorded"
                     reason = "approval reply recorded for pending audit event"
 

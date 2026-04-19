@@ -161,6 +161,36 @@ class AuditEvent(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
+    action_execution: Mapped["ActionExecution | None"] = relationship(
+        back_populates="audit_event",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class ActionExecution(Base):
+    __tablename__ = "action_executions"
+    __table_args__ = (
+        UniqueConstraint("audit_event_id", name="uq_action_executions_audit_event_id"),
+        Index("ix_action_executions_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    audit_event_id: Mapped[str] = mapped_column(String, ForeignKey("audit_events.id"), index=True)
+    project_id: Mapped[str | None] = mapped_column(String, ForeignKey("projects.id"), nullable=True, index=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    action: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default="requested")
+    requested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    awaiting_approval_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    audit_event: Mapped[AuditEvent] = relationship(back_populates="action_execution")
+    project: Mapped[Project | None] = relationship()
+
 
 class RollbackRecord(Base):
     __tablename__ = "rollback_records"
