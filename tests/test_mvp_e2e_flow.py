@@ -7,6 +7,8 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from bro_pm import models
+
 
 @pytest.fixture
 def api_client(tmp_path):
@@ -170,3 +172,60 @@ def test_api_mvp_e2e_onboarding_goal_decomposition_and_project_report(api_client
     assert report["publish"]["status"] == "contract_ready"
     assert report["publish"]["action"] == "publish_report"
     assert report["publish"]["target"].endswith(project["slug"])
+
+
+def test_api_mvp_e2e_report_publish_queues_hermes_handoff(api_client: TestClient):
+    onboarding_response = api_client.post("/api/v1/projects/onboard", json=_onboarding_payload())
+
+    assert onboarding_response.status_code == 201
+    project = onboarding_response.json()["project"]
+
+    goal_response = api_client.post(
+        f"/api/v1/projects/{project['id']}/goals",
+        params=_mutation_auth_params(),
+        headers=_mutation_auth_headers(),
+        json=_goal_payload(),
+    )
+    assert goal_response.status_code == 201
+
+    report_response = api_client.post(
+        f"/api/v1/projects/{project['id']}/reports/project",
+        headers={"x-actor-trusted": "true"},
+        json={
+            **_report_payload(),
+            "execute_publish": True,
+            "idempotency_key": "mvp-hermes-report-publish",
+        },
+    )
+
+    assert report_response.status_code == 200
+    report = report_response.json()
+    assert report["publish"] == {
+        "integration": "hermes",
+        "owner": "hermes",
+        "action": "publish_report",
+        "status": "queued",
+        "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
+        "detail": "Queued Hermes knowledge handoff; Bro-PM kept operational truth and did not write Notion directly",
+        "visibility": "internal",
+    }
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        due_actions = (
+            session.query(models.DueAction)
+            .filter_by(project_id=project["id"])
+            .order_by(models.DueAction.due_at.asc(), models.DueAction.created_at.asc(), models.DueAction.id.asc())
+            .all()
+        )
+    finally:
+        session.close()
+
+    assert [due_action.kind for due_action in due_actions] == [
+        "project_launch_bootstrap",
+        "project_report_publish",
+    ]
+    assert due_actions[1].channel == "hermes"
+    assert due_actions[1].recipient == "knowledge-writer"
+    assert due_actions[1].payload_json["publish_contract"]["target"] == report["publish"]["target"]

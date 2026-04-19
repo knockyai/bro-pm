@@ -13,9 +13,11 @@ def test_api_project_runtime_status_returns_dashboard_safe_durable_summary(api_c
 
     db_module = importlib.import_module("bro_pm.database")
     session = db_module.SessionLocal()
+    project_created_at = None
     try:
         stored_project = session.get(models.Project, project["id"])
         assert stored_project is not None
+        project_created_at = stored_project.created_at
         stored_project.safe_paused = True
         stored_project.updated_at = datetime(2026, 4, 19, 11, 0, 0)
 
@@ -73,6 +75,17 @@ def test_api_project_runtime_status_returns_dashboard_safe_durable_summary(api_c
     )
 
     assert response.status_code == 200
+    expected_revision_at = max(
+        candidate
+        for candidate in (
+            project_created_at,
+            datetime(2026, 4, 19, 11, 0, 0),
+            datetime(2026, 4, 19, 11, 1, 0),
+            datetime(2026, 4, 19, 11, 2, 0),
+            datetime(2026, 4, 19, 11, 4, 0),
+        )
+        if candidate is not None
+    )
     assert response.json() == {
         "project_id": project["id"],
         "safe_paused": True,
@@ -89,7 +102,7 @@ def test_api_project_runtime_status_returns_dashboard_safe_durable_summary(api_c
             "failed": 0,
             "last_failure_at": None,
         },
-        "revision_at": "2026-04-19T11:04:00",
+        "revision_at": expected_revision_at.isoformat(),
         "generated_at": response.json()["generated_at"],
     }
 

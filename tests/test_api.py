@@ -19,6 +19,10 @@ from bro_pm import models
 from bro_pm.integrations import INTEGRATIONS, IntegrationError, IntegrationResult
 from bro_pm.services.reporting_service import ReportingService
 
+HERMES_PUBLISH_DETAIL = (
+    "Queued Hermes knowledge handoff; Bro-PM kept operational truth and did not write Notion directly"
+)
+
 
 @pytest.fixture
 def api_client(tmp_path):
@@ -2100,6 +2104,7 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
     }
     assert report["publish"] == {
         "integration": "notion",
+        "owner": "bro_pm",
         "action": "publish_report",
         "status": "contract_ready",
         "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
@@ -2112,15 +2117,8 @@ def test_api_project_report_returns_notion_ready_payload_with_safe_publish_contr
     assert {event["action"] for event in audit_events} == {"draft_boss_escalation", "pause_project", "create_goal", "create_project"}
 
 
-def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_client: TestClient, monkeypatch):
+def test_api_project_report_execute_publish_queues_hermes_due_action_and_persists_audit(api_client: TestClient):
     project = _create_project(api_client)
-    captured: dict[str, dict] = {}
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        captured["call"] = {"action": action, "payload": payload}
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     response = api_client.post(
         f"/api/v1/projects/{project['id']}/reports/project",
@@ -2133,46 +2131,27 @@ def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_
     assert report["summary"].endswith("Latest audit signal: no recent audit signal.")
     assert report["kpis"]["audit_events"] == 0
     assert report["publish"] == {
-        "integration": "notion",
+        "integration": "hermes",
+        "owner": "hermes",
         "action": "publish_report",
-        "status": "executed",
+        "status": "queued",
         "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-        "detail": "notion executed: publish_report",
+        "detail": HERMES_PUBLISH_DETAIL,
         "visibility": "internal",
     }
-    assert captured["call"] == {
-        "action": "publish_report",
-        "payload": {
-            "workspace_root": "Bro-PM",
-            "parent_page": "Bro-PM/Reports/internal",
-            "project_page": f"Bro-PM/Projects/internal/{project['slug']}",
-            "visibility": "internal",
-            "report": {
-                "project_id": project["id"],
-                "report_type": "project_report",
-                "visibility": "internal",
-                "summary": "Project Nova is tracking no active goal with 0 open tasks. Latest audit signal: no recent audit signal.",
-                "kpis": {
-                    "total_tasks": 0,
-                    "completed_tasks": 0,
-                    "open_tasks": 0,
-                    "active_goals": 0,
-                    "audit_events": 0,
-                },
-                "risks": [],
-                "decisions": [],
-                "action_ids": [],
-                "links": {
-                    "project": f"Bro-PM/Projects/internal/{project['slug']}",
-                    "tasks": f"Bro-PM/Projects/internal/{project['slug']}/Tasks",
-                    "audit_events": f"Bro-PM/Projects/internal/{project['slug']}/Audit",
-                    "report": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-                    "notion_parent": "Bro-PM/Reports/internal",
-                    "notion_project": f"Bro-PM/Projects/internal/{project['slug']}",
-                },
-            },
-        },
-    }
+
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        due_actions = session.query(models.DueAction).filter_by(project_id=project["id"]).all()
+    finally:
+        session.close()
+
+    assert len(due_actions) == 1
+    assert due_actions[0].kind == "project_report_publish"
+    assert due_actions[0].channel == "hermes"
+    assert due_actions[0].recipient == "knowledge-writer"
+    assert due_actions[0].payload_json["publish_contract"]["report"]["project_id"] == project["id"]
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
     assert [event["action"] for event in audit_events[:2]] == ["publish_report", "create_project"]
@@ -2183,21 +2162,22 @@ def test_api_project_report_execute_publish_calls_notion_and_persists_audit(api_
         "action": "publish_report",
         "target_type": "report",
         "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-        "result": "executed",
-        "detail": "notion executed: publish_report",
+        "result": "queued",
+        "detail": HERMES_PUBLISH_DETAIL,
         "created_at": audit_events[0]["created_at"],
     }
 
 
-def test_api_project_report_execute_publish_commits_pending_reservation_before_notion_execute(
+def test_api_project_report_execute_publish_commits_pending_reservation_before_due_action_queue(
     api_client: TestClient, monkeypatch
 ):
     project = _create_project(api_client)
     db_module = importlib.import_module("bro_pm.database")
     observed: dict[str, dict | None] = {}
     idempotency_key = "report-publish-durable-pending"
+    original_enqueue = ReportingService._enqueue_publish_due_action
 
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
+    def observe_enqueue(self, **kwargs):
         observer_session = db_module.SessionLocal()
         try:
             record = observer_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one_or_none()
@@ -2211,9 +2191,9 @@ def test_api_project_report_execute_publish_commits_pending_reservation_before_n
             )
         finally:
             observer_session.close()
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
+        return original_enqueue(self, **kwargs)
 
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
+    monkeypatch.setattr(ReportingService, "_enqueue_publish_due_action", observe_enqueue)
 
     response = api_client.post(
         f"/api/v1/projects/{project['id']}/reports/project",
@@ -2230,16 +2210,11 @@ def test_api_project_report_execute_publish_commits_pending_reservation_before_n
 
 
 def test_service_project_report_execute_publish_commits_final_audit_before_caller_commit(
-    api_client: TestClient, monkeypatch
+    api_client: TestClient
 ):
     project = _create_project(api_client)
     db_module = importlib.import_module("bro_pm.database")
     idempotency_key = "report-publish-durable-final"
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     service_session = db_module.SessionLocal()
     try:
@@ -2271,24 +2246,19 @@ def test_service_project_report_execute_publish_commits_final_audit_before_calle
     finally:
         service_session.close()
 
-    assert response.publish.status == "executed"
+    assert response.publish.status == "queued"
     assert observed == {
-        "result": "executed",
-        "detail": "notion executed: publish_report",
+        "result": "queued",
+        "detail": HERMES_PUBLISH_DETAIL,
     }
 
 
 
-def test_service_project_report_execute_publish_without_idempotency_key_defers_audit_until_caller_commit(
-    api_client: TestClient, monkeypatch
+def test_service_project_report_execute_publish_without_idempotency_key_commits_audit_and_due_action_immediately(
+    api_client: TestClient
 ):
     project = _create_project(api_client)
     db_module = importlib.import_module("bro_pm.database")
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     service_session = db_module.SessionLocal()
     try:
@@ -2306,37 +2276,25 @@ def test_service_project_report_execute_publish_without_idempotency_key_defers_a
         observer_session = db_module.SessionLocal()
         try:
             observed_before_commit = observer_session.query(models.AuditEvent).filter_by(action="publish_report").all()
-        finally:
-            observer_session.close()
-
-        service_session.commit()
-
-        observer_session = db_module.SessionLocal()
-        try:
-            observed_after_commit = observer_session.query(models.AuditEvent).filter_by(action="publish_report").all()
+            observed_due_actions = observer_session.query(models.DueAction).filter_by(
+                project_id=project["id"], kind="project_report_publish"
+            ).all()
         finally:
             observer_session.close()
     finally:
         service_session.close()
 
-    assert response.publish.status == "executed"
-    assert observed_before_commit == []
-    assert len(observed_after_commit) == 1
-    assert observed_after_commit[0].result == "executed"
+    assert response.publish.status == "queued"
+    assert len(observed_before_commit) == 1
+    assert observed_before_commit[0].result == "queued"
+    assert len(observed_due_actions) == 1
 
 
 
-def test_api_project_report_execute_publish_replays_idempotent_success_without_second_notion_call(
-    api_client: TestClient, monkeypatch
+def test_api_project_report_execute_publish_replays_idempotent_queue_without_second_due_action(
+    api_client: TestClient
 ):
     project = _create_project(api_client)
-    call_count = {"count": 0}
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     first_response = api_client.post(
         f"/api/v1/projects/{project['id']}/reports/project",
@@ -2352,147 +2310,32 @@ def test_api_project_report_execute_publish_replays_idempotent_success_without_s
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     assert second_response.json() == first_response.json()
-    assert call_count["count"] == 1
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
     assert len(publish_events) == 1
-    assert publish_events[0]["result"] == "executed"
-    assert publish_events[0]["detail"] == "notion executed: publish_report"
+    assert publish_events[0]["result"] == "queued"
+    assert publish_events[0]["detail"] == HERMES_PUBLISH_DETAIL
 
+    db_module = importlib.import_module("bro_pm.database")
+    session = db_module.SessionLocal()
+    try:
+        due_actions = session.query(models.DueAction).filter_by(
+            project_id=project["id"], kind="project_report_publish"
+        ).all()
+    finally:
+        session.close()
 
-def test_api_project_report_execute_publish_replays_stored_failure_without_second_notion_call(
-    api_client: TestClient, monkeypatch
-):
-    project = _create_project(api_client)
-    call_count = {"count": 0}
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        raise IntegrationError("publish integration unavailable")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
-
-    first_response = api_client.post(
-        f"/api/v1/projects/{project['id']}/reports/project",
-        headers={"x-actor-trusted": "true"},
-        json=_report_auth_payload(execute_publish=True, idempotency_key="report-publish-failure"),
-    )
-    second_response = api_client.post(
-        f"/api/v1/projects/{project['id']}/reports/project",
-        headers={"x-actor-trusted": "true"},
-        json=_report_auth_payload(execute_publish=True, idempotency_key="report-publish-failure"),
-    )
-
-    assert first_response.status_code == 422
-    assert second_response.status_code == 422
-    assert first_response.json() == second_response.json() == {"detail": "publish integration unavailable"}
-    assert call_count["count"] == 1
-
-    audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    publish_events = [event for event in audit_events if event["action"] == "publish_report"]
-    assert len(publish_events) == 1
-    assert publish_events[0]["result"] == "failed"
-    assert publish_events[0]["detail"] == "publish integration unavailable"
-
-
-
-def test_api_project_report_execute_publish_finalizes_unexpected_idempotent_failure_for_replay(
-    monkeypatch, tmp_path
-):
-    db_path = tmp_path / f"bro_pm_api_{uuid4().hex}.db"
-    db_url = f"sqlite:///{db_path}"
-
-    for mod_name in ("bro_pm.database", "bro_pm.api.app", "bro_pm.api", "bro_pm.api.v1", "bro_pm.api.v1.commands", "bro_pm.api.v1.projects"):
-        sys.modules.pop(mod_name, None)
-
-    api_app = importlib.import_module("bro_pm.api.app")
-    with TestClient(api_app.create_app(database_url=db_url), raise_server_exceptions=False) as client:
-        project = _create_project(client)
-        call_count = {"count": 0}
-        idempotency_key = "report-publish-unexpected-failure"
-
-        def boom(*, action: str, payload: dict) -> IntegrationResult:
-            call_count["count"] += 1
-            raise RuntimeError("publish exploded")
-
-        monkeypatch.setattr(INTEGRATIONS["notion"], "execute", boom)
-
-        first_response = client.post(
-            f"/api/v1/projects/{project['id']}/reports/project",
-            headers={"x-actor-trusted": "true"},
-            json=_report_auth_payload(execute_publish=True, idempotency_key=idempotency_key),
-        )
-        second_response = client.post(
-            f"/api/v1/projects/{project['id']}/reports/project",
-            headers={"x-actor-trusted": "true"},
-            json=_report_auth_payload(execute_publish=True, idempotency_key=idempotency_key),
-        )
-        audit_events = _get_project_audit_events(client, project["id"]).json()
-
-    assert first_response.status_code == 500
-    assert second_response.status_code == 422
-    assert second_response.json() == {"detail": "publish exploded"}
-    assert call_count["count"] == 1
-
-    publish_events = [event for event in audit_events if event["action"] == "publish_report"]
-    assert len(publish_events) == 1
-    assert publish_events[0]["result"] == "failed"
-    assert publish_events[0]["detail"] == "publish exploded"
-
-
-
-def test_api_project_report_execute_publish_replays_soft_failure_without_second_notion_call(
-    api_client: TestClient, monkeypatch
-):
-    project = _create_project(api_client)
-    call_count = {"count": 0}
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        return IntegrationResult(ok=False, detail="notion rejected publish payload")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
-
-    first_response = api_client.post(
-        f"/api/v1/projects/{project['id']}/reports/project",
-        headers={"x-actor-trusted": "true"},
-        json=_report_auth_payload(execute_publish=True, idempotency_key="report-publish-soft-failure"),
-    )
-    second_response = api_client.post(
-        f"/api/v1/projects/{project['id']}/reports/project",
-        headers={"x-actor-trusted": "true"},
-        json=_report_auth_payload(execute_publish=True, idempotency_key="report-publish-soft-failure"),
-    )
-
-    assert first_response.status_code == 200
-    assert second_response.status_code == 200
-    assert second_response.json() == first_response.json()
-    assert first_response.json()["publish"]["status"] == "failed"
-    assert first_response.json()["publish"]["detail"] == "notion rejected publish payload"
-    assert call_count["count"] == 1
-
-    audit_events = _get_project_audit_events(api_client, project["id"]).json()
-    publish_events = [event for event in audit_events if event["action"] == "publish_report"]
-    assert len(publish_events) == 1
-    assert publish_events[0]["result"] == "failed"
-    assert publish_events[0]["detail"] == "notion rejected publish payload"
+    assert len(due_actions) == 1
 
 
 
 def test_api_project_report_execute_publish_replays_success_under_safe_pause_and_state_drift(
-    api_client: TestClient, monkeypatch
+    api_client: TestClient
 ):
     project = _create_project(api_client)
     db_module = importlib.import_module("bro_pm.database")
-    call_count = {"count": 0}
     idempotency_key = "report-publish-state-drift"
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     first_response = api_client.post(
         f"/api/v1/projects/{project['id']}/reports/project",
@@ -2518,24 +2361,16 @@ def test_api_project_report_execute_publish_replays_success_under_safe_pause_and
 
     assert second_response.status_code == 200
     assert second_response.json() == first_response.json()
-    assert call_count["count"] == 1
 
 
 
 def test_api_project_report_execute_publish_recovers_stale_pending_with_manual_reconciliation_error(
-    api_client: TestClient, monkeypatch
+    api_client: TestClient
 ):
     project = _create_project(api_client)
     db_module = importlib.import_module("bro_pm.database")
     idempotency_key = "report-publish-stale-pending"
-    call_count = {"count": 0}
     stale_detail = "stale pending publish request requires manual reconciliation before retry"
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        return IntegrationResult(ok=True, detail="unexpected second execution")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     session = db_module.SessionLocal()
     try:
@@ -2549,10 +2384,10 @@ def test_api_project_report_execute_publish_recovers_stale_pending_with_manual_r
                 payload=json.dumps(
                     {
                         "integration": {
-                            "name": "notion",
+                            "name": "hermes",
                             "action": "publish_report",
                             "status": "pending",
-                            "detail": "report publish execution pending",
+                            "detail": "report publish handoff pending",
                         },
                         "visibility": "internal",
                         "target": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
@@ -2595,7 +2430,6 @@ def test_api_project_report_execute_publish_recovers_stale_pending_with_manual_r
     assert first_response.status_code == 422
     assert second_response.status_code == 422
     assert first_response.json() == second_response.json() == {"detail": stale_detail}
-    assert call_count["count"] == 0
 
     session = db_module.SessionLocal()
     try:
@@ -2611,17 +2445,8 @@ def test_api_project_report_execute_publish_recovers_stale_pending_with_manual_r
 
 
 
-def test_api_project_report_execute_publish_rejects_conflicting_idempotency_reuse(
-    api_client: TestClient, monkeypatch
-):
+def test_api_project_report_execute_publish_rejects_conflicting_idempotency_reuse(api_client: TestClient):
     project = _create_project(api_client)
-    call_count = {"count": 0}
-
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
-        call_count["count"] += 1
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
 
     first_response = api_client.post(
         f"/api/v1/projects/{project['id']}/reports/project",
@@ -2637,7 +2462,6 @@ def test_api_project_report_execute_publish_rejects_conflicting_idempotency_reus
     assert first_response.status_code == 200
     assert conflicting_response.status_code == 409
     assert conflicting_response.json() == {"detail": "idempotency key already used for different request context"}
-    assert call_count["count"] == 1
 
     audit_events = _get_project_audit_events(api_client, project["id"]).json()
     publish_events = [event for event in audit_events if event["action"] == "publish_report"]
@@ -2646,7 +2470,7 @@ def test_api_project_report_execute_publish_rejects_conflicting_idempotency_reus
 
 
 
-def test_service_project_report_execute_publish_replays_concurrent_duplicate_without_second_notion_call(
+def test_service_project_report_execute_publish_replays_concurrent_duplicate_without_second_queue(
     api_client: TestClient, monkeypatch
 ):
     project = _create_project(api_client)
@@ -2654,15 +2478,15 @@ def test_service_project_report_execute_publish_replays_concurrent_duplicate_wit
     call_count = {"count": 0}
     start_barrier = Barrier(2)
     idempotency_key = "report-publish-concurrent"
+    original_enqueue = ReportingService._enqueue_publish_due_action
 
-    def execute_publish(*, action: str, payload: dict) -> IntegrationResult:
+    def counted_enqueue(self, **kwargs):
         call_count["count"] += 1
-        assert action == "publish_report"
-        assert payload["report"]["project_id"] == project["id"]
+        assert kwargs["publish_payload"]["report"]["project_id"] == project["id"]
         time.sleep(0.05)
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
+        return original_enqueue(self, **kwargs)
 
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_publish)
+    monkeypatch.setattr(ReportingService, "_enqueue_publish_due_action", counted_enqueue)
 
     def _run_once() -> dict:
         session = db_module.SessionLocal()
@@ -2695,7 +2519,7 @@ def test_service_project_report_execute_publish_replays_concurrent_duplicate_wit
         outcomes = [future.result() for future in [executor.submit(_run_once), executor.submit(_run_once)]]
 
     assert all(outcome["status"] == "ok" for outcome in outcomes)
-    assert {outcome["publish_status"] for outcome in outcomes} == {"executed"}
+    assert {outcome["publish_status"] for outcome in outcomes} == {"queued"}
     assert len({outcome["detail"] for outcome in outcomes}) == 1
     assert len({outcome["target"] for outcome in outcomes}) == 1
     assert call_count["count"] == 1
@@ -2704,7 +2528,7 @@ def test_service_project_report_execute_publish_replays_concurrent_duplicate_wit
     try:
         publish_events = audit_session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).all()
         assert len(publish_events) == 1
-        assert publish_events[0].result == "executed"
+        assert publish_events[0].result == "queued"
     finally:
         audit_session.close()
 
@@ -2737,7 +2561,7 @@ def test_api_project_report_execute_publish_rejects_viewer_role(api_client: Test
     assert response.json()["detail"] == "requires operator role"
 
 
-def test_api_project_report_execute_publish_returns_422_on_integration_error(monkeypatch, tmp_path):
+def test_api_project_report_execute_publish_without_idempotency_key_persists_queued_audit(tmp_path):
     db_path = tmp_path / f"bro_pm_api_{uuid4().hex}.db"
     db_url = f"sqlite:///{db_path}"
 
@@ -2748,11 +2572,6 @@ def test_api_project_report_execute_publish_returns_422_on_integration_error(mon
     with TestClient(api_app.create_app(database_url=db_url), raise_server_exceptions=False) as client:
         project = _create_project(client)
 
-        def boom(*, action: str, payload: dict) -> IntegrationResult:
-            raise IntegrationError("publish integration unavailable")
-
-        monkeypatch.setattr(INTEGRATIONS["notion"], "execute", boom)
-
         response = client.post(
             f"/api/v1/projects/{project['id']}/reports/project",
             headers={"x-actor-trusted": "true"},
@@ -2760,8 +2579,7 @@ def test_api_project_report_execute_publish_returns_422_on_integration_error(mon
         )
         audit_events = _get_project_audit_events(client, project["id"]).json()
 
-    assert response.status_code == 422
-    assert response.json()["detail"] == "publish integration unavailable"
+    assert response.status_code == 200
     assert [event["action"] for event in audit_events[:2]] == ["publish_report", "create_project"]
     assert audit_events[0] == {
         "id": audit_events[0]["id"],
@@ -2770,8 +2588,8 @@ def test_api_project_report_execute_publish_returns_422_on_integration_error(mon
         "action": "publish_report",
         "target_type": "report",
         "target_id": f"Bro-PM/Reports/internal/Projects/{project['slug']}",
-        "result": "failed",
-        "detail": "publish integration unavailable",
+        "result": "queued",
+        "detail": HERMES_PUBLISH_DETAIL,
         "created_at": audit_events[0]["created_at"],
     }
 

@@ -424,6 +424,7 @@ class ProjectReportLinks(BaseModel):
 
 class ReportPublishResult(BaseModel):
     integration: str
+    owner: str | None = None
     action: str
     status: str
     target: str

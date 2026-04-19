@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -27,6 +27,9 @@ class ReportingService:
     PENDING_PUBLISH_STALE_AFTER = timedelta(minutes=5)
     PENDING_PUBLISH_WAIT_ATTEMPTS = 100
     PENDING_PUBLISH_WAIT_DELAY_SECONDS = 0.05
+    HERMES_PUBLISH_DETAIL = (
+        "Queued Hermes knowledge handoff; Bro-PM kept operational truth and did not write Notion directly"
+    )
 
     def __init__(self, db_session: Session):
         self.db = db_session
@@ -138,7 +141,7 @@ class ReportingService:
                             visibility=visibility,
                             publish_target=publish_target,
                             status="pending",
-                            detail="report publish execution pending",
+                            detail="report publish handoff pending",
                             request_context=request_context,
                             report_core=report_core,
                             replay={"kind": "pending"},
@@ -167,32 +170,16 @@ class ReportingService:
                     raise
 
             try:
-                integration_result = self.notion.execute(action="publish_report", payload=publish_payload)
-            except IntegrationError as exc:
-                publish_detail = str(exc)
-                self._persist_publish_audit(
+                self._enqueue_publish_due_action(
                     project=project,
                     actor=actor,
-                    visibility=visibility,
+                    publish_payload=publish_payload,
                     publish_target=publish_target,
-                    status="failed",
-                    detail=publish_detail,
-                    request_context=request_context,
                     report_core=report_core,
-                    replay={
-                        "kind": "error",
-                        "detail": publish_detail,
-                    },
                     idempotency_key=idempotency_key,
-                    existing_record=reserved_publish_record,
                 )
-                if idempotency_key:
-                    self.db.commit()
-                else:
-                    self.db.flush()
-                raise
             except Exception as exc:
-                if idempotency_key:
+                if reserved_publish_record is not None:
                     publish_detail = str(exc) or type(exc).__name__
                     self._persist_publish_audit(
                         project=project,
@@ -212,11 +199,11 @@ class ReportingService:
                     )
                     self.db.commit()
                 raise
-
-            publish_status = "executed" if integration_result.ok else "failed"
-            publish_detail = integration_result.detail or "notion publish_report execution failed"
+            publish_status = "queued"
+            publish_detail = self.HERMES_PUBLISH_DETAIL
             publish = ReportPublishResult(
-                integration="notion",
+                integration="hermes",
+                owner="hermes",
                 action="publish_report",
                 status=publish_status,
                 target=publish_target,
@@ -243,15 +230,13 @@ class ReportingService:
                 idempotency_key=idempotency_key,
                 existing_record=reserved_publish_record,
             )
-            if idempotency_key:
-                self.db.commit()
-            else:
-                self.db.flush()
+            self.db.commit()
             return response
 
         self.notion.validate(action="publish_report", payload=publish_payload)
         publish = ReportPublishResult(
             integration="notion",
+            owner="bro_pm",
             action="publish_report",
             status="contract_ready",
             target=publish_target,
@@ -527,6 +512,54 @@ class ReportingService:
             )
         )
 
+    def _enqueue_publish_due_action(
+        self,
+        *,
+        project: models.Project,
+        actor: str,
+        publish_payload: dict,
+        publish_target: str,
+        report_core: dict,
+        idempotency_key: str | None,
+    ) -> models.DueAction:
+        due_action_idempotency_key = f"{idempotency_key}:due-action" if idempotency_key else None
+        if due_action_idempotency_key:
+            existing = self.db.query(models.DueAction).filter_by(idempotency_key=due_action_idempotency_key).one_or_none()
+            if existing is not None:
+                return existing
+
+        due_action = models.DueAction(
+            project_id=project.id,
+            channel="hermes",
+            recipient="knowledge-writer",
+            kind="project_report_publish",
+            payload_json={
+                "text": f"Hermes should publish the Bro-PM project report for {project.slug}.",
+                "trace_label": "project_report_publish_handoff",
+                "target": publish_target,
+                "project_id": project.id,
+                "project_slug": project.slug,
+                "project_name": project.name,
+                "requested_by": actor,
+                "ownership": {
+                    "operational_truth": "bro_pm",
+                    "knowledge_outputs": "hermes",
+                },
+                "publish_contract": {
+                    **publish_payload,
+                    "target": publish_target,
+                    "report": report_core,
+                },
+            },
+            due_at=datetime.now(timezone.utc),
+            status="pending",
+            actor=actor,
+            idempotency_key=due_action_idempotency_key,
+        )
+        self.db.add(due_action)
+        self.db.flush()
+        return due_action
+
     def _build_publish_audit_payload(
         self,
         *,
@@ -541,7 +574,7 @@ class ReportingService:
     ) -> dict:
         return {
             "integration": {
-                "name": "notion",
+                "name": "hermes",
                 "action": "publish_report",
                 "status": status,
                 "detail": detail,
@@ -604,7 +637,7 @@ class ReportingService:
         payload = self._load_payload(existing.payload)
         payload["integration"] = {
             **(payload.get("integration") or {}),
-            "name": "notion",
+            "name": "hermes",
             "action": "publish_report",
             "status": "failed",
             "detail": detail,

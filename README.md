@@ -248,12 +248,12 @@ Detail endpoint отдаёт sanitized payload, а top-level `detail` берёт
 
 Если `execute_publish=false`, сервис не публикует ничего наружу, а возвращает Notion-ready publish contract со статусом `contract_ready`.
 
-Если `execute_publish=true`, сервис проходит через publish path и пишет audit для `publish_report`, включая idempotent replay-логику.
+Если `execute_publish=true`, сервис не пишет в Notion напрямую: он ставит Hermes-facing `DueAction(kind="project_report_publish")`, пишет audit для `publish_report` со статусом `queued` и сохраняет idempotent replay-логику в Bro-PM.
 
 Дополнительно в текущем MVP появился реальный timer-actions path:
 
 - onboarding-поле `reporting_cadence` теперь не просто metadata;
-- in-process scheduler умеет публиковать scheduled project reports для cadence `daily` и `weekly`;
+- in-process scheduler умеет ставить scheduled project reports для cadence `daily` и `weekly` в Hermes handoff queue;
 - каждые 10 минут тот же timer-actions runtime делает autonomous decision review по проектам;
 - decision review может:
   - поставить в `DueAction` boss-escalation для последующей доставки через Hermes gateway, если видит повторяющиеся недавние сбои;
@@ -358,7 +358,7 @@ Remote-path пока не реализован:
 Что делают:
 
 - `CommandService` — parse/execution flow, policy, idempotency, audit, rollback;
-- `ReportingService` — сбор project report, publish contract, publish audit, replay idempotency.
+- `ReportingService` — сбор project report, Notion-ready publish contract, Hermes handoff queueing, publish audit, replay idempotency.
 
 ### Policy слой
 
@@ -653,7 +653,7 @@ dev/test:
 `POST /api/v1/projects/{project_id}/reports/project`
 - принимает `actor`, `role`, optional `execute_publish`, optional `idempotency_key`;
 - для policy-проверяемого пути нужен header `x-actor-trusted: true`;
-- возвращает project report и publish block.
+- возвращает project report и publish block; при `execute_publish=true` publish block описывает queued Hermes ownership, а не backend Notion execution.
 
 `BRO_PM_TIMER_ACTIONS_ENABLED`
 - default: `true` for the default live app object;
@@ -805,6 +805,8 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/projects/<PROJECT_ID>/reports/proj
 - `publish.status = "contract_ready"`
 
 То есть publish contract уже собран, но внешний publish по умолчанию ещё не исполнялся.
+
+Если вызвать этот же endpoint с `execute_publish=true`, Bro-PM сохранит audit/idempotency и поставит Hermes due action для knowledge-writing вместо прямой backend-публикации в Notion.
 
 Если нужен реальный timer-actions runtime, оставь live app scheduler включённым:
 

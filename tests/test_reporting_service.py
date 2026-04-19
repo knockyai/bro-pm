@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from bro_pm import models
+from bro_pm.integrations import IntegrationError
 from bro_pm.services.reporting_service import ReportingService
 
 
@@ -209,3 +210,146 @@ def test_reporting_service_decisions_include_autonomy_reason_mode_and_lineage(re
     assert decision.lineage == (
         "mode=timer_autonomy -> trace=timer_commitment_risk -> audit=create_task:executed -> integration=notion executed: create_task"
     )
+
+
+def test_reporting_service_execute_publish_queues_hermes_due_action_and_audit(reporting_db):
+    session = reporting_db.SessionLocal()
+    try:
+        project = models.Project(
+            name=f"Project {uuid4().hex[:8]}",
+            slug=f"project-{uuid4().hex[:8]}",
+            timezone="UTC",
+            created_by="alice",
+            metadata_json={
+                "onboarding": {
+                    "status": "active",
+                    "reporting_cadence": "weekly",
+                    "board_integration": "notion",
+                }
+            },
+        )
+        session.add(project)
+        session.commit()
+
+        service = ReportingService(db_session=session)
+        response = service.generate_project_report(
+            project=project,
+            actor="alice",
+            role="admin",
+            actor_trusted=True,
+            execute_publish=True,
+            idempotency_key="report-publish-hermes-queue",
+        )
+
+        due_action = (
+            session.query(models.DueAction)
+            .filter_by(project_id=project.id, kind="project_report_publish")
+            .one()
+        )
+        audit = session.query(models.AuditEvent).filter_by(idempotency_key="report-publish-hermes-queue").one()
+        audit_payload = json.loads(audit.payload)
+    finally:
+        session.close()
+
+    assert response.publish.integration == "hermes"
+    assert response.publish.owner == "hermes"
+    assert response.publish.status == "queued"
+    assert response.publish.target == f"Bro-PM/Reports/internal/Projects/{project.slug}"
+    assert due_action.channel == "hermes"
+    assert due_action.recipient == "knowledge-writer"
+    assert due_action.status == "pending"
+    assert due_action.idempotency_key == "report-publish-hermes-queue:due-action"
+    assert due_action.payload_json["publish_contract"]["report"]["project_id"] == project.id
+    assert due_action.payload_json["ownership"] == {
+        "operational_truth": "bro_pm",
+        "knowledge_outputs": "hermes",
+    }
+    assert audit.result == "queued"
+    assert audit_payload["integration"]["name"] == "hermes"
+    assert audit_payload["integration"]["detail"] == (
+        "Queued Hermes knowledge handoff; Bro-PM kept operational truth and did not write Notion directly"
+    )
+
+
+def test_reporting_service_execute_publish_failure_marks_hermes_audit_failed_and_replayable(reporting_db, monkeypatch):
+    session = reporting_db.SessionLocal()
+    idempotency_key = "report-publish-hermes-queue-failure"
+    project_id = None
+    seen_pending_integration = None
+    try:
+        project = models.Project(
+            name=f"Project {uuid4().hex[:8]}",
+            slug=f"project-{uuid4().hex[:8]}",
+            timezone="UTC",
+            created_by="alice",
+            metadata_json={
+                "onboarding": {
+                    "status": "active",
+                    "reporting_cadence": "weekly",
+                    "board_integration": "notion",
+                }
+            },
+        )
+        session.add(project)
+        session.commit()
+        project_id = project.id
+
+        service = ReportingService(db_session=session)
+
+        def fail_enqueue(**kwargs):
+            nonlocal seen_pending_integration
+            reserved = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+            seen_pending_integration = json.loads(reserved.payload)["integration"]
+            raise RuntimeError("queue unavailable")
+
+        monkeypatch.setattr(service, "_enqueue_publish_due_action", fail_enqueue)
+
+        with pytest.raises(RuntimeError, match="queue unavailable"):
+            service.generate_project_report(
+                project=project,
+                actor="alice",
+                role="admin",
+                actor_trusted=True,
+                execute_publish=True,
+                idempotency_key=idempotency_key,
+            )
+
+        audit = session.query(models.AuditEvent).filter_by(idempotency_key=idempotency_key).one()
+        audit_payload = json.loads(audit.payload)
+    finally:
+        session.close()
+
+    assert seen_pending_integration == {
+        "name": "hermes",
+        "action": "publish_report",
+        "status": "pending",
+        "detail": "report publish handoff pending",
+    }
+    assert audit.result == "failed"
+    assert audit_payload["integration"] == {
+        "name": "hermes",
+        "action": "publish_report",
+        "status": "failed",
+        "detail": "queue unavailable",
+    }
+    assert audit_payload["idempotency"]["replay"] == {
+        "kind": "error",
+        "detail": "queue unavailable",
+    }
+
+    replay_session = reporting_db.SessionLocal()
+    try:
+        replay_project = replay_session.get(models.Project, project_id)
+        assert replay_project is not None
+        replay_service = ReportingService(db_session=replay_session)
+        with pytest.raises(IntegrationError, match="queue unavailable"):
+            replay_service.generate_project_report(
+                project=replay_project,
+                actor="alice",
+                role="admin",
+                actor_trusted=True,
+                execute_publish=True,
+                idempotency_key=idempotency_key,
+            )
+    finally:
+        replay_session.close()

@@ -9,7 +9,6 @@ from uuid import uuid4
 import pytest
 
 from bro_pm import models
-from bro_pm.integrations import INTEGRATIONS, IntegrationResult
 
 
 @pytest.fixture
@@ -72,16 +71,22 @@ def _publish_events(database, project_id: str) -> list[models.AuditEvent]:
         session.close()
 
 
+def _publish_due_actions(database, project_id: str) -> list[models.DueAction]:
+    session = database.SessionLocal()
+    try:
+        return (
+            session.query(models.DueAction)
+            .filter_by(project_id=project_id, kind="project_report_publish")
+            .order_by(models.DueAction.created_at.asc(), models.DueAction.id.asc())
+            .all()
+        )
+    finally:
+        session.close()
+
+
 def test_run_due_once_publishes_due_weekly_project_once_per_window(scheduler_db, monkeypatch):
     scheduler = importlib.import_module("bro_pm.services.report_scheduler")
     project_id = _create_project(scheduler_db, reporting_cadence="weekly")
-    publish_calls: list[str] = []
-
-    def execute_stub(*, action: str, payload: dict):
-        publish_calls.append(payload["report"]["project_id"])
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
     now = datetime(2026, 4, 18, 9, 30, tzinfo=timezone.utc)
 
     first_run = scheduler.run_due_once(session_factory=scheduler_db.SessionLocal, now=now)
@@ -89,10 +94,13 @@ def test_run_due_once_publishes_due_weekly_project_once_per_window(scheduler_db,
 
     assert first_run == 1
     assert second_run == 0
-    assert publish_calls == [project_id]
     publish_events = _publish_events(scheduler_db, project_id)
     assert len(publish_events) == 1
-    assert publish_events[0].result == "executed"
+    assert publish_events[0].result == "queued"
+    publish_due_actions = _publish_due_actions(scheduler_db, project_id)
+    assert len(publish_due_actions) == 1
+    assert publish_due_actions[0].channel == "hermes"
+    assert publish_due_actions[0].recipient == "knowledge-writer"
 
 
 def test_run_due_once_skips_safe_paused_manual_and_unsupported_projects(scheduler_db, monkeypatch):
@@ -100,13 +108,6 @@ def test_run_due_once_skips_safe_paused_manual_and_unsupported_projects(schedule
     paused_project_id = _create_project(scheduler_db, reporting_cadence="weekly", safe_paused=True)
     manual_project_id = _create_project(scheduler_db, reporting_cadence="manual")
     unsupported_project_id = _create_project(scheduler_db, reporting_cadence="monthly")
-    publish_calls: list[str] = []
-
-    def execute_stub(*, action: str, payload: dict):
-        publish_calls.append(payload["report"]["project_id"])
-        return IntegrationResult(ok=True, detail="notion executed: publish_report")
-
-    monkeypatch.setattr(INTEGRATIONS["notion"], "execute", execute_stub)
 
     result = scheduler.run_due_once(
         session_factory=scheduler_db.SessionLocal,
@@ -114,7 +115,6 @@ def test_run_due_once_skips_safe_paused_manual_and_unsupported_projects(schedule
     )
 
     assert result == 0
-    assert publish_calls == []
     assert _publish_events(scheduler_db, paused_project_id) == []
     assert _publish_events(scheduler_db, manual_project_id) == []
     assert _publish_events(scheduler_db, unsupported_project_id) == []
