@@ -17,6 +17,7 @@ from ...schemas import (
     ProjectOnboardingCreate,
     ProjectOnboardingResponse,
     ProjectMembershipResponse,
+    ProjectRuntimeStatusResponse,
     ExecutorCapacityProfileResponse,
     OnboardingGateChecks,
     OnboardingSmokeCheck,
@@ -39,6 +40,7 @@ from ...services.command_service import CommandService
 from ...services.planner_service import PlannerService
 from ...services.onboarding_service import OnboardingExecutionInput, execute_project_onboarding
 from ...services.planning_state import sync_executor_load
+from ...services.project_runtime_status_service import ProjectRuntimeStatusService
 from ...services.reporting_service import ReportIdempotencyConflictError, ReportingService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -846,6 +848,29 @@ def list_capacity_profiles(
         .all()
     )
     return [_capacity_profile_to_response(profile) for profile in profiles]
+
+
+@router.get("/{project_id}/runtime-status", response_model=ProjectRuntimeStatusResponse)
+def get_project_runtime_status(
+    project_id: str,
+    role: str = Query(..., pattern="^(owner|admin|operator|viewer)$"),
+    actor_trusted: bool = Header(default=False, alias="x-actor-trusted"),
+    db: Session = Depends(get_db_session),
+) -> ProjectRuntimeStatusResponse:
+    project = db.query(models.Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    decision = PolicyEngine().evaluate(
+        actor_role=role,
+        actor_trusted=bool(actor_trusted),
+        action="audit_view",
+        safe_paused=bool(project.safe_paused),
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    return ProjectRuntimeStatusService(db_session=db).get_project_status(project_id=project_id)
 
 
 @router.get("/{project_id}/audit-events", response_model=List[AuditResponse])

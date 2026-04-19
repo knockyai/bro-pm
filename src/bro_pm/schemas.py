@@ -328,6 +328,32 @@ class AuditEventDetailResponse(AuditResponse):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectRuntimeTaskCounts(BaseModel):
+    total: int
+    open: int
+
+
+class ProjectRuntimeApprovalSummary(BaseModel):
+    pending: int
+
+
+class ProjectRuntimeExecutionSummary(BaseModel):
+    pending: int
+    failed: int
+    last_failure_at: datetime | None = None
+
+
+class ProjectRuntimeStatusResponse(BaseModel):
+    project_id: str
+    safe_paused: bool
+    active_goal_count: int
+    task_counts: ProjectRuntimeTaskCounts
+    approvals: ProjectRuntimeApprovalSummary
+    executions: ProjectRuntimeExecutionSummary
+    revision_at: datetime
+    generated_at: datetime
+
+
 class RollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
